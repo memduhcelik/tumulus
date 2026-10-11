@@ -48,6 +48,27 @@ pub enum Real {
     Num(f64),
 }
 
+/// jq's conversion before `%`. Values outside `[-2^63, 2^63]` saturate.
+/// `2^63` is the one value in that window that does not fit in `i64`.
+/// The C cast of it is the minimum on x86_64 and the maximum elsewhere.
+pub fn jq_dtoi(n: f64) -> i64 {
+    let min = i64::MIN as f64;
+    if n < min {
+        return i64::MIN;
+    }
+    if -n < min {
+        return i64::MAX;
+    }
+    if n == i64::MAX as f64 {
+        return if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            i64::MIN
+        } else {
+            i64::MAX
+        };
+    }
+    n as i64
+}
+
 pub fn real(text: &str) -> Real {
     let text = body(text);
     if text == NAN_TEXT {

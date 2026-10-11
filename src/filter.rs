@@ -621,9 +621,9 @@ fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<Value, Strin
     let number::Real::Num(y) = number::real(b) else {
         return Ok(Value::Number(number::mark_f64(number::nan_text())));
     };
-    // Truncate toward zero into a 64-bit integer. A fractional divisor such
-    // as `0.5` is zero after that truncation.
-    let divisor = y as i64;
+    // Truncate toward zero into jq's integer width. A fractional divisor
+    // such as `0.5` is zero after that truncation.
+    let divisor = number::jq_dtoi(y);
     if divisor == 0 {
         return Err(zero_divisor(left, right, true));
     }
@@ -634,7 +634,7 @@ fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<Value, Strin
     let remainder = if divisor == -1 {
         0.0
     } else {
-        ((x as i64) % divisor) as f64
+        (number::jq_dtoi(x) % divisor) as f64
     };
     Ok(Value::Number(number::mark_f64(number::format_jq_f64(
         remainder,
