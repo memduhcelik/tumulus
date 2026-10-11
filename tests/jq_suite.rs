@@ -184,7 +184,7 @@ fn require_jq() -> String {
 }
 
 fn run_filter(bin: &str, program: &str, input: &[u8], home: &Path) -> Outcome {
-    // `--` keeps a program such as `-1` from being read as an option.
+    // `--` ends option parsing. The program is the next argument.
     let mut child = Command::new(bin)
         .args(["--", program])
         .env("HOME", home)

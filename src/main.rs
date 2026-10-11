@@ -207,7 +207,9 @@ fn options() -> Result<Options, Error> {
             other if other.starts_with("--") => {
                 return Err(Error::new(format!("unknown option: {other}")));
             }
-            other if other.starts_with('-') => {
+            // `-nc` is options. `-1` and `-.a` are programs, because the
+            // character after the dash is not a letter.
+            other if is_option_cluster(other) => {
                 apply_short_cluster(&mut style, &mut null_input, other)?;
             }
             _ => operands.push(arg.clone()),
@@ -244,6 +246,11 @@ fn apply_null(style: Style, program: &tumulus::Filter, out: &mut dyn Write) -> R
             Ok(5)
         }
     }
+}
+
+fn is_option_cluster(arg: &str) -> bool {
+    let mut chars = arg.chars();
+    chars.next() == Some('-') && chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
 }
 
 fn apply_short_cluster(style: &mut Style, null_input: &mut bool, arg: &str) -> Result<(), Error> {

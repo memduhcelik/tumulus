@@ -919,6 +919,34 @@ fn values_match_jq() {
 }
 
 #[test]
+fn leading_minus_program_matches_jq() {
+    require_jq();
+    let object = br#"{"a":1,"foo":2}"#;
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("bare -1", &["-1"], b"null\n"),
+        ("bare -.a", &["-.a"], object),
+        ("bare -.", &["-."], b"5\n"),
+        ("bare -.5", &["-n", "-.5"], b""),
+        ("bare -0", &["-n", "-0"], b""),
+        ("null input -1", &["-n", "-1"], b""),
+        ("compact before", &["-c", "-1,[2]"], b"1\n"),
+        ("compact after", &["-1,[2]", "-c"], b"1\n"),
+        ("flags then program", &["-nc", "-1"], b""),
+        (
+            "indent value stays indent",
+            &["--indent", "-1", "."],
+            object,
+        ),
+        ("end of options", &["-n", "--", "-1"], b""),
+        ("later minus is a file", &["-1", "-2"], b""),
+        ("later dotted minus is a file", &["-.a", "-.b"], object),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+}
+
+#[test]
 fn operators_match_jq() {
     require_jq();
     let programs = [
