@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process;
 
-use tumulus::{compile, eval, parse_stream, render, Error, Indent, Layout, Style};
+use tumulus::{compile, eval, parse_stream, render, Error, Indent, Layout, ProgramError, Style};
 
 fn main() {
     // The runtime ignores SIGPIPE and turns a closed pipe into an error.
@@ -43,11 +43,19 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     let options = options()?;
     let program = match compile(&options.program) {
         Ok(program) => program,
-        Err(err) => {
-            eprintln!("tumulus: {err}");
+        Err(ProgramError::Syntax) => {
+            eprintln!("tumulus: syntax error");
+            return Ok(3);
+        }
+        Err(ProgramError::Report(text)) => {
+            eprint!("{text}");
             return Ok(3);
         }
     };
+    // `-n` runs the filter once on null and does not read stdin or files.
+    if options.null_input {
+        return apply_null(options.style, &program, out);
+    }
     if options.files.is_empty() {
         let outcome = apply(&read_stdin()?, options.style, &program, "<stdin>", out)?;
         return Ok(outcome.status);
@@ -152,6 +160,7 @@ fn os_reason(err: &std::io::Error) -> String {
 
 struct Options {
     style: Style,
+    null_input: bool,
     program: String,
     files: Vec<String>,
 }
@@ -159,6 +168,7 @@ struct Options {
 fn options() -> Result<Options, Error> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut style = Style::default();
+    let mut null_input = false;
     let mut operands = Vec::new();
     let mut end = false;
     let mut index = 0;
@@ -184,6 +194,7 @@ fn options() -> Result<Options, Error> {
         }
         match arg.as_str() {
             "-c" | "--compact-output" => style.layout = Layout::Compact,
+            "-n" | "--null-input" => null_input = true,
             "--tab" => style.layout = Layout::Pretty(Indent::Tabs),
             "-r" | "--raw-output" => style.raw = true,
             "-j" | "--join-output" => {
@@ -197,7 +208,7 @@ fn options() -> Result<Options, Error> {
                 return Err(Error::new(format!("unknown option: {other}")));
             }
             other if other.starts_with('-') => {
-                apply_short_cluster(&mut style, other)?;
+                apply_short_cluster(&mut style, &mut null_input, other)?;
             }
             _ => operands.push(arg.clone()),
         }
@@ -207,6 +218,7 @@ fn options() -> Result<Options, Error> {
         // With no filter argument, jq applies `.`.
         return Ok(Options {
             style,
+            null_input,
             program: ".".to_string(),
             files: Vec::new(),
         });
@@ -214,15 +226,31 @@ fn options() -> Result<Options, Error> {
     let program = operands.remove(0);
     Ok(Options {
         style,
+        null_input,
         program,
         files: operands,
     })
 }
 
-fn apply_short_cluster(style: &mut Style, arg: &str) -> Result<(), Error> {
+fn apply_null(style: Style, program: &tumulus::Filter, out: &mut dyn Write) -> Result<i32, Error> {
+    match eval(program, &tumulus::Value::Null) {
+        Ok(values) => {
+            write_values(&values, style, out)?;
+            Ok(0)
+        }
+        Err(failure) => {
+            write_values(&failure.partial, style, out)?;
+            eprintln!("jq: error (at <unknown>): {}", failure.message);
+            Ok(5)
+        }
+    }
+}
+
+fn apply_short_cluster(style: &mut Style, null_input: &mut bool, arg: &str) -> Result<(), Error> {
     for flag in arg.chars().skip(1) {
         match flag {
             'c' => style.layout = Layout::Compact,
+            'n' => *null_input = true,
             'r' => style.raw = true,
             'j' => {
                 style.join = true;

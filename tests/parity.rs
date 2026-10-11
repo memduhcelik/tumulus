@@ -683,6 +683,235 @@ fn closed_stdout(program: &str, args: &[&str], input: &[u8]) -> (Option<i32>, Ve
     (output.status.signal(), output.stderr)
 }
 
+#[test]
+fn values_match_jq() {
+    require_jq();
+    let programs = [
+        "0",
+        "1",
+        "-1",
+        "--1",
+        "---1",
+        "- 1",
+        "- -1",
+        "-(1)",
+        "1.5",
+        "1.",
+        ".5",
+        "-.5",
+        "01",
+        "1e2",
+        "1E+2",
+        "1e-1",
+        "00.10",
+        "1.2300",
+        "true",
+        "false",
+        "null",
+        "\"hi\"",
+        "\"\"",
+        "\"a\\nb\"",
+        "\"\\u0041\"",
+        "\"caf\\u00e9\"",
+        "\"say \\\"hi\\\"\"",
+        "\"a\\/b\"",
+        "\"\\\\(1)\"",
+        "\"x\\(.)y\"",
+        "\"\\(1)\"",
+        "\"\\(true)\"",
+        "\"\\(null)\"",
+        "\"\\(.a)\"",
+        "\"a\\(1,2)b\"",
+        "\"\\(\"hi\")\"",
+        "\"\\(.a,.b)\"",
+        "\"\\({a:1})\"",
+        "\"\\([1,2])\"",
+        "\"a\\(1)b\\(2)\"",
+        "[]",
+        "[1]",
+        "[1,2,3]",
+        "[1,\"a\",true,null,.]",
+        "[.a,.b]",
+        "[[1],[2]]",
+        "[(1,2)]",
+        "[1,2]",
+        "[1|2]",
+        "{}",
+        "{a:1}",
+        "{a:.a}",
+        "{a}",
+        "{a,b}",
+        "{\"a\":1}",
+        "{\"a b\":1}",
+        "{\"a\"}",
+        "{\"a\",b}",
+        "{\"a\\(1)\"}",
+        "{(.a):1}",
+        "{a:1,b:2}",
+        "{a:1,b}",
+        "{a:(1,2)}",
+        "{(\"a\",\"b\"):1}",
+        "{a:1,a:2}",
+        "{a:1,b:2,a:3}",
+        "{if:1,and:2,or:3,not:4}",
+        "{null:null}",
+        "{true:false}",
+        "{empty:1}",
+        "{empty}",
+        "{\"\":1}",
+        "{(\"\"):1}",
+        "{a:1,}",
+        "{a,}",
+        "{a: {b: 1}}",
+        "{a:1|2}",
+        "{foo::bar:1}",
+        "1 # hi",
+        "# c\n1",
+        "\"a#b\"",
+        "{a:1, # c\nb:2}",
+        "[1, #c\n2]",
+        "{ #c\na: 1 }",
+        "\"\\(.a)x\\(.b)\"",
+    ];
+    for program in programs {
+        compare_exact(
+            &format!("-n {program}"),
+            &["-n", "-c", "--", program],
+            b"not json",
+        );
+    }
+    compare_exact("pretty object", &["-n", "--", "{a:1,b:2}"], b"");
+    compare_exact("pretty array", &["-n", "--", "[1,2]"], b"");
+    compare_exact("raw string", &["-n", "-r", "--", "\"hi\""], b"");
+    compare_exact("join string", &["-n", "-j", "--", "\"hi\""], b"");
+    compare_exact("cluster nc", &["-nc", "--", "1"], b"ignored");
+    compare_exact("long null input", &["--null-input", "-c", "--", "1"], b"");
+    compare_exact("n after program", &[".", "-n"], b"{\"z\":1}");
+    compare_exact("n dot ignores stdin", &["-n", "-c", "."], b"{\"z\":1}");
+    compare_exact(
+        "n ignores missing file",
+        &["-n", ".", "no-such-file.json"],
+        b"",
+    );
+    compare_exact("n alone", &["-n"], b"{\"z\":1}");
+
+    let input = br#"{"a":1,"b":2,"c":3,"a b":4,"a$2":9,"d":"c","":7,"x":[10,20]}"#;
+    let with_input = [
+        "\"x\\(.)y\"",
+        "\"\\(.a)\"",
+        "\"\\(.a,.b)\"",
+        "{a}",
+        "{a,b}",
+        "{\"a\"}",
+        "{a,b,(.d):.a,e:.b}",
+        "{(.a):.b}",
+        "[.a,.b]",
+        "[(.a,.b)]",
+        "{a:(1,2)}",
+        "{(\"a\",\"b\"):1}",
+        "{\"a\\(1)\":.b}",
+        "{a:1,b:.b}",
+        "\"\\(.x)\"",
+        ".\"a\\(1)\"",
+        ".[\"a\\(1,2)\"]",
+        ".a[.d]",
+        "(.a,.b)[\"a\",\"b\"]",
+        "{a:(1,2),b:(3,4)}",
+        "{(.a,.b):1}",
+        "{\"\\(1,2)\"}",
+        "{a:(1,.b)}",
+        "1, [2, .a]",
+    ];
+    for program in with_input {
+        compare_exact(program, &["-c", "--", program], input);
+    }
+
+    let bad_strings = [
+        "\"\\q\"",
+        "\"\\v\"",
+        "\"\\u12\"",
+        "\"\\uXXXX\"",
+        "\"\\uD800\"",
+        "\"ok\\q\"",
+        "  \"\\q\"",
+        "{a:\"\\q\"}",
+        "\"\\u12zz\"",
+        "\"\\uD800\\uZZZZ\"",
+    ];
+    for program in bad_strings {
+        compare_exact(
+            &format!("string {program}"),
+            &["-n", "-c", "--", program],
+            b"",
+        );
+    }
+    let bad_keys = [
+        "{(0):1}",
+        "{(1):1}",
+        "{([]):1}",
+        "{({}):1}",
+        "{(null):1}",
+        "{(true):1}",
+        "{(false):1}",
+        "{(1.50):1}",
+        "{(1e2):1}",
+        "{(01):1}",
+        "{([1,2]):1}",
+        "{({a:1,b:[2]}):1}",
+        "{(1|.):1}",
+        "{(.|1):2}",
+        "{(1|.|.):2}",
+        "{\n(0):1}",
+        "#c\n{(1):1}",
+    ];
+    for program in bad_keys {
+        compare_exact(&format!("key {program}"), &["-n", "-c", "--", program], b"");
+    }
+
+    let runtime = [
+        ("{(.):1}", "1\n"),
+        ("{(.):1}", "\"k\"\n"),
+        ("{(.):1}", "null\n"),
+        ("{(.):1}", "true\n"),
+        ("{(.):1}", "false\n"),
+        ("{(.):1}", "[]\n"),
+        ("{(.):1}", "{}\n"),
+        ("{(.):1}", "1.50\n"),
+        ("{(.):1}", "{\"a\":1}\n"),
+        ("{(.):1}", "{\"b\":1,\"a\":2}\n"),
+        ("{a:.a}", "1\n"),
+        ("[.a]", "1\n"),
+        ("[1,.a]", "1\n"),
+        ("{a:1,b:.b}", "1\n"),
+        ("\"\\(.a)\"", "1\n"),
+        ("\"pre\\(1,.a)post\"", "1\n"),
+        ("\"\\(1,.a)\"", "1\n"),
+        ("{(\"a\",\"b\"):.a}", "{\"a\":1}\n"),
+        ("{a:(1,.b)}", "1\n"),
+        ("{a:(1,.b), c:3}", "1\n"),
+        ("{c:3, a:(1,.b)}", "1\n"),
+        ("{a:(1,2), b:(3,.x)}", "1\n"),
+        ("{a:(1,2), b:(3,.x)}", "{\"x\":9}\n"),
+        ("{(1,2):1}", "null\n"),
+        ("{(1|2):1}", "null\n"),
+        ("{([1, .]):1}", "2\n"),
+        ("-n .[]", ""),
+    ];
+    for (program, input) in runtime {
+        if program == "-n .[]" {
+            compare_exact("n iterate", &["-n", ".[]"], b"");
+            continue;
+        }
+        compare_exact(
+            &format!("rt {program} {input}"),
+            &["-c", "--", program],
+            input.as_bytes(),
+        );
+    }
+    compare_exact("n bad key", &["-n", "-c", "{(.):1}"], b"");
+    compare_exact("n bad key pretty location", &["-n", "{(.a):1}"], b"");
+}
+
 struct DirGuard(std::path::PathBuf);
 
 impl Drop for DirGuard {

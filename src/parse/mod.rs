@@ -95,12 +95,13 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
     })
 }
 
-pub(crate) fn parse_json_string_literal(text: &str) -> Result<(String, usize), Error> {
+/// Decode one JSON string token, or jq's message for a bad escape.
+pub(crate) fn decode_string_token(text: &str) -> Result<String, String> {
     let mut parser = Parser::new(text);
-    let value = parser
-        .parse_string()
-        .map_err(|_| Error::new("bad string"))?;
-    Ok((value, parser.index))
+    match parser.parse_string() {
+        Ok(value) => Ok(value),
+        Err(err) => Err(format!("{} (while parsing '{text}')", err.text())),
+    }
 }
 
 fn locate(text: &str, parsed: Vec<(Value, usize, usize)>) -> Vec<LocatedValue> {

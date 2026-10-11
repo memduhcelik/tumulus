@@ -8,7 +8,7 @@ mod print;
 mod value;
 
 pub use error::Error;
-pub use filter::{compile, eval, Failure, Filter};
+pub use filter::{compile, eval, Failure, Filter, ProgramError};
 pub use parse::{parse_stream, write_input, LocatedValue, ParsedStream};
 pub use print::{render, Indent, Layout, Style};
 pub use value::Value;
