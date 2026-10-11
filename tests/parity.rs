@@ -3,7 +3,8 @@
 //! Nothing here stands in for jq's output.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -575,6 +576,51 @@ fn truncated_tail_matches_jq() {
     let cut = cut.to_str().expect("utf-8 path");
     compare_exact("cut file", &[".", cut], b"");
     compare_exact("cut file field", &["-c", ".n", cut], b"");
+}
+
+#[test]
+fn closed_pipe_stops_quietly() {
+    require_jq();
+    let input = "1\n".repeat(50_000);
+    let ours = closed_stdout(
+        env!("CARGO_BIN_EXE_tumulus"),
+        &["-c", "."],
+        input.as_bytes(),
+    );
+    let jq = closed_stdout("jq", &["-c", "."], input.as_bytes());
+    assert_eq!(
+        ours,
+        jq,
+        "closed stdout\nours signal {:?} stderr {}\njq signal {:?} stderr {}",
+        ours.0,
+        String::from_utf8_lossy(&ours.1),
+        jq.0,
+        String::from_utf8_lossy(&jq.1),
+    );
+}
+
+fn closed_stdout(program: &str, args: &[&str], input: &[u8]) -> (Option<i32>, Vec<u8>) {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
+    {
+        let mut stdin = child.stdin.take().expect("stdin pipe");
+        stdin
+            .write_all(input)
+            .unwrap_or_else(|err| panic!("write stdin to {program}: {err}"));
+    }
+    let mut stdout = child.stdout.take().expect("stdout pipe");
+    let mut byte = [0u8; 1];
+    let _ = stdout.read(&mut byte);
+    drop(stdout);
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("wait for {program}: {err}"));
+    (output.status.signal(), output.stderr)
 }
 
 struct DirGuard(std::path::PathBuf);
