@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Compare tumulus with jq
+        run: cargo test --locked

@@ -1,0 +1,321 @@
+use std::io::Write;
+
+use crate::error::Error;
+use crate::print;
+use crate::value::Value;
+
+/// Parse every JSON value in `bytes` and write jq's layout for each one.
+///
+/// A leading UTF-8 BOM is ignored. Number text is kept as it appeared;
+/// exponent rewriting and non-standard spellings are left for later.
+pub fn write_input(bytes: &[u8], compact: bool, out: &mut dyn Write) -> Result<(), Error> {
+    let bytes = strip_bom(bytes);
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
+    let mut parser = Parser::new(text);
+    loop {
+        parser.skip_ws();
+        if parser.eof() {
+            break;
+        }
+        let value = parser.parse_value()?;
+        let rendered = print::render(&value, compact);
+        out.write_all(rendered.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn strip_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        bytes
+    }
+}
+
+struct Parser<'a> {
+    src: &'a str,
+    index: usize,
+    line: usize,
+    column: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            index: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    fn eof(&self) -> bool {
+        self.index >= self.src.len()
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.src[self.index..].chars().next()
+    }
+
+    fn bump(&mut self) -> Result<char, Error> {
+        let mut chars = self.src[self.index..].chars();
+        let Some(c) = chars.next() else {
+            return Err(self.error("unexpected end of input"));
+        };
+        self.index += c.len_utf8();
+        if c == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
+        Ok(c)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+            let _ = self.bump();
+        }
+    }
+
+    fn error(&self, message: &str) -> Error {
+        Error::new(format!(
+            "{message} at line {}, column {}",
+            self.line, self.column
+        ))
+    }
+
+    fn parse_value(&mut self) -> Result<Value, Error> {
+        match self.peek() {
+            Some('n') => self.literal("null", Value::Null),
+            Some('t') => self.literal("true", Value::Bool(true)),
+            Some('f') => self.literal("false", Value::Bool(false)),
+            Some('"') => Ok(Value::String(self.parse_string()?)),
+            Some('[') => {
+                self.bump()?;
+                self.parse_array()
+            }
+            Some('{') => {
+                self.bump()?;
+                self.parse_object()
+            }
+            Some('-' | '0'..='9') => self.parse_number(),
+            Some(_) => Err(self.error("expected a value")),
+            None => Err(self.error("expected a value")),
+        }
+    }
+
+    fn literal(&mut self, text: &str, value: Value) -> Result<Value, Error> {
+        if !self.src[self.index..].starts_with(text) {
+            return Err(self.error("invalid literal"));
+        }
+        let after = self.index + text.len();
+        // Reject the keyword before producing a value when the next character
+        // still belongs to the token (`truefalse`, `true-1`).
+        self.index = after;
+        let saved_column = self.column;
+        self.column += text.len();
+        if !self.token_boundary_ok() {
+            self.index = after - text.len();
+            self.column = saved_column;
+            return Err(self.error("invalid literal"));
+        }
+        Ok(value)
+    }
+
+    fn token_boundary_ok(&self) -> bool {
+        match self.peek() {
+            None => true,
+            Some(' ' | '\t' | '\n' | '\r' | '"' | '[' | '{' | ']' | '}' | ',' | ':') => true,
+            Some(_) => false,
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Value, Error> {
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.peek() == Some(']') {
+            self.bump()?;
+            return Ok(Value::Array(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump()?;
+                    self.skip_ws();
+                }
+                Some(']') => {
+                    self.bump()?;
+                    break;
+                }
+                _ => return Err(self.error("expected ',' or ']'")),
+            }
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn parse_object(&mut self) -> Result<Value, Error> {
+        self.skip_ws();
+        // First key position wins; a later duplicate replaces the value.
+        let mut items: Vec<(String, Value)> = Vec::new();
+        if self.peek() == Some('}') {
+            self.bump()?;
+            return Ok(Value::Object(items));
+        }
+        loop {
+            if self.peek() != Some('"') {
+                return Err(self.error("expected a string key"));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(':') {
+                return Err(self.error("expected ':'"));
+            }
+            self.bump()?;
+            self.skip_ws();
+            let value = self.parse_value()?;
+            if let Some((_, slot)) = items.iter_mut().find(|(existing, _)| existing == &key) {
+                *slot = value;
+            } else {
+                items.push((key, value));
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump()?;
+                    self.skip_ws();
+                }
+                Some('}') => {
+                    self.bump()?;
+                    break;
+                }
+                _ => return Err(self.error("expected ',' or '}'")),
+            }
+        }
+        Ok(Value::Object(items))
+    }
+
+    fn parse_string(&mut self) -> Result<String, Error> {
+        if self.bump()? != '"' {
+            return Err(self.error("expected a string"));
+        }
+        let mut out = String::new();
+        loop {
+            let c = self.bump()?;
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let escaped = self.bump()?;
+                    match escaped {
+                        '"' | '\\' | '/' => out.push(escaped),
+                        'b' => out.push('\u{0008}'),
+                        'f' => out.push('\u{000c}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let unit = self.hex4()?;
+                            self.push_unicode(&mut out, unit)?;
+                        }
+                        _ => return Err(self.error("invalid escape")),
+                    }
+                }
+                c if (c as u32) < 0x20 => {
+                    return Err(self.error("unescaped control character in string"));
+                }
+                c => out.push(c),
+            }
+        }
+    }
+
+    fn push_unicode(&mut self, out: &mut String, unit: u32) -> Result<(), Error> {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            if self.bump()? != '\\' || self.bump()? != 'u' {
+                return Err(self.error("invalid surrogate pair"));
+            }
+            let low = self.hex4()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(self.error("invalid surrogate pair"));
+            }
+            let scalar = 0x10000 + (((unit - 0xD800) << 10) | (low - 0xDC00));
+            let Some(c) = char::from_u32(scalar) else {
+                return Err(self.error("invalid surrogate pair"));
+            };
+            out.push(c);
+            return Ok(());
+        }
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            return Err(self.error("invalid surrogate pair"));
+        }
+        let Some(c) = char::from_u32(unit) else {
+            return Err(self.error("invalid unicode escape"));
+        };
+        out.push(c);
+        Ok(())
+    }
+
+    fn hex4(&mut self) -> Result<u32, Error> {
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let c = self.bump()?;
+            let Some(digit) = c.to_digit(16) else {
+                return Err(self.error("invalid hex escape"));
+            };
+            value = (value << 4) | digit;
+        }
+        Ok(value)
+    }
+
+    fn parse_number(&mut self) -> Result<Value, Error> {
+        let start = self.index;
+        if self.peek() == Some('-') {
+            self.bump()?;
+        }
+        match self.peek() {
+            Some('0') => {
+                self.bump()?;
+                if matches!(self.peek(), Some('0'..='9')) {
+                    return Err(self.error("invalid number"));
+                }
+            }
+            Some('1'..='9') => {
+                while matches!(self.peek(), Some('0'..='9')) {
+                    self.bump()?;
+                }
+            }
+            _ => return Err(self.error("invalid number")),
+        }
+        if self.peek() == Some('.') {
+            self.bump()?;
+            let mut digits = 0;
+            while matches!(self.peek(), Some('0'..='9')) {
+                self.bump()?;
+                digits += 1;
+            }
+            if digits == 0 {
+                return Err(self.error("invalid number"));
+            }
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            self.bump()?;
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.bump()?;
+            }
+            let mut digits = 0;
+            while matches!(self.peek(), Some('0'..='9')) {
+                self.bump()?;
+                digits += 1;
+            }
+            if digits == 0 {
+                return Err(self.error("invalid number"));
+            }
+        }
+        if !self.token_boundary_ok() {
+            return Err(self.error("invalid number"));
+        }
+        Ok(Value::Number(self.src[start..self.index].to_string()))
+    }
+}
