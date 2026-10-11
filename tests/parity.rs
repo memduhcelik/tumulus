@@ -316,6 +316,107 @@ fn missing_file_still_prints_the_rest() {
     );
 }
 
+#[test]
+fn output_flags_match_jq() {
+    require_jq();
+    let input =
+        r#"{"b":"café","a":"🙂","A":"x\n","e":"","n":"ü","":true} "ü" {"z":1,"y":{"b":1,"a":2}}"#;
+    let flags: &[&[&str]] = &[
+        &["-r", "."],
+        &["-j", "."],
+        &["-a", "."],
+        &["-S", "."],
+        &["--tab", "."],
+        &["--indent", "0", "."],
+        &["--indent", "1", "."],
+        &["--indent", "4", "."],
+        &["--indent", "7", "."],
+        &["--indent", "-1", "."],
+        &["--raw-output", "."],
+        &["--join-output", "."],
+        &["--ascii-output", "."],
+        &["--sort-keys", "."],
+        &["-c", "."],
+        &["-c", "--indent", "4", "."],
+        &["--indent", "4", "-c", "."],
+        &["-c", "--tab", "."],
+        &["--tab", "-c", "."],
+        &["--indent", "0", "--tab", "."],
+        &["--tab", "--indent", "0", "."],
+        &["--indent", "-1", "-c", "."],
+        &["-c", "--indent", "-1", "."],
+        &["--indent", "4", "--tab", "."],
+        &["--tab", "--indent", "4", "."],
+        &["-r", "-a", "."],
+        &["-a", "-r", "."],
+        &["-j", "-a", "."],
+        &["-r", "-S", "."],
+        &["-S", "-a", "."],
+        &["-j", "-S", "--indent", "4", "."],
+        &["-r", "-a", "-S", "--tab", "."],
+        &["-j", "-a", "-S", "--indent", "3", "."],
+        &["-c", "-a", "-S", "."],
+        &["--raw-output", "--ascii-output", "--sort-keys", "."],
+        &[
+            "--join-output",
+            "--ascii-output",
+            "--sort-keys",
+            "--indent",
+            "4",
+            ".",
+        ],
+        &[".", "-S", "-a", "--indent", "1"],
+        &["-rj", "."],
+        &["-jr", "."],
+        &["-ra", "."],
+        &["-ar", "."],
+        &["-rS", "."],
+        &["-ja", "."],
+        &["-aS", "."],
+        &["-rjSa", "."],
+        &["-crj", "."],
+        &["-crjaS", "."],
+        &["-cS", "."],
+        &["-Sc", "."],
+        &["-raj", "."],
+        &["--indent", "4abc", "."],
+        &["--indent", "+4", "."],
+        &["--indent", "4.9", "."],
+        &["--indent", "foo", "."],
+        &["--indent", "-1abc", "."],
+        &["--indent", "4294967295", "."],
+        &["--indent", "4294967296", "."],
+        &["--indent", "4294967297", "."],
+    ];
+    for args in flags {
+        compare(&format!("{args:?}"), args, input.as_bytes());
+    }
+
+    let nonfinite = "NaN nan NAN nAn +NaN -nan Infinity infinity INFINITY InFiNiTy inf Inf INF +inf -Inf -infinity +Infinity";
+    for args in [
+        &["."][..],
+        &["-c", "."],
+        &["-r", "."],
+        &["-a", "."],
+        &["-S", "."],
+        &["--indent", "4", "."],
+        &["-j", "-a", "."],
+    ] {
+        compare(&format!("nonfinite {args:?}"), args, nonfinite.as_bytes());
+    }
+
+    let python = r#"{"z": -Infinity, "y": Infinity, "x": NaN, "s": "café"}"#;
+    compare("python object", &["."], python.as_bytes());
+    compare("python object compact", &["-c", "."], python.as_bytes());
+    compare("python array", &["-c", "."], b"[NaN, Infinity, -Infinity]");
+
+    compare_exact("indent 8", &["--indent", "8", "."], b"1");
+    compare_exact("indent 08", &["--indent", "08", "."], b"1");
+    compare_exact("indent -2", &["--indent", "-2", "."], b"1");
+    compare_exact("indent missing", &["--indent"], b"1");
+    compare_exact("indent missing after filter", &[".", "--indent"], b"1");
+}
+
 struct DirGuard(std::path::PathBuf);
 
 impl Drop for DirGuard {

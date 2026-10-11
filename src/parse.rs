@@ -2,13 +2,13 @@ use std::io::Write;
 
 use crate::error::Error;
 use crate::number;
-use crate::print;
+use crate::print::{self, Style};
 use crate::value::Value;
 
 /// Parse every JSON value in `bytes` and write jq's layout for each one.
 ///
 /// A leading UTF-8 BOM is ignored. Numbers are rewritten the way jq rewrites them.
-pub fn write_input(bytes: &[u8], compact: bool, out: &mut dyn Write) -> Result<(), Error> {
+pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<(), Error> {
     let bytes = strip_bom(bytes);
     let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
     let mut parser = Parser::new(text);
@@ -18,9 +18,11 @@ pub fn write_input(bytes: &[u8], compact: bool, out: &mut dyn Write) -> Result<(
             break;
         }
         let value = parser.parse_value()?;
-        let rendered = print::render(&value, compact);
+        let rendered = print::render(&value, style);
         out.write_all(rendered.as_bytes())?;
-        out.write_all(b"\n")?;
+        if !style.join {
+            out.write_all(b"\n")?;
+        }
     }
     Ok(())
 }
@@ -88,7 +90,8 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Result<Value, Error> {
         match self.peek() {
-            Some('n') => self.literal("null", Value::Null),
+            Some('n' | 'N') => self.parse_n_word(),
+            Some('i' | 'I') => self.parse_infinity(false),
             Some('t') => self.literal("true", Value::Bool(true)),
             Some('f') => self.literal("false", Value::Bool(false)),
             Some('"') => Ok(Value::String(self.parse_string()?)),
@@ -269,6 +272,50 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
+    fn parse_n_word(&mut self) -> Result<Value, Error> {
+        if self.src[self.index..].starts_with("null") {
+            return self.literal("null", Value::Null);
+        }
+        self.parse_nan()
+    }
+
+    fn parse_nan(&mut self) -> Result<Value, Error> {
+        if self.take_nonfinite_word("nan") {
+            return Ok(Value::Null);
+        }
+        Err(self.error("invalid number"))
+    }
+
+    fn parse_infinity(&mut self, negative: bool) -> Result<Value, Error> {
+        if self.take_nonfinite_word("infinity") || self.take_nonfinite_word("inf") {
+            return Ok(Value::Number(number::infinite(negative)));
+        }
+        Err(self.error("invalid number"))
+    }
+
+    /// Case-insensitive `nan`, `inf`, or `infinity`, only when the next
+    /// character ends the token the way jq ends it.
+    fn take_nonfinite_word(&mut self, word: &str) -> bool {
+        let rest = &self.src[self.index..];
+        let bytes = rest.as_bytes();
+        let pat = word.as_bytes();
+        if bytes.len() < pat.len() || !bytes[..pat.len()].eq_ignore_ascii_case(pat) {
+            return false;
+        }
+        let after = self.index + pat.len();
+        let boundary = match self.src[after..].chars().next() {
+            None => true,
+            Some(' ' | '\t' | '\n' | '\r' | '"' | '[' | '{' | ']' | '}' | ',' | ':') => true,
+            Some(_) => false,
+        };
+        if !boundary {
+            return false;
+        }
+        self.index = after;
+        self.column += pat.len();
+        true
+    }
+
     fn parse_number(&mut self) -> Result<Value, Error> {
         let mut negative = false;
         match self.peek() {
@@ -280,6 +327,13 @@ impl<'a> Parser<'a> {
                 negative = true;
             }
             _ => {}
+        }
+
+        if matches!(self.peek(), Some('i' | 'I')) {
+            return self.parse_infinity(negative);
+        }
+        if matches!(self.peek(), Some('n' | 'N')) {
+            return self.parse_nan();
         }
 
         let mut int_digits = String::new();
