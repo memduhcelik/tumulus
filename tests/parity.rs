@@ -30,13 +30,21 @@ fn run(program: &str, args: &[String], input: &[u8]) -> std::process::Output {
         .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
     {
         let mut stdin = child.stdin.take().expect("stdin pipe");
-        stdin
-            .write_all(input)
-            .unwrap_or_else(|err| panic!("write stdin to {program}: {err}"));
+        write_stdin(&mut stdin, program, input);
     }
     child
         .wait_with_output()
         .unwrap_or_else(|err| panic!("wait for {program}: {err}"))
+}
+
+/// A child that exits before reading closes the pipe. The check still
+/// compares that child's output.
+fn write_stdin(stdin: &mut impl Write, program: &str, input: &[u8]) {
+    match stdin.write_all(input) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write stdin to {program}: {err}"),
+    }
 }
 
 fn compare(name: &str, args: &[&str], input: &[u8]) {
@@ -669,9 +677,7 @@ fn closed_stdout(program: &str, args: &[&str], input: &[u8]) -> (Option<i32>, Ve
         .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
     {
         let mut stdin = child.stdin.take().expect("stdin pipe");
-        stdin
-            .write_all(input)
-            .unwrap_or_else(|err| panic!("write stdin to {program}: {err}"));
+        write_stdin(&mut stdin, program, input);
     }
     let mut stdout = child.stdout.take().expect("stdout pipe");
     let mut byte = [0u8; 1];
