@@ -24,7 +24,7 @@ impl ParseErr {
 }
 
 pub(in crate::parse) struct Parser<'a> {
-    pub(in crate::parse) src: &'a str,
+    pub(in crate::parse) src: &'a [u8],
     pub(in crate::parse) index: usize,
     /// jq counts the line from 1.
     pub(in crate::parse) line: usize,
@@ -35,7 +35,7 @@ pub(in crate::parse) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(in crate::parse) fn new(src: &'a str) -> Self {
+    pub(in crate::parse) fn new(src: &'a [u8]) -> Self {
         Self {
             src,
             index: 0,
@@ -50,19 +50,41 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parse) fn peek(&self) -> Option<char> {
-        self.src[self.index..].chars().next()
+        self.char_at(self.index)
+    }
+
+    pub(in crate::parse) fn char_at(&self, index: usize) -> Option<char> {
+        decode_at(self.src, index).map(|(c, _)| c)
     }
 
     pub(in crate::parse) fn bump(&mut self) -> Option<char> {
-        let c = self.peek()?;
-        self.index += c.len_utf8();
+        let (c, width) = decode_at(self.src, self.index)?;
+        self.index += width;
         if c == '\n' {
             self.line += 1;
             self.column = 0;
         } else {
-            self.column += c.len_utf8();
+            // Width is the input bytes, not U+FFFD's own three-byte encoding.
+            self.column += width;
         }
         Some(c)
+    }
+
+    /// One source byte. Columns stay on the original bytes inside a string,
+    /// where a later sanitizer may turn several of those bytes into one scalar.
+    pub(in crate::parse) fn take_byte(&mut self) -> Option<u8> {
+        if self.index >= self.src.len() {
+            return None;
+        }
+        let byte = self.src[self.index];
+        self.index += 1;
+        if byte == b'\n' {
+            self.line += 1;
+            self.column = 0;
+        } else {
+            self.column += 1;
+        }
+        Some(byte)
     }
 
     pub(in crate::parse) fn skip_ws(&mut self) {
@@ -84,6 +106,70 @@ impl<'a> Parser<'a> {
         self.bump();
         self.fail(phrase, false)
     }
+}
+
+/// One scalar at `index`, and how many input bytes it occupied.
+///
+/// Used outside string contents. A following byte that cannot continue the
+/// sequence stays put, so a quote or space is still a delimiter.
+fn decode_at(src: &[u8], index: usize) -> Option<(char, usize)> {
+    let rest = src.get(index..)?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(decode_utf8(rest, false))
+}
+
+/// String contents after escapes. The slice ends where the string ends, so a
+/// lead with too few bytes left takes the whole tail, not only its continuations.
+pub(in crate::parse) fn sanitize_content(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let (ch, width) = decode_utf8(&bytes[index..], true);
+        out.push(ch);
+        index += width;
+    }
+    out
+}
+
+fn decode_utf8(bytes: &[u8], hard_end: bool) -> (char, usize) {
+    let lead = bytes[0];
+    let (width, min_value, mut value) = match lead {
+        0x00..=0x7F => return (lead as char, 1),
+        0xC2..=0xDF => (2, 0x80u32, u32::from(lead & 0x1F)),
+        0xE0..=0xEF => (3, 0x800, u32::from(lead & 0x0F)),
+        0xF0..=0xF4 => (4, 0x10000, u32::from(lead & 0x07)),
+        _ => return ('\u{FFFD}', 1),
+    };
+    // The end of a string is a hard end: jq folds a short tail into one
+    // U+FFFD, including bytes that are not continuations.
+    if hard_end && bytes.len() < width {
+        return ('\u{FFFD}', bytes.len());
+    }
+    let available = bytes.len().min(width);
+    for i in 1..available {
+        if !is_continuation(bytes[i]) {
+            return ('\u{FFFD}', i);
+        }
+        value = (value << 6) | u32::from(bytes[i] & 0x3F);
+    }
+    if available < width
+        || value < min_value
+        || value > 0x10FFFF
+        || (0xD800..=0xDFFF).contains(&value)
+    {
+        let taken = if available < width { available } else { width };
+        return ('\u{FFFD}', taken);
+    }
+    match char::from_u32(value) {
+        Some(c) => (c, width),
+        None => ('\u{FFFD}', width),
+    }
+}
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
 }
 
 fn is_ws(c: char) -> bool {

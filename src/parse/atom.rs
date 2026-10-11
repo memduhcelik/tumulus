@@ -39,7 +39,7 @@ impl<'a> Parser<'a> {
     }
 
     fn literal(&mut self, text: &str, value: Value) -> Result<Value, ()> {
-        if !self.src[self.index..].starts_with(text) {
+        if !self.src[self.index..].starts_with(text.as_bytes()) {
             return Err(());
         }
         self.index += text.len();
@@ -58,7 +58,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_n_word(&mut self) -> Result<Value, ()> {
-        if self.src[self.index..].starts_with("null") {
+        if self.src[self.index..].starts_with(b"null") {
             return self.literal("null", Value::Null);
         }
         self.parse_nan()
@@ -80,11 +80,11 @@ impl<'a> Parser<'a> {
 
     fn take_nonfinite_word(&mut self, word: &str) -> bool {
         let rest = &self.src[self.index..];
-        if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word) {
+        if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word.as_bytes()) {
             return false;
         }
         let after = self.index + word.len();
-        let boundary = match self.src[after..].chars().next() {
+        let boundary = match self.char_at(after) {
             None => true,
             Some(c) if is_delimiter(c) => true,
             Some(_) => false,
@@ -179,9 +179,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn invalid_phrase(token: &str) -> &'static str {
+fn invalid_phrase(token: &[u8]) -> &'static str {
     // `t` and `f` start true/false. `nu` has already chosen null over nan.
-    let literal = token.starts_with('t') || token.starts_with('f') || token.starts_with("nu");
+    let literal = token.starts_with(b"t") || token.starts_with(b"f") || token.starts_with(b"nu");
     if literal {
         "Invalid literal"
     } else {
@@ -189,7 +189,7 @@ fn invalid_phrase(token: &str) -> &'static str {
     }
 }
 
-fn interpret_atom(token: &str) -> Option<Value> {
+fn interpret_atom(token: &[u8]) -> Option<Value> {
     let mut parser = Parser::new(token);
     let value = parser.parse_scalar().ok()?;
     if parser.eof() {

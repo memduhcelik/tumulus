@@ -31,8 +31,10 @@ pub struct ParsedStream {
 
 /// Parse every JSON value in `bytes` and write jq's layout for each one.
 ///
-/// A leading UTF-8 BOM is ignored. Numbers are rewritten the way jq rewrites them.
-/// When the tail is truncated, values before that tail are still written.
+/// A leading UTF-8 BOM is ignored. Bytes that are not valid UTF-8 inside a
+/// string become U+FFFD, and parsing continues. Numbers are rewritten the way
+/// jq rewrites them. When the tail is truncated, values before that tail are
+/// still written.
 pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<(), Error> {
     let parsed = parse_stream(bytes)?;
     for item in &parsed.values {
@@ -50,8 +52,7 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
 
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
     let bytes = strip_bom(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
-    let mut parser = Parser::new(text);
+    let mut parser = Parser::new(bytes);
     let mut parsed = Vec::new();
     loop {
         parser.skip_ws();
@@ -63,7 +64,7 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
             Ok(value) => value,
             Err(err) => {
                 return Ok(ParsedStream {
-                    values: locate(text, parsed),
+                    values: locate(bytes, parsed),
                     error: Some(err.text()),
                 });
             }
@@ -82,7 +83,7 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
             if let Some(phrase) = phrase {
                 parser.bump();
                 return Ok(ParsedStream {
-                    values: locate(text, parsed),
+                    values: locate(bytes, parsed),
                     error: Some(parser.fail(phrase, false).text()),
                 });
             }
@@ -90,25 +91,25 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
         parsed.push((value, start_line, end));
     }
     Ok(ParsedStream {
-        values: locate(text, parsed),
+        values: locate(bytes, parsed),
         error: None,
     })
 }
 
 /// Decode one JSON string token, or jq's message for a bad escape.
 pub(crate) fn decode_string_token(text: &str) -> Result<String, String> {
-    let mut parser = Parser::new(text);
+    let mut parser = Parser::new(text.as_bytes());
     match parser.parse_string() {
         Ok(value) => Ok(value),
         Err(err) => Err(format!("{} (while parsing '{text}')", err.text())),
     }
 }
 
-fn locate(text: &str, parsed: Vec<(Value, usize, usize)>) -> Vec<LocatedValue> {
+fn locate(text: &[u8], parsed: Vec<(Value, usize, usize)>) -> Vec<LocatedValue> {
     let last = parsed.len();
     let mut out = Vec::with_capacity(last);
     for (index, (value, start_line, end)) in parsed.into_iter().enumerate() {
-        let newline_after = text[end..].contains('\n');
+        let newline_after = text[end..].contains(&b'\n');
         let line = if index + 1 == last && !newline_after {
             start_line.saturating_sub(1)
         } else {

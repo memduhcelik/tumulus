@@ -11,24 +11,27 @@ const SURROGATE: &str = "Invalid \\uXXXX\\uXXXX surrogate pair escape";
 impl<'a> Parser<'a> {
     pub(in crate::parse) fn parse_string(&mut self) -> Result<String, ParseErr> {
         self.bump();
-        let mut out = String::new();
+        // Raw content bytes, with escapes already turned into their bytes.
+        // Invalid UTF-8 is replaced once the string has its closing quote,
+        // because a short tail is one U+FFFD for whatever bytes are left.
+        let mut raw = Vec::new();
         let mut problem = None;
         loop {
-            let Some(c) = self.bump() else {
+            let Some(byte) = self.take_byte() else {
                 return Err(self.fail("Unfinished string", true));
             };
-            match c {
-                '"' => {
+            match byte {
+                b'"' => {
                     if let Some(phrase) = problem {
                         return Err(self.fail(phrase, false));
                     }
-                    return Ok(out);
+                    return Ok(super::parser::sanitize_content(&raw));
                 }
-                '\\' => self.parse_escape(&mut out, &mut problem)?,
-                c if (c as u32) < 0x20 => note(&mut problem, CONTROL),
-                c => {
+                b'\\' => self.parse_escape(&mut raw, &mut problem)?,
+                b if b < 0x20 => note(&mut problem, CONTROL),
+                b => {
                     if problem.is_none() {
-                        out.push(c);
+                        raw.push(b);
                     }
                 }
             }
@@ -37,23 +40,19 @@ impl<'a> Parser<'a> {
 
     fn parse_escape(
         &mut self,
-        out: &mut String,
+        out: &mut Vec<u8>,
         problem: &mut Option<&'static str>,
     ) -> Result<(), ParseErr> {
         let Some(esc) = self.bump() else {
             return Err(self.fail("Unfinished string", true));
         };
         match esc {
-            '"' | '\\' | '/' => {
-                if problem.is_none() {
-                    out.push(esc);
-                }
-            }
-            'b' => push_if_ok(out, problem, '\u{0008}'),
-            'f' => push_if_ok(out, problem, '\u{000c}'),
-            'n' => push_if_ok(out, problem, '\n'),
-            'r' => push_if_ok(out, problem, '\r'),
-            't' => push_if_ok(out, problem, '\t'),
+            '"' | '\\' | '/' => push_char(out, problem, esc),
+            'b' => push_char(out, problem, '\u{0008}'),
+            'f' => push_char(out, problem, '\u{000c}'),
+            'n' => push_char(out, problem, '\n'),
+            'r' => push_char(out, problem, '\r'),
+            't' => push_char(out, problem, '\t'),
             'u' => self.parse_u(out, problem)?,
             _ => note(problem, "Invalid escape"),
         }
@@ -62,7 +61,7 @@ impl<'a> Parser<'a> {
 
     fn parse_u(
         &mut self,
-        out: &mut String,
+        out: &mut Vec<u8>,
         problem: &mut Option<&'static str>,
     ) -> Result<(), ParseErr> {
         let Some(unit) = self.read_hex_unit(problem, INVALID_U, BAD_U_CHARS)? else {
@@ -76,11 +75,11 @@ impl<'a> Parser<'a> {
         }
         if (0xDC00..=0xDFFF).contains(&unit) {
             // jq keeps a lone low surrogate and prints U+FFFD.
-            out.push('\u{FFFD}');
+            push_char(out, problem, '\u{FFFD}');
             return Ok(());
         }
         if let Some(c) = char::from_u32(unit) {
-            out.push(c);
+            push_char(out, problem, c);
         }
         Ok(())
     }
@@ -88,13 +87,13 @@ impl<'a> Parser<'a> {
     fn parse_low_surrogate(
         &mut self,
         high: u32,
-        out: &mut String,
+        out: &mut Vec<u8>,
         problem: &mut Option<&'static str>,
     ) -> Result<(), ParseErr> {
         if self.eof() {
             return Err(self.fail("Unfinished string", true));
         }
-        if !self.src[self.index..].starts_with("\\u") {
+        if !self.src[self.index..].starts_with(b"\\u") {
             note(problem, SURROGATE);
             return Ok(());
         }
@@ -112,7 +111,7 @@ impl<'a> Parser<'a> {
         }
         let scalar = 0x10000 + (((high - 0xD800) << 10) | (low - 0xDC00));
         if let Some(c) = char::from_u32(scalar) {
-            out.push(c);
+            push_char(out, problem, c);
         }
         Ok(())
     }
@@ -157,8 +156,9 @@ fn note(problem: &mut Option<&'static str>, phrase: &'static str) {
     }
 }
 
-fn push_if_ok(out: &mut String, problem: &Option<&'static str>, c: char) {
+fn push_char(out: &mut Vec<u8>, problem: &Option<&'static str>, c: char) {
     if problem.is_none() {
-        out.push(c);
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
     }
 }
