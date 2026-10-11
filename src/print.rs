@@ -59,7 +59,7 @@ fn write_value(out: &mut String, value: &Value, style: Style, level: usize, raw_
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
-        Value::Number(raw) => out.push_str(raw),
+        Value::Number(raw) => crate::number::write_number(out, raw),
         Value::String(text) if raw_here && style.raw_strings() => out.push_str(text),
         Value::String(text) => push_string(out, text, style.ascii),
         Value::Array(items) => write_array(out, items, style, level),

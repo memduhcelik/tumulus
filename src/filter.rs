@@ -1,8 +1,23 @@
-//! Paths, slices, iteration, recurse, pipe, comma, `?`, and values.
+//! Paths, slices, iteration, recurse, pipe, comma, operators, and values.
 
-use crate::number::{array_index, slice_bound};
+use crate::number::{self, array_index, slice_bound};
 use crate::print::{self, Layout, Style};
 use crate::value::Value;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 #[derive(Clone, Debug)]
 pub enum Filter {
@@ -30,6 +45,24 @@ pub enum Filter {
     At {
         base: Box<Filter>,
         key: Box<Filter>,
+    },
+    Bin {
+        op: Op,
+        left: Box<Filter>,
+        right: Box<Filter>,
+    },
+    /// A leading `-`.
+    Neg(Box<Filter>),
+    /// `not`, read from the current input.
+    Not,
+    And(Box<Filter>, Box<Filter>),
+    Or(Box<Filter>, Box<Filter>),
+    /// `//`
+    Alt(Box<Filter>, Box<Filter>),
+    If {
+        cond: Box<Filter>,
+        yes: Box<Filter>,
+        no: Box<Filter>,
     },
 }
 
@@ -100,7 +133,9 @@ pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
             Err(failure) => Ok(failure.partial),
         },
         Filter::Pipe(left, right) => {
-            let inputs = eval(left, input)?;
+            // Values already produced on the left are still fed to the right.
+            // A right-hand error stops before the left-hand error is reported.
+            let (inputs, left_err) = parts(eval(left, input));
             let mut out = Vec::new();
             for value in inputs {
                 match eval(right, &value) {
@@ -114,7 +149,7 @@ pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
                     }
                 }
             }
-            Ok(out)
+            finish(out, left_err)
         }
         Filter::Comma(left, right) => {
             let mut out = eval(left, input)?;
@@ -141,6 +176,13 @@ pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
         },
         Filter::Object(fields) => eval_object(fields, input),
         Filter::At { base, key } => eval_at(base, key, input),
+        Filter::Bin { op, left, right } => eval_bin(*op, left, right, input),
+        Filter::Neg(inner) => eval_neg(inner, input),
+        Filter::Not => Ok(vec![Value::Bool(!truthy(input))]),
+        Filter::And(left, right) => eval_and(left, right, input),
+        Filter::Or(left, right) => eval_or(left, right, input),
+        Filter::Alt(left, right) => eval_alt(left, right, input),
+        Filter::If { cond, yes, no } => eval_if(cond, yes, no, input),
     }
 }
 
@@ -264,12 +306,47 @@ fn shown(value: &Value) -> String {
         ..Style::default()
     };
     let rendered = print::render(value, style);
-    if rendered.chars().count() > 14 {
-        let mut truncated: String = rendered.chars().take(11).collect();
-        truncated.push_str("...");
-        truncated
+    let bytes = rendered.as_bytes();
+    if bytes.len() <= 14 {
+        return rendered;
+    }
+    // Keep 11 bytes. An incomplete UTF-8 sequence becomes U+FFFD.
+    let head = &bytes[..11];
+    let mut valid = 0;
+    let mut index = 0;
+    while index < head.len() {
+        let width = utf8_width(head[index]);
+        if width == 0 || index + width > head.len() {
+            break;
+        }
+        if head[index + 1..index + width]
+            .iter()
+            .any(|byte| byte & 0xC0 != 0x80)
+        {
+            break;
+        }
+        index += width;
+        valid = index;
+    }
+    let mut out = String::from_utf8_lossy(&head[..valid]).into_owned();
+    if valid < head.len() {
+        out.push('\u{FFFD}');
+    }
+    out.push_str("...");
+    out
+}
+
+fn utf8_width(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else if lead & 0xF8 == 0xF0 {
+        4
     } else {
-        rendered
+        0
     }
 }
 
@@ -278,6 +355,495 @@ fn fail(message: String) -> Failure {
         partial: Vec::new(),
         message,
     }
+}
+
+fn parts(result: Result<Vec<Value>, Failure>) -> (Vec<Value>, Option<String>) {
+    match result {
+        Ok(values) => (values, None),
+        Err(failure) => (failure.partial, Some(failure.message)),
+    }
+}
+
+fn truthy(value: &Value) -> bool {
+    !matches!(value, Value::Null | Value::Bool(false))
+}
+
+fn finish(out: Vec<Value>, err: Option<String>) -> Result<Vec<Value>, Failure> {
+    match err {
+        Some(message) => Err(Failure {
+            partial: out,
+            message,
+        }),
+        None => Ok(out),
+    }
+}
+
+fn eval_neg(inner: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval(inner, input));
+    let mut out = Vec::new();
+    for value in values {
+        match negate_value(&value) {
+            Ok(next) => out.push(next),
+            Err(message) => {
+                return Err(Failure {
+                    partial: out,
+                    message,
+                })
+            }
+        }
+    }
+    finish(out, err)
+}
+
+fn eval_bin(op: Op, left: &Filter, right: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    // The right stream is the outer loop. A left error drops the remaining
+    // rights; a right error is reported after the successful rights.
+    let (rights, right_err) = parts(eval(right, input));
+    let mut out = Vec::new();
+    for right_value in rights {
+        let (lefts, left_err) = parts(eval(left, input));
+        for left_value in lefts {
+            match apply_op(op, &left_value, &right_value) {
+                Ok(value) => out.push(value),
+                Err(message) => {
+                    return Err(Failure {
+                        partial: out,
+                        message,
+                    })
+                }
+            }
+        }
+        if let Some(message) = left_err {
+            return Err(Failure {
+                partial: out,
+                message,
+            });
+        }
+    }
+    finish(out, right_err)
+}
+
+fn eval_and(left: &Filter, right: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    let (lefts, left_err) = parts(eval(left, input));
+    let mut out = Vec::new();
+    for left_value in lefts {
+        if !truthy(&left_value) {
+            out.push(Value::Bool(false));
+            continue;
+        }
+        let (rights, right_err) = parts(eval(right, input));
+        for right_value in rights {
+            out.push(Value::Bool(truthy(&right_value)));
+        }
+        if let Some(message) = right_err {
+            return Err(Failure {
+                partial: out,
+                message,
+            });
+        }
+    }
+    finish(out, left_err)
+}
+
+fn eval_or(left: &Filter, right: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    let (lefts, left_err) = parts(eval(left, input));
+    let mut out = Vec::new();
+    for left_value in lefts {
+        if truthy(&left_value) {
+            out.push(Value::Bool(true));
+            continue;
+        }
+        let (rights, right_err) = parts(eval(right, input));
+        for right_value in rights {
+            out.push(Value::Bool(truthy(&right_value)));
+        }
+        if let Some(message) = right_err {
+            return Err(Failure {
+                partial: out,
+                message,
+            });
+        }
+    }
+    finish(out, left_err)
+}
+
+fn eval_alt(left: &Filter, right: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    match eval(left, input) {
+        Err(failure) => Err(Failure {
+            partial: failure.partial.into_iter().filter(truthy).collect(),
+            message: failure.message,
+        }),
+        Ok(values) => {
+            let defined: Vec<Value> = values.into_iter().filter(truthy).collect();
+            if defined.is_empty() {
+                eval(right, input)
+            } else {
+                Ok(defined)
+            }
+        }
+    }
+}
+
+fn eval_if(cond: &Filter, yes: &Filter, no: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    let (conds, err) = parts(eval(cond, input));
+    let mut out = Vec::new();
+    for cond_value in conds {
+        let branch = if truthy(&cond_value) { yes } else { no };
+        match eval(branch, input) {
+            Ok(values) => out.extend(values),
+            Err(failure) => {
+                out.extend(failure.partial);
+                return Err(Failure {
+                    partial: out,
+                    message: failure.message,
+                });
+            }
+        }
+    }
+    finish(out, err)
+}
+
+fn apply_op(op: Op, left: &Value, right: &Value) -> Result<Value, String> {
+    match op {
+        Op::Add => add_values(left, right),
+        Op::Sub => sub_values(left, right),
+        Op::Mul => mul_values(left, right),
+        Op::Div => div_values(left, right),
+        Op::Rem => rem_values(left, right),
+        Op::Eq => Ok(Value::Bool(cmp_value(left, right) == 0)),
+        Op::Ne => Ok(Value::Bool(cmp_value(left, right) != 0)),
+        Op::Lt => Ok(Value::Bool(cmp_value(left, right) < 0)),
+        Op::Gt => Ok(Value::Bool(cmp_value(left, right) > 0)),
+        Op::Le => Ok(Value::Bool(cmp_value(left, right) <= 0)),
+        Op::Ge => Ok(Value::Bool(cmp_value(left, right) >= 0)),
+    }
+}
+
+fn add_values(left: &Value, right: &Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Null, other) | (other, Value::Null) => Ok(other.clone()),
+        (Value::Number(a), Value::Number(b)) => Ok(num_binop(a, b, NumOp::Add)),
+        (Value::String(a), Value::String(b)) => {
+            let mut text = a.clone();
+            text.push_str(b);
+            Ok(Value::String(text))
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            let mut items = a.clone();
+            items.extend(b.iter().cloned());
+            Ok(Value::Array(items))
+        }
+        (Value::Object(a), Value::Object(b)) => Ok(merge_objects(a, b)),
+        _ => Err(binary_type(left, right, "cannot be added")),
+    }
+}
+
+fn sub_values(left: &Value, right: &Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => Ok(num_binop(a, b, NumOp::Sub)),
+        (Value::Array(a), Value::Array(b)) => Ok(array_sub(a, b)),
+        _ => Err(binary_type(left, right, "cannot be subtracted")),
+    }
+}
+
+fn mul_values(left: &Value, right: &Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => Ok(num_binop(a, b, NumOp::Mul)),
+        (Value::String(text), Value::Number(n)) | (Value::Number(n), Value::String(text)) => {
+            match string_times(text, number::real(n)) {
+                Some(value) => Ok(value),
+                None => Err(binary_type(left, right, "cannot be multiplied")),
+            }
+        }
+        (Value::Object(a), Value::Object(b)) => Ok(merge_deep(a, b)),
+        _ => Err(binary_type(left, right, "cannot be multiplied")),
+    }
+}
+
+fn div_values(left: &Value, right: &Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => num_div(left, right, a, b),
+        (Value::String(text), Value::String(sep)) => Ok(split_string(text, sep)),
+        _ => Err(binary_type(left, right, "cannot be divided")),
+    }
+}
+
+fn rem_values(left: &Value, right: &Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => num_rem(left, right, a, b),
+        _ => Err(binary_type(left, right, "cannot be divided (remainder)")),
+    }
+}
+
+enum NumOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+fn num_binop(left: &str, right: &str, op: NumOp) -> Value {
+    let value = match (number::real(left), number::real(right)) {
+        (number::Real::Nan, _) | (_, number::Real::Nan) => {
+            return Value::Number(number::mark_f64(number::nan_text()))
+        }
+        (number::Real::Num(a), number::Real::Num(b)) => match op {
+            NumOp::Add => a + b,
+            NumOp::Sub => a - b,
+            NumOp::Mul => a * b,
+        },
+    };
+    Value::Number(number::mark_f64(number::format_jq_f64(value)))
+}
+
+fn num_div(left: &Value, right: &Value, a: &str, b: &str) -> Result<Value, String> {
+    if let number::Real::Num(divisor) = number::real(b) {
+        if divisor == 0.0 {
+            return Err(zero_divisor(left, right, false));
+        }
+    }
+    let value = match (number::real(a), number::real(b)) {
+        (number::Real::Nan, _) | (_, number::Real::Nan) => {
+            return Ok(Value::Number(number::mark_f64(number::nan_text())))
+        }
+        (number::Real::Num(x), number::Real::Num(y)) => x / y,
+    };
+    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
+        value,
+    ))))
+}
+
+fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<Value, String> {
+    // A NaN operand wins over a zero divisor. `nan % 0` is NaN.
+    if matches!(number::real(a), number::Real::Nan) || matches!(number::real(b), number::Real::Nan)
+    {
+        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+    }
+    let number::Real::Num(y) = number::real(b) else {
+        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+    };
+    // Truncate toward zero into a 64-bit integer. A fractional divisor such
+    // as `0.5` is zero after that truncation.
+    let divisor = y as i64;
+    if divisor == 0 {
+        return Err(zero_divisor(left, right, true));
+    }
+    let number::Real::Num(x) = number::real(a) else {
+        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+    };
+    // `i64::MIN % -1` does not fit in the quotient. Every integer divides by -1.
+    let remainder = if divisor == -1 {
+        0.0
+    } else {
+        ((x as i64) % divisor) as f64
+    };
+    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
+        remainder,
+    ))))
+}
+
+fn negate_value(value: &Value) -> Result<Value, String> {
+    let Value::Number(text) = value else {
+        return Err(format!(
+            "{} ({}) cannot be negated",
+            value.type_name(),
+            shown(value)
+        ));
+    };
+    let negated = match number::real(text) {
+        number::Real::Nan => return Ok(Value::Number(number::mark_f64(number::nan_text()))),
+        number::Real::Num(n) => -n,
+    };
+    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
+        negated,
+    ))))
+}
+
+/// `None` means the repeat would be enormous. jq builds it; we refuse.
+fn string_times(text: &str, n: number::Real) -> Option<Value> {
+    let number::Real::Num(n) = n else {
+        return Some(Value::Null);
+    };
+    if n < 0.0 {
+        return Some(Value::Null);
+    }
+    if !n.is_finite() {
+        return None;
+    }
+    let count = n.trunc();
+    if count > 8_000_000.0 {
+        return None;
+    }
+    Some(Value::String(text.repeat(count as usize)))
+}
+
+fn split_string(text: &str, sep: &str) -> Value {
+    if sep.is_empty() {
+        return Value::Array(
+            text.chars()
+                .map(|ch| Value::String(ch.to_string()))
+                .collect(),
+        );
+    }
+    if text.is_empty() {
+        return Value::Array(Vec::new());
+    }
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(sep) {
+        parts.push(Value::String(rest[..at].to_string()));
+        rest = &rest[at + sep.len()..];
+    }
+    parts.push(Value::String(rest.to_string()));
+    Value::Array(parts)
+}
+
+fn array_sub(left: &[Value], right: &[Value]) -> Value {
+    let mut out = Vec::new();
+    for item in left {
+        if !right.iter().any(|other| cmp_value(item, other) == 0) {
+            out.push(item.clone());
+        }
+    }
+    Value::Array(out)
+}
+
+fn merge_objects(left: &[(String, Value)], right: &[(String, Value)]) -> Value {
+    let mut pairs = left.to_vec();
+    for (key, value) in right {
+        put(&mut pairs, key.clone(), value.clone());
+    }
+    Value::Object(pairs)
+}
+
+fn merge_deep(left: &[(String, Value)], right: &[(String, Value)]) -> Value {
+    let mut pairs = Vec::new();
+    for (key, left_value) in left {
+        if let Some((_, right_value)) = right.iter().find(|(name, _)| name == key) {
+            match (left_value, right_value) {
+                (Value::Object(left_obj), Value::Object(right_obj)) => {
+                    pairs.push((key.clone(), merge_deep(left_obj, right_obj)));
+                }
+                _ => pairs.push((key.clone(), right_value.clone())),
+            }
+        } else {
+            pairs.push((key.clone(), left_value.clone()));
+        }
+    }
+    for (key, right_value) in right {
+        if left.iter().all(|(name, _)| name != key) {
+            pairs.push((key.clone(), right_value.clone()));
+        }
+    }
+    Value::Object(pairs)
+}
+
+fn type_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(false) => 1,
+        Value::Bool(true) => 2,
+        Value::Number(_) => 3,
+        Value::String(_) => 4,
+        Value::Array(_) => 5,
+        Value::Object(_) => 6,
+    }
+}
+
+fn cmp_value(left: &Value, right: &Value) -> i8 {
+    let left_rank = type_rank(left);
+    let right_rank = type_rank(right);
+    if left_rank != right_rank {
+        return if left_rank < right_rank { -1 } else { 1 };
+    }
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => cmp_number(a, b),
+        (Value::String(a), Value::String(b)) => ord_i8(a.cmp(b)),
+        (Value::Array(a), Value::Array(b)) => cmp_array(a, b),
+        (Value::Object(a), Value::Object(b)) => cmp_object(a, b),
+        _ => 0,
+    }
+}
+
+fn cmp_number(left: &str, right: &str) -> i8 {
+    number::cmp_number_text(left, right)
+}
+
+fn cmp_array(left: &[Value], right: &[Value]) -> i8 {
+    for (a, b) in left.iter().zip(right.iter()) {
+        let cmp = cmp_value(a, b);
+        if cmp != 0 {
+            return cmp;
+        }
+    }
+    ord_i8(left.len().cmp(&right.len()))
+}
+
+fn cmp_object(left: &[(String, Value)], right: &[(String, Value)]) -> i8 {
+    let mut left_keys: Vec<&str> = left.iter().map(|(key, _)| key.as_str()).collect();
+    let mut right_keys: Vec<&str> = right.iter().map(|(key, _)| key.as_str()).collect();
+    left_keys.sort_unstable();
+    right_keys.sort_unstable();
+    for (a, b) in left_keys.iter().zip(right_keys.iter()) {
+        match a.cmp(b) {
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Less => return -1,
+            std::cmp::Ordering::Greater => return 1,
+        }
+    }
+    if left_keys.len() != right_keys.len() {
+        return if left_keys.len() < right_keys.len() {
+            -1
+        } else {
+            1
+        };
+    }
+    for key in left_keys {
+        let left_value = object_get(left, key);
+        let right_value = object_get(right, key);
+        let cmp = cmp_value(left_value, right_value);
+        if cmp != 0 {
+            return cmp;
+        }
+    }
+    0
+}
+
+fn object_get<'a>(items: &'a [(String, Value)], key: &str) -> &'a Value {
+    items
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+        .expect("key is present")
+}
+
+fn ord_i8(order: std::cmp::Ordering) -> i8 {
+    match order {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn binary_type(left: &Value, right: &Value, verb: &str) -> String {
+    format!(
+        "{} ({}) and {} ({}) {verb}",
+        left.type_name(),
+        shown(left),
+        right.type_name(),
+        shown(right)
+    )
+}
+
+fn zero_divisor(left: &Value, right: &Value, remainder: bool) -> String {
+    let verb = if remainder {
+        "cannot be divided (remainder)"
+    } else {
+        "cannot be divided"
+    };
+    format!(
+        "{} because the divisor is zero",
+        binary_type(left, right, verb)
+    )
 }
 
 struct Parser<'a> {
@@ -296,12 +862,108 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comma(&mut self) -> Result<Filter, ProgramError> {
-        let mut filter = self.parse_juxt()?;
+        let mut filter = self.parse_alt()?;
         while self.eat(',') {
-            let right = self.parse_juxt()?;
+            let right = self.parse_alt()?;
             filter = Filter::Comma(Box::new(filter), Box::new(right));
         }
         Ok(filter)
+    }
+
+    /// `//` is right-associative and looser than `or`.
+    fn parse_alt(&mut self) -> Result<Filter, ProgramError> {
+        let left = self.parse_or()?;
+        if self.eat_alt() {
+            let right = self.parse_alt()?;
+            return Ok(Filter::Alt(Box::new(left), Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    fn parse_or(&mut self) -> Result<Filter, ProgramError> {
+        let mut left = self.parse_and()?;
+        while self.eat_keyword("or") {
+            let right = self.parse_and()?;
+            left = Filter::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Filter, ProgramError> {
+        let mut left = self.parse_cmp()?;
+        while self.eat_keyword("and") {
+            let right = self.parse_cmp()?;
+            left = Filter::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Comparisons do not chain. `1<2<3` is a syntax error.
+    fn parse_cmp(&mut self) -> Result<Filter, ProgramError> {
+        let left = self.parse_add()?;
+        let Some(op) = self.cmp_op() else {
+            return Ok(left);
+        };
+        let right = self.parse_add()?;
+        if self.cmp_op_pending() {
+            return Err(ProgramError::Syntax);
+        }
+        Ok(Filter::Bin {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    fn parse_add(&mut self) -> Result<Filter, ProgramError> {
+        let mut left = self.parse_signed()?;
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some('+') => Op::Add,
+                Some('-') => Op::Sub,
+                _ => break,
+            };
+            self.bump();
+            let right = self.parse_signed()?;
+            left = Filter::Bin {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// A leading `-` binds looser than `*` `/` `%`, so `-1/2` is `-(1/2)`.
+    fn parse_signed(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() == Some('-') {
+            self.bump();
+            let operand = self.parse_signed()?;
+            return Ok(Filter::Neg(Box::new(operand)));
+        }
+        self.parse_mul()
+    }
+
+    fn parse_mul(&mut self) -> Result<Filter, ProgramError> {
+        let mut left = self.parse_juxt()?;
+        while let Some(op) = self.mul_op() {
+            // A minus here is the start of the operand, and that operand
+            // includes the tighter `*` `/` `%` that follow it: `2/-3*4`
+            // is `2/-(3*4)`. Without the minus, `8/2/2` stays left-associative.
+            let right = if self.sees('-') {
+                self.parse_signed()?
+            } else {
+                self.parse_juxt()?
+            };
+            left = Filter::Bin {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_juxt(&mut self) -> Result<Filter, ProgramError> {
@@ -309,6 +971,10 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             if matches!(self.peek(), Some('.' | '(')) {
+                // `not(1)` is a function call. Calls are not in this version.
+                if self.peek() == Some('(') && matches!(filter, Filter::Not) {
+                    return Err(ProgramError::Syntax);
+                }
                 let right = self.parse_postfix()?;
                 filter = Filter::Pipe(Box::new(filter), Box::new(right));
             } else {
@@ -319,7 +985,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix(&mut self) -> Result<Filter, ProgramError> {
-        let mut filter = self.parse_unary()?;
+        let mut filter = self.parse_primary()?;
         loop {
             self.skip_ws();
             if self.eat('?') {
@@ -356,27 +1022,6 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(filter)
-    }
-
-    /// A leading `-` is part of a number. `--1` is `1`, and `- 1` is `-1`.
-    fn parse_unary(&mut self) -> Result<Filter, ProgramError> {
-        self.skip_ws();
-        let mut negative = false;
-        while self.peek() == Some('-') {
-            self.bump();
-            negative = !negative;
-            self.skip_ws();
-        }
-        let filter = self.parse_primary()?;
-        if !negative {
-            return Ok(filter);
-        }
-        match filter {
-            Filter::Literal(Value::Number(text)) => {
-                Ok(Filter::Literal(Value::Number(negate_number(&text))))
-            }
-            _ => Err(ProgramError::Syntax),
-        }
     }
 
     fn parse_primary(&mut self) -> Result<Filter, ProgramError> {
@@ -417,21 +1062,140 @@ impl<'a> Parser<'a> {
                 "true" => Ok(Filter::Literal(Value::Bool(true))),
                 "false" => Ok(Filter::Literal(Value::Bool(false))),
                 "null" => Ok(Filter::Literal(Value::Null)),
+                "nan" => Ok(Filter::Literal(Value::Number(number::nan_text()))),
+                "infinite" => Ok(Filter::Literal(Value::Number(number::pos_inf()))),
+                "not" => Ok(Filter::Not),
+                "if" => self.parse_if(),
                 _ => Err(ProgramError::Syntax),
             };
         }
         Err(ProgramError::Syntax)
     }
 
-    /// Pipe and unary minus, without the comma operator.
-    /// Object values use this. A comma there separates fields.
+    /// Pipe and unary minus, without comma or the arithmetic operators.
+    /// Object values use this, so `{a:1+2}` stays a syntax error.
     fn parse_expd(&mut self) -> Result<Filter, ProgramError> {
-        let mut filter = self.parse_unary()?;
+        let mut filter = self.parse_expd_unary()?;
         while self.eat('|') {
-            let right = self.parse_unary()?;
+            let right = self.parse_expd_unary()?;
             filter = Filter::Pipe(Box::new(filter), Box::new(right));
         }
         Ok(filter)
+    }
+
+    fn parse_expd_unary(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() == Some('-') {
+            self.bump();
+            let operand = self.parse_expd_unary()?;
+            return Ok(Filter::Neg(Box::new(operand)));
+        }
+        self.parse_postfix()
+    }
+
+    fn parse_if(&mut self) -> Result<Filter, ProgramError> {
+        let cond = self.parse_pipe()?;
+        if !self.eat_keyword("then") {
+            return Err(ProgramError::Syntax);
+        }
+        let yes = self.parse_pipe()?;
+        let no = self.parse_else()?;
+        Ok(Filter::If {
+            cond: Box::new(cond),
+            yes: Box::new(yes),
+            no: Box::new(no),
+        })
+    }
+
+    fn parse_else(&mut self) -> Result<Filter, ProgramError> {
+        if self.eat_keyword("elif") {
+            let cond = self.parse_pipe()?;
+            if !self.eat_keyword("then") {
+                return Err(ProgramError::Syntax);
+            }
+            let yes = self.parse_pipe()?;
+            let no = self.parse_else()?;
+            return Ok(Filter::If {
+                cond: Box::new(cond),
+                yes: Box::new(yes),
+                no: Box::new(no),
+            });
+        }
+        let no = if self.eat_keyword("else") {
+            self.parse_pipe()?
+        } else {
+            // A missing else yields the input, which is null under -n.
+            Filter::Identity
+        };
+        if !self.eat_keyword("end") {
+            return Err(ProgramError::Syntax);
+        }
+        Ok(no)
+    }
+
+    fn eat_keyword(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        let rest = &self.src[self.index..];
+        if rest.len() < word.len() || !rest.starts_with(word) {
+            return false;
+        }
+        let boundary = match rest[word.len()..].chars().next() {
+            None => true,
+            Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => false,
+            Some(_) => true,
+        };
+        if !boundary {
+            return false;
+        }
+        self.index += word.len();
+        true
+    }
+
+    fn eat_alt(&mut self) -> bool {
+        self.skip_ws();
+        if self.src[self.index..].starts_with("//") {
+            self.index += 2;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sees(&mut self, expected: char) -> bool {
+        self.skip_ws();
+        self.peek() == Some(expected)
+    }
+
+    fn cmp_op(&mut self) -> Option<Op> {
+        self.skip_ws();
+        let (op, len) = cmp_at(&self.src[self.index..])?;
+        self.index += len;
+        Some(op)
+    }
+
+    fn cmp_op_pending(&mut self) -> bool {
+        self.skip_ws();
+        cmp_at(&self.src[self.index..]).is_some()
+    }
+
+    /// `*` `/` `%`, but not `//`.
+    fn mul_op(&mut self) -> Option<Op> {
+        self.skip_ws();
+        let rest = &self.src[self.index..];
+        if rest.starts_with("//") {
+            return None;
+        }
+        let (op, len) = if rest.starts_with('*') {
+            (Op::Mul, 1)
+        } else if rest.starts_with('/') {
+            (Op::Div, 1)
+        } else if rest.starts_with('%') {
+            (Op::Rem, 1)
+        } else {
+            return None;
+        };
+        self.index += len;
+        Some(op)
     }
 
     fn parse_path(&mut self) -> Result<Filter, ProgramError> {
@@ -1058,6 +1822,24 @@ fn optional_last(filter: Filter) -> Filter {
     }
 }
 
+fn cmp_at(rest: &str) -> Option<(Op, usize)> {
+    if rest.starts_with("==") {
+        Some((Op::Eq, 2))
+    } else if rest.starts_with("!=") {
+        Some((Op::Ne, 2))
+    } else if rest.starts_with("<=") {
+        Some((Op::Le, 2))
+    } else if rest.starts_with(">=") {
+        Some((Op::Ge, 2))
+    } else if rest.starts_with('<') {
+        Some((Op::Lt, 1))
+    } else if rest.starts_with('>') {
+        Some((Op::Gt, 1))
+    } else {
+        None
+    }
+}
+
 fn at_key(base: Option<Filter>, key: Filter) -> Filter {
     if let Filter::Literal(Value::String(name)) = key {
         return chain(base, Filter::Field(name));
@@ -1065,16 +1847,6 @@ fn at_key(base: Option<Filter>, key: Filter) -> Filter {
     Filter::At {
         base: Box::new(base.unwrap_or(Filter::Identity)),
         key: Box::new(key),
-    }
-}
-
-fn negate_number(text: &str) -> String {
-    if text == "0" || text == "-0" {
-        return "0".to_string();
-    }
-    match text.strip_prefix('-') {
-        Some(rest) => rest.to_string(),
-        None => format!("-{text}"),
     }
 }
 
@@ -1156,6 +1928,17 @@ fn const_outputs(filter: &Filter) -> Option<Vec<Value>> {
         }
         Filter::Object(fields) => const_object(fields).map(|value| vec![value]),
         Filter::Optional(inner) => const_outputs(inner),
+        Filter::Bin { op, left, right } => {
+            let lefts = const_outputs(left)?;
+            let rights = const_outputs(right)?;
+            let mut out = Vec::new();
+            for right in &rights {
+                for left in &lefts {
+                    out.push(apply_op(*op, left, right).ok()?);
+                }
+            }
+            Some(out)
+        }
         _ => None,
     }
 }

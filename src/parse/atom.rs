@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
 
     fn parse_nan(&mut self) -> Result<Value, ()> {
         if self.take_nonfinite_word("nan") {
-            return Ok(Value::Number("null".to_string()));
+            return Ok(Value::Number(number::nan_text()));
         }
         Err(())
     }

@@ -28,11 +28,15 @@ A program can also contain numbers, strings, `true`, `false`, and `null`. String
 
 An object key that is not a string fails the way jq fails. A bad string escape does too.
 
+`+`, `-`, `*`, `/`, and `%` work on numbers. `+` also joins strings and arrays and merges objects. `-` removes elements from an array. `*` repeats a string, and it merges objects when both values of a key are objects. `/` splits a string. `nan` and `infinite` are numbers. Comparisons are `==`, `!=`, `<`, `<=`, `>`, and `>=`. The order is null, then false, then true, then numbers, strings, arrays, and objects. `and`, `or`, and `not` yield booleans. `//` is the alternative. `if` uses `then`, any number of `elif`, an optional `else`, and `end`.
+
+An operator that is given values it cannot use fails the way jq fails, including division and remainder by zero. The exit status is 5.
+
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
 
-Filters past the list above are rejected. `.+1` is a syntax error here and prints `2` in jq. The message is `tumulus: syntax error` and the exit status is 3.
+Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`.
 
 `{$name}` and `{$name: value}` are rejected. jq uses the variable's name or the variable's value as an object key. `$__loc__` as a field is rejected too.
 

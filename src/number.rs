@@ -10,10 +10,303 @@ const MAX_SCI: i128 = 999_999_999;
 const MIN_LSD: i128 = -1_147_483_646;
 const DBL_MAX: &str = "1.7976931348623157e+308";
 
-/// jq prints infinities as the maximum finite binary64 value.
+/// Sentinels for values whose printed form is not enough to tell them apart
+/// from a finite number or from `null`.
+const POS_INF: &str = "\u{0}+";
+const NEG_INF: &str = "\u{0}-";
+const NAN_TEXT: &str = "\u{0}n";
+
+pub fn pos_inf() -> String {
+    POS_INF.to_string()
+}
+
+pub fn neg_inf() -> String {
+    NEG_INF.to_string()
+}
+
+pub fn nan_text() -> String {
+    NAN_TEXT.to_string()
+}
+
+pub fn write_number(out: &mut String, text: &str) {
+    let text = body(text);
+    if text == POS_INF {
+        out.push_str(DBL_MAX);
+    } else if text == NEG_INF {
+        out.push('-');
+        out.push_str(DBL_MAX);
+    } else if text == NAN_TEXT {
+        out.push_str("null");
+    } else {
+        out.push_str(text);
+    }
+}
+
+/// A number as arithmetic sees it. `Nan` is not equal to itself.
+pub enum Real {
+    Nan,
+    Num(f64),
+}
+
+pub fn real(text: &str) -> Real {
+    let text = body(text);
+    if text == NAN_TEXT {
+        return Real::Nan;
+    }
+    if text == POS_INF {
+        return Real::Num(f64::INFINITY);
+    }
+    if text == NEG_INF {
+        return Real::Num(f64::NEG_INFINITY);
+    }
+    match text.parse::<f64>() {
+        Ok(n) if n.is_nan() => Real::Nan,
+        Ok(n) => Real::Num(n),
+        Err(_) => Real::Nan,
+    }
+}
+
+/// An arithmetic result. Its printed text is not the preserved literal.
+pub fn mark_f64(text: String) -> String {
+    let mut out = String::with_capacity(text.len() + 1);
+    out.push('\u{1}');
+    out.push_str(&text);
+    out
+}
+
+fn body(text: &str) -> &str {
+    text.strip_prefix('\u{1}').unwrap_or(text)
+}
+
+fn is_marked(text: &str) -> bool {
+    text.starts_with('\u{1}')
+}
+
+/// Literals keep their decimal. A value that has been through arithmetic
+/// compares as a binary64 number, and two literals compare as decimals.
+pub fn cmp_number_text(left: &str, right: &str) -> i8 {
+    let left_body = body(left);
+    let right_body = body(right);
+    let left_exact = !is_marked(left) && is_finite_decimal(left_body);
+    let right_exact = !is_marked(right) && is_finite_decimal(right_body);
+    if left_exact && right_exact {
+        return cmp_decimal(left_body, right_body);
+    }
+    cmp_real(real(left), real(right))
+}
+
+fn is_finite_decimal(text: &str) -> bool {
+    !matches!(text, POS_INF | NEG_INF | NAN_TEXT)
+}
+
+fn cmp_real(left: Real, right: Real) -> i8 {
+    match (left, right) {
+        (Real::Nan, _) => -1,
+        (_, Real::Nan) => 1,
+        (Real::Num(a), Real::Num(b)) => {
+            if a < b {
+                -1
+            } else if a > b {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn cmp_decimal(left: &str, right: &str) -> i8 {
+    let Some((left_neg, left_digits, left_scale)) = decimal_parts(left) else {
+        return cmp_real(real(left), real(right));
+    };
+    let Some((right_neg, right_digits, right_scale)) = decimal_parts(right) else {
+        return cmp_real(real(left), real(right));
+    };
+    let left_mag = canonical_mag(left_digits, left_scale);
+    let right_mag = canonical_mag(right_digits, right_scale);
+    match (&left_mag, &right_mag) {
+        (None, None) => 0,
+        (None, Some(_)) => {
+            if right_neg {
+                1
+            } else {
+                -1
+            }
+        }
+        (Some(_), None) => {
+            if left_neg {
+                -1
+            } else {
+                1
+            }
+        }
+        (Some((ld, ls)), Some((rd, rs))) => {
+            let mag = cmp_mag(ld, *ls, rd, *rs);
+            if left_neg == right_neg {
+                if left_neg {
+                    -mag
+                } else {
+                    mag
+                }
+            } else if left_neg {
+                -1
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// Digits without leading or trailing zeros, and the power of ten of the
+/// last digit. `None` is zero.
+fn canonical_mag(digits: String, scale: i32) -> Option<(String, i64)> {
+    let lead = digits.chars().take_while(|ch| *ch == '0').count();
+    if lead == digits.len() {
+        return None;
+    }
+    let mut digits = if lead > 0 {
+        digits[lead..].to_string()
+    } else {
+        digits
+    };
+    let mut scale = i64::from(scale);
+    while digits.ends_with('0') {
+        digits.pop();
+        scale += 1;
+    }
+    Some((digits, scale))
+}
+
+fn cmp_mag(left: &str, left_scale: i64, right: &str, right_scale: i64) -> i8 {
+    let left_exp = left_scale + left.len() as i64 - 1;
+    let right_exp = right_scale + right.len() as i64 - 1;
+    if left_exp != right_exp {
+        return if left_exp < right_exp { -1 } else { 1 };
+    }
+    match left.cmp(right) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Print a computed number the way jq prints an arithmetic result.
+/// Literals keep `normalize`; this is only for results of operators.
+pub fn format_jq_f64(n: f64) -> String {
+    if n.is_nan() {
+        return nan_text();
+    }
+    if n.is_infinite() {
+        return if n.is_sign_negative() {
+            neg_inf()
+        } else {
+            pos_inf()
+        };
+    }
+    if n == 0.0 {
+        return if n.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    let negative = n.is_sign_negative();
+    let (digits, decpt) = decompose(n.abs());
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&format_digits(&digits, decpt));
+    out
+}
+
+/// `digits` is the shortest coefficient and `decpt` places the point so the
+/// value is `0.digits * 10^decpt`.
+fn decompose(abs: f64) -> (String, i32) {
+    let text = format!("{abs}");
+    let exp_at = text.find(['e', 'E']);
+    let (mant, exp) = match exp_at {
+        Some(at) => (&text[..at], text[at + 1..].parse::<i32>().unwrap_or(0)),
+        None => (text.as_str(), 0),
+    };
+    let mut digits = String::new();
+    let mut point: Option<i32> = None;
+    for ch in mant.chars() {
+        if ch == '.' {
+            point = Some(digits.len() as i32);
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        }
+    }
+    let mut point = point.unwrap_or(digits.len() as i32);
+    let lead = digits.chars().take_while(|ch| *ch == '0').count() as i32;
+    if lead as usize >= digits.len() {
+        return ("0".to_string(), 0);
+    }
+    if lead > 0 {
+        digits = digits[lead as usize..].to_string();
+        point -= lead;
+    }
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        return ("0".to_string(), 0);
+    }
+    (digits, point + exp)
+}
+
+fn format_digits(digits: &str, decpt: i32) -> String {
+    let len = digits.len() as i32;
+    if decpt <= -4 || decpt > len + 15 {
+        let mut out = String::new();
+        out.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        let exp = decpt - 1;
+        out.push('e');
+        if exp < 0 {
+            out.push('-');
+        } else {
+            out.push('+');
+        }
+        let body = exp.abs().to_string();
+        if body.len() < 2 {
+            out.push('0');
+        }
+        out.push_str(&body);
+        return out;
+    }
+    if decpt <= 0 {
+        let mut out = String::from("0.");
+        out.extend(std::iter::repeat_n('0', (-decpt) as usize));
+        out.push_str(digits);
+        return out;
+    }
+    if decpt >= len {
+        let mut out = digits.to_string();
+        out.extend(std::iter::repeat_n('0', (decpt - len) as usize));
+        return out;
+    }
+    let at = decpt as usize;
+    let mut out = String::new();
+    out.push_str(&digits[..at]);
+    out.push('.');
+    out.push_str(&digits[at..]);
+    out
+}
+
 /// Truncate a filter index literal toward zero.
 /// `None` means the magnitude does not fit in an array index.
 pub fn array_index(literal: &str) -> Option<i64> {
+    let literal = body(literal);
+    if matches!(literal, POS_INF | NEG_INF | NAN_TEXT) {
+        return None;
+    }
     let bytes = literal.as_bytes();
     let mut index = 0;
     let negative = if bytes.first() == Some(&b'-') {
@@ -292,9 +585,9 @@ fn literal_int_len(literal: &str) -> usize {
 
 pub fn infinite(negative: bool) -> String {
     if negative {
-        format!("-{DBL_MAX}")
+        neg_inf()
     } else {
-        DBL_MAX.to_string()
+        pos_inf()
     }
 }
 
@@ -375,8 +668,10 @@ fn render(negative: bool, digits: &str, lsd: Exp) -> String {
 fn saturate_high(sign: &str, zero: bool) -> String {
     if zero {
         format!("{sign}0E+{MAX_SCI}")
+    } else if sign.is_empty() {
+        pos_inf()
     } else {
-        format!("{sign}{DBL_MAX}")
+        neg_inf()
     }
 }
 
