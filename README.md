@@ -20,13 +20,13 @@ Printing:
 
 Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected.
 
-Filters that work are field access (`.a`, `.a.b`, `.["a"]`), array indexes (`.[0]` and negative indexes), iteration (`.[]`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
+Filters that work are field access (`.a`, `.a.b`, `.["a"]`, `."a b"`), array indexes (`.[0]` and negative indexes), slices (`.[2:5]`, `.[:-1]`), several keys or indexes in one bracket (`.["a","b"]`), iteration (`.[]`), recurse (`..`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
 
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
 
-Filters past the list above are rejected. `.+1` is a syntax error here and prints `2` in jq. `..` is a syntax error here and is recurse in jq. The message is `tumulus: syntax error` and the exit status is 3.
+Filters past the list above are rejected. `.+1` is a syntax error here and prints `2` in jq. The message is `tumulus: syntax error` and the exit status is 3.
 
 Options other than the ones above are rejected. `-s` exits 1 with `tumulus: unknown option: -s`. jq slurps with `-s`. An unknown long option exits 1 with `tumulus: unknown option: ...`. jq exits 2 and prints its usage text.
 

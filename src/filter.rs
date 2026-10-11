@@ -1,6 +1,6 @@
-//! The first jq filters: paths, iteration, pipe, comma, and `?`.
+//! Paths, slices, iteration, recurse, pipe, comma, and `?`.
 
-use crate::number::array_index;
+use crate::number::{array_index, slice_bound};
 use crate::parse;
 use crate::print::{self, Layout, Style};
 use crate::value::Value;
@@ -10,7 +10,14 @@ pub enum Filter {
     Identity,
     Field(String),
     Index(ArrayIndex),
+    /// `.[start:end]`. `None` means that side was left off.
+    Slice {
+        start: Option<String>,
+        end: Option<String>,
+    },
     Iterate,
+    /// `..`, the value and then every value inside it.
+    Recurse,
     Pipe(Box<Filter>, Box<Filter>),
     Comma(Box<Filter>, Box<Filter>),
     Optional(Box<Filter>),
@@ -47,7 +54,9 @@ pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
         Filter::Identity => Ok(vec![input.clone()]),
         Filter::Field(key) => index_string(input, key),
         Filter::Index(index) => index_number(input, index),
+        Filter::Slice { start, end } => slice(input, start.as_deref(), end.as_deref()),
         Filter::Iterate => iterate(input),
+        Filter::Recurse => Ok(recurse(input)),
         Filter::Optional(inner) => match eval(inner, input) {
             Ok(values) => Ok(values),
             Err(failure) => Ok(failure.partial),
@@ -133,6 +142,59 @@ fn nth(items: &[Value], index: i64) -> Value {
     } else {
         items[position as usize].clone()
     }
+}
+
+fn slice(input: &Value, start: Option<&str>, end: Option<&str>) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Null => Ok(vec![Value::Null]),
+        Value::Array(items) => {
+            let (from, to) = slice_range(start, end, items.len());
+            Ok(vec![Value::Array(items[from..to].to_vec())])
+        }
+        Value::String(text) => {
+            let chars: Vec<char> = text.chars().collect();
+            let (from, to) = slice_range(start, end, chars.len());
+            Ok(vec![Value::String(chars[from..to].iter().collect())])
+        }
+        other => Err(fail(format!(
+            "Cannot index {} with object",
+            other.type_name()
+        ))),
+    }
+}
+
+fn slice_range(start: Option<&str>, end: Option<&str>, len: usize) -> (usize, usize) {
+    let len_i = i64::try_from(len).unwrap_or(i64::MAX);
+    let from = match start {
+        Some(literal) => slice_bound(literal, len_i, false),
+        None => 0,
+    };
+    let to = match end {
+        Some(literal) => slice_bound(literal, len_i, true),
+        None => len_i,
+    };
+    let from = from.max(0) as usize;
+    let to = to.max(0) as usize;
+    let from = from.min(len);
+    let to = to.min(len);
+    if from >= to {
+        (from, from)
+    } else {
+        (from, to)
+    }
+}
+
+fn recurse(input: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![input.clone()];
+    while let Some(value) = stack.pop() {
+        if let Ok(mut children) = iterate(&value) {
+            children.reverse();
+            stack.extend(children);
+        }
+        out.push(value);
+    }
+    out
 }
 
 fn iterate(input: &Value) -> Result<Vec<Value>, Failure> {
@@ -235,13 +297,22 @@ impl<'a> Parser<'a> {
     fn parse_path(&mut self) -> Result<Filter, String> {
         self.bump();
         if self.peek() == Some('.') {
-            return Err("syntax error".to_string());
+            self.bump();
+            if self.peek() == Some('.') || self.starts_ident() {
+                return Err("syntax error".to_string());
+            }
+            return self.finish_path(Some(Filter::Recurse));
         }
         let mut filter = None;
-        if self.starts_ident() {
-            let name = self.ident()?;
+        if let Some(name) = self.quoted_field()? {
             filter = Some(Filter::Field(name));
+        } else if self.starts_ident() {
+            filter = Some(Filter::Field(self.ident()?));
         }
+        self.finish_path(filter)
+    }
+
+    fn finish_path(&mut self, mut filter: Option<Filter>) -> Result<Filter, String> {
         loop {
             self.skip_ws();
             if self.eat('?') {
@@ -261,6 +332,10 @@ impl<'a> Parser<'a> {
                     return Err("syntax error".to_string());
                 }
                 self.bump();
+                if let Some(name) = self.quoted_field()? {
+                    filter = Some(chain(filter, Filter::Field(name)));
+                    continue;
+                }
                 if self.starts_ident() {
                     let name = self.ident()?;
                     filter = Some(chain(filter, Filter::Field(name)));
@@ -278,6 +353,20 @@ impl<'a> Parser<'a> {
         Ok(filter.unwrap_or(Filter::Identity))
     }
 
+    /// A quoted name after `.`, including when a space sits between them.
+    fn quoted_field(&mut self) -> Result<Option<String>, String> {
+        if self.peek() == Some('"') {
+            return Ok(Some(self.string()?));
+        }
+        let save = self.index;
+        self.skip_ws();
+        if self.peek() == Some('"') {
+            return Ok(Some(self.string()?));
+        }
+        self.index = save;
+        Ok(None)
+    }
+
     fn parse_brackets(&mut self) -> Result<Filter, String> {
         if !self.eat('[') {
             return Err("syntax error".to_string());
@@ -286,24 +375,33 @@ impl<'a> Parser<'a> {
         if self.eat(']') {
             return Ok(Filter::Iterate);
         }
-        if self.peek() == Some('"') {
-            let key = self.string()?;
+        let mut toks = Vec::new();
+        loop {
             self.skip_ws();
-            if !self.eat(']') {
-                return Err("syntax error".to_string());
+            if self.peek() == Some('"') {
+                toks.push(BracketTok::Str(self.string()?));
+            } else if self
+                .peek()
+                .is_some_and(|c| c == '-' || c == '.' || c.is_ascii_digit())
+            {
+                toks.push(BracketTok::Num(self.number_literal()?.to_string()));
             }
-            return Ok(Filter::Field(key));
-        }
-        let literal = self.number_literal()?;
-        self.skip_ws();
-        if !self.eat(']') {
+            self.skip_ws();
+            if self.eat(':') {
+                toks.push(BracketTok::Colon);
+                continue;
+            }
+            if self.peek() == Some(',') {
+                self.bump();
+                toks.push(BracketTok::Comma);
+                continue;
+            }
+            if self.eat(']') {
+                break;
+            }
             return Err("syntax error".to_string());
         }
-        let index = match array_index(literal) {
-            Some(index) => ArrayIndex::At(index),
-            None => ArrayIndex::OutOfRange,
-        };
-        Ok(Filter::Index(index))
+        filter_from_brackets(toks)
     }
 
     fn string(&mut self) -> Result<String, String> {
@@ -402,6 +500,99 @@ impl<'a> Parser<'a> {
     fn eof(&self) -> bool {
         self.index >= self.src.len()
     }
+}
+
+enum BracketTok {
+    Num(String),
+    Str(String),
+    Colon,
+    Comma,
+}
+
+fn filter_from_brackets(toks: Vec<BracketTok>) -> Result<Filter, String> {
+    let colons = toks
+        .iter()
+        .filter(|tok| matches!(tok, BracketTok::Colon))
+        .count();
+    if colons > 1 {
+        return Err("syntax error".to_string());
+    }
+    if colons == 1 {
+        let at = toks
+            .iter()
+            .position(|tok| matches!(tok, BracketTok::Colon))
+            .expect("colon");
+        let starts = bracket_side(&toks[..at])?;
+        let ends = bracket_side(&toks[at + 1..])?;
+        if starts.iter().all(Option::is_none) && ends.iter().all(Option::is_none) {
+            return Err("syntax error".to_string());
+        }
+        let mut filters = Vec::new();
+        for start in &starts {
+            for end in &ends {
+                filters.push(Filter::Slice {
+                    start: start.clone(),
+                    end: end.clone(),
+                });
+            }
+        }
+        return Ok(combine_commas(filters));
+    }
+    let mut items = Vec::new();
+    let mut expect_value = true;
+    for tok in toks {
+        match tok {
+            BracketTok::Comma if !expect_value => expect_value = true,
+            BracketTok::Num(literal) if expect_value => {
+                let index = match array_index(&literal) {
+                    Some(index) => ArrayIndex::At(index),
+                    None => ArrayIndex::OutOfRange,
+                };
+                items.push(Filter::Index(index));
+                expect_value = false;
+            }
+            BracketTok::Str(key) if expect_value => {
+                items.push(Filter::Field(key));
+                expect_value = false;
+            }
+            _ => return Err("syntax error".to_string()),
+        }
+    }
+    if expect_value || items.is_empty() {
+        return Err("syntax error".to_string());
+    }
+    Ok(combine_commas(items))
+}
+
+fn bracket_side(toks: &[BracketTok]) -> Result<Vec<Option<String>>, String> {
+    if toks.is_empty() {
+        return Ok(vec![None]);
+    }
+    let mut bounds = Vec::new();
+    let mut expect_value = true;
+    for tok in toks {
+        match tok {
+            BracketTok::Comma if !expect_value => expect_value = true,
+            BracketTok::Num(literal) if expect_value => {
+                bounds.push(Some(literal.clone()));
+                expect_value = false;
+            }
+            _ => return Err("syntax error".to_string()),
+        }
+    }
+    if expect_value || bounds.is_empty() {
+        return Err("syntax error".to_string());
+    }
+    Ok(bounds)
+}
+
+fn combine_commas(items: Vec<Filter>) -> Filter {
+    let mut items = items.into_iter();
+    let mut filter = items.next().expect("one bracket term");
+    for item in items {
+        filter = Filter::Comma(Box::new(filter), Box::new(item));
+    }
+    filter
 }
 
 fn chain(left: Option<Filter>, right: Filter) -> Filter {
