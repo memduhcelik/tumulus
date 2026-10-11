@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process;
 
-use tumulus::{write_input, Error, Indent, Layout, Style};
+use tumulus::{compile, eval, parse_stream, render, Error, Indent, Layout, Style};
 
 fn main() {
     let stdout = io::stdout();
@@ -27,23 +27,73 @@ fn main() {
 
 fn run(out: &mut dyn Write) -> Result<i32, Error> {
     let options = options()?;
+    let program = match compile(&options.program) {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("tumulus: {err}");
+            return Ok(3);
+        }
+    };
     if options.files.is_empty() {
-        write_input(&read_stdin()?, options.style, out)?;
-        return Ok(0);
+        return apply(&read_stdin()?, options.style, &program, "<stdin>", out);
     }
-    let mut missing = false;
+    let mut status = 0;
     for path in &options.files {
         match read_input(path) {
-            Ok(bytes) => write_input(&bytes, options.style, out)?,
+            Ok(bytes) => {
+                let source = if path == "-" {
+                    "<stdin>"
+                } else {
+                    path.as_str()
+                };
+                let code = apply(&bytes, options.style, &program, source, out)?;
+                if code != 0 {
+                    status = code;
+                }
+            }
             Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
                 // jq names the missing file and keeps going.
                 eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
-                missing = true;
+                if status == 0 {
+                    status = 2;
+                }
             }
             Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
         }
     }
-    Ok(if missing { 2 } else { 0 })
+    Ok(status)
+}
+
+fn apply(
+    bytes: &[u8],
+    style: Style,
+    program: &tumulus::Filter,
+    source: &str,
+    out: &mut dyn Write,
+) -> Result<i32, Error> {
+    let mut failed = false;
+    for item in parse_stream(bytes)? {
+        match eval(program, &item.value) {
+            Ok(values) => write_values(&values, style, out)?,
+            Err(failure) => {
+                write_values(&failure.partial, style, out)?;
+                eprintln!("jq: error (at {source}:{}): {}", item.line, failure.message);
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed { 5 } else { 0 })
+}
+
+fn write_values(values: &[tumulus::Value], style: Style, out: &mut dyn Write) -> Result<(), Error> {
+    for value in values {
+        let rendered = render(value, style);
+        out.write_all(rendered.as_bytes())?;
+        if !style.join {
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 fn os_reason(err: &std::io::Error) -> String {
@@ -56,6 +106,7 @@ fn os_reason(err: &std::io::Error) -> String {
 
 struct Options {
     style: Style,
+    program: String,
     files: Vec<String>,
 }
 
@@ -110,15 +161,14 @@ fn options() -> Result<Options, Error> {
         // With no filter argument, jq applies `.`.
         return Ok(Options {
             style,
+            program: ".".to_string(),
             files: Vec::new(),
         });
     }
-    if operands[0] != "." {
-        return Err(Error::new(format!("unsupported filter: {}", operands[0])));
-    }
-    operands.remove(0);
+    let program = operands.remove(0);
     Ok(Options {
         style,
+        program,
         files: operands,
     })
 }

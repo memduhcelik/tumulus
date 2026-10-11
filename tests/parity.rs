@@ -417,6 +417,104 @@ fn output_flags_match_jq() {
     compare_exact("indent missing after filter", &[".", "--indent"], b"1");
 }
 
+#[test]
+fn filters_match_jq() {
+    require_jq();
+    let doc = r#"{"a":[{"b":1,"c":[10]},2,{"b":3,"c":[]}],"b":[9],"a b":{"z":true},"n":null}"#;
+    let cases = [
+        (".a", doc),
+        (".a.b", r#"{"a":{"b":1}}"#),
+        (".a.b", r#"{"a":1}"#),
+        (".a.b", "null"),
+        (".a.b?", r#"{"a":1}"#),
+        (".a?.b", "1"),
+        (".a?.b", r#"{"a":1}"#),
+        ("(.a.b)?", "1"),
+        (r#".["a b"].z"#, doc),
+        (r#".["a"].b"#, r#"{"a":{"b":4}}"#),
+        (".[0]", "[10,20,30]"),
+        (".[-1]", "[10,20,30]"),
+        (".[1.9]", "[10,20,30]"),
+        (".[-1.1]", "[10,20,30]"),
+        (".[10]", "[10,20,30]"),
+        (".[0]", "null"),
+        (".[0]", "1"),
+        (".[0]?", "1"),
+        (".[]", "[10,20,30]"),
+        (".[]", r#"{"b":1,"a":2}"#),
+        (".[]", "[]"),
+        (".[]", "1"),
+        (".[]", "null"),
+        (".[]", r#""abc""#),
+        (".[]?", "1"),
+        (".[]?", "null"),
+        (".a[0].b", doc),
+        (".a[].b", doc),
+        (".a[].b?", doc),
+        (".a[] | .b, .c[]?", doc),
+        (".a, .b | .[0]", doc),
+        (".[] | .a, .b", r#"[{"a":1,"b":2},{"a":3}]"#),
+        ("(.a | .b), .n", r#"{"a":{"b":1},"n":2}"#),
+        (".[] | .a?", r#"[1,{"a":2},true]"#),
+        ("(.[] | .a)?", r#"[{"a":1},2]"#),
+        (".a.b?", "1"),
+        (".?", "1"),
+        (".a??", r#"{"a":1}"#),
+        ("._a", r#"{"_a":1}"#),
+        (".a .b", r#"{"a":{"b":1}}"#),
+        (".a [0]", r#"{"a":[10,20]}"#),
+        (".[][]", "[[1,2],[3]]"),
+        (".", "NaN"),
+        (".a", "NaN"),
+        (".[]", "NaN"),
+        (".", "Infinity"),
+        (".[]", "Infinity"),
+        (".[]", "-Infinity"),
+        (".[]", r#""xxxxxxxxxxxx""#),
+        (".a", "1\n{\"a\":2}\ntrue\n"),
+        (".[] | .a", r#"[{"a":1},2]"#),
+        (".a, .b", "1"),
+    ];
+    for (expr, input) in cases {
+        compare_exact(expr, &[expr], input.as_bytes());
+    }
+    compare_exact(
+        "long iterate",
+        &[".[]"],
+        format!("\"{}\"", "x".repeat(13)).as_bytes(),
+    );
+    compare_exact("compact field", &["-c", ".a[].b"], doc.as_bytes());
+    compare_exact(
+        "raw names",
+        &["-r", ".a[].b"],
+        r#"{"a":[{"b":"caf\u00e9"},{"b":"x"}]}"#.as_bytes(),
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "tumulus-filter-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _cleanup = DirGuard(dir.clone());
+    fs::create_dir_all(&dir).expect("temp dir");
+    let ended = dir.join("ended.json");
+    let open = dir.join("open.json");
+    fs::write(&ended, "1\n{\"a\":2}\n").expect("write");
+    fs::write(&open, "1\ntrue").expect("write");
+    compare_exact(
+        "file lines",
+        &[
+            ".a",
+            ended.to_str().expect("utf-8"),
+            open.to_str().expect("utf-8"),
+        ],
+        b"",
+    );
+}
+
 struct DirGuard(std::path::PathBuf);
 
 impl Drop for DirGuard {

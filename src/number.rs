@@ -11,6 +11,116 @@ const MIN_LSD: i128 = -1_147_483_646;
 const DBL_MAX: &str = "1.7976931348623157e+308";
 
 /// jq prints infinities as the maximum finite binary64 value.
+/// Truncate a filter index literal toward zero.
+/// `None` means the magnitude does not fit in an array index.
+pub fn array_index(literal: &str) -> Option<i64> {
+    let bytes = literal.as_bytes();
+    let mut index = 0;
+    let negative = if bytes.first() == Some(&b'-') {
+        index = 1;
+        true
+    } else {
+        false
+    };
+    let mut int_digits = String::new();
+    let mut frac_digits = String::new();
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            frac_digits.push(bytes[index] as char);
+            index += 1;
+        }
+    } else {
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            int_digits.push(bytes[index] as char);
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'.') {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                frac_digits.push(bytes[index] as char);
+                index += 1;
+            }
+        }
+    }
+    let exponent = if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
+        index += 1;
+        let exp_negative = if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-')
+        {
+            let neg = bytes[index] == b'-';
+            index += 1;
+            neg
+        } else {
+            false
+        };
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let digits = literal[start..index].trim_start_matches('0');
+        if digits.len() > 9 {
+            return if exp_negative { Some(0) } else { None };
+        }
+        let value: i32 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().unwrap_or(0)
+        };
+        if exp_negative {
+            -value
+        } else {
+            value
+        }
+    } else {
+        0
+    };
+    let mut digits = int_digits;
+    digits.push_str(&frac_digits);
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let point = (literal_int_len(literal)) as i32;
+    let Some(new_point) = point.checked_add(exponent) else {
+        return if exponent < 0 { Some(0) } else { None };
+    };
+    if new_point <= 0 {
+        return Some(0);
+    }
+    let int_part = if new_point as usize >= digits.len() {
+        let mut widened = digits;
+        widened.extend(std::iter::repeat_n('0', new_point as usize - widened.len()));
+        widened
+    } else {
+        digits[..new_point as usize].to_string()
+    };
+    let trimmed = int_part.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    if trimmed.len() > 18 {
+        return None;
+    }
+    let magnitude: i64 = trimmed.parse().ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
+fn literal_int_len(literal: &str) -> usize {
+    let bytes = literal.as_bytes();
+    let mut index = usize::from(bytes.first() == Some(&b'-'));
+    if bytes.get(index) == Some(&b'.') {
+        return 0;
+    }
+    let start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    index - start
+}
+
 pub fn infinite(negative: bool) -> String {
     if negative {
         format!("-{DBL_MAX}")

@@ -8,23 +8,55 @@ use crate::value::Value;
 /// Parse every JSON value in `bytes` and write jq's layout for each one.
 ///
 /// A leading UTF-8 BOM is ignored. Numbers are rewritten the way jq rewrites them.
+pub struct LocatedValue {
+    pub value: Value,
+    /// Line number jq prints in a runtime error for this value.
+    pub line: usize,
+}
+
 pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<(), Error> {
-    let bytes = strip_bom(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
-    let mut parser = Parser::new(text);
-    loop {
-        parser.skip_ws();
-        if parser.eof() {
-            break;
-        }
-        let value = parser.parse_value()?;
-        let rendered = print::render(&value, style);
+    for item in parse_stream(bytes)? {
+        let rendered = print::render(&item.value, style);
         out.write_all(rendered.as_bytes())?;
         if !style.join {
             out.write_all(b"\n")?;
         }
     }
     Ok(())
+}
+
+pub fn parse_stream(bytes: &[u8]) -> Result<Vec<LocatedValue>, Error> {
+    let bytes = strip_bom(bytes);
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
+    let mut parser = Parser::new(text);
+    let mut parsed = Vec::new();
+    loop {
+        parser.skip_ws();
+        if parser.eof() {
+            break;
+        }
+        let start_line = parser.line;
+        let value = parser.parse_value()?;
+        parsed.push((value, start_line, parser.index));
+    }
+    let last = parsed.len();
+    let mut out = Vec::with_capacity(last);
+    for (index, (value, start_line, end)) in parsed.into_iter().enumerate() {
+        let newline_after = text[end..].contains('\n');
+        let line = if index + 1 == last && !newline_after {
+            start_line.saturating_sub(1)
+        } else {
+            start_line
+        };
+        out.push(LocatedValue { value, line });
+    }
+    Ok(out)
+}
+
+pub(crate) fn parse_json_string_literal(text: &str) -> Result<(String, usize), Error> {
+    let mut parser = Parser::new(text);
+    let value = parser.parse_string()?;
+    Ok((value, parser.index))
 }
 
 fn strip_bom(bytes: &[u8]) -> &[u8] {
@@ -281,7 +313,8 @@ impl<'a> Parser<'a> {
 
     fn parse_nan(&mut self) -> Result<Value, Error> {
         if self.take_nonfinite_word("nan") {
-            return Ok(Value::Null);
+            // jq keeps NaN as a number whose text is null.
+            return Ok(Value::Number("null".to_string()));
         }
         Err(self.error("invalid number"))
     }
