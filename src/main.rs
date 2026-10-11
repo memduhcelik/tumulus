@@ -39,6 +39,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
         return Ok(outcome.status);
     }
     let mut status = 0;
+    let mut missing = false;
     for path in &options.files {
         match read_input(path) {
             Ok(bytes) => {
@@ -50,6 +51,9 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
                 let outcome = apply(&bytes, options.style, &program, source, out)?;
                 if outcome.status != 0 {
                     status = outcome.status;
+                } else if outcome.clear_failure && status == 5 && !missing {
+                    // A later value that runs cleanly clears an earlier filter failure.
+                    status = 0;
                 }
                 if outcome.halt {
                     break;
@@ -61,6 +65,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
                 if status == 0 {
                     status = 2;
                 }
+                missing = true;
             }
             Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
         }
@@ -71,6 +76,8 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
 struct Outcome {
     status: i32,
     halt: bool,
+    /// The last value in this input ran without a filter error.
+    clear_failure: bool,
 }
 
 fn apply(
@@ -84,7 +91,10 @@ fn apply(
     let mut failed = false;
     for item in &parsed.values {
         match eval(program, &item.value) {
-            Ok(values) => write_values(&values, style, out)?,
+            Ok(values) => {
+                write_values(&values, style, out)?;
+                failed = false;
+            }
             Err(failure) => {
                 write_values(&failure.partial, style, out)?;
                 eprintln!("jq: error (at {source}:{}): {}", item.line, failure.message);
@@ -97,11 +107,13 @@ fn apply(
         return Ok(Outcome {
             status: 5,
             halt: true,
+            clear_failure: false,
         });
     }
     Ok(Outcome {
         status: if failed { 5 } else { 0 },
         halt: false,
+        clear_failure: !failed && !parsed.values.is_empty(),
     })
 }
 

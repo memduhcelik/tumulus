@@ -22,7 +22,7 @@ Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+
 
 Filters that work are field access (`.a`, `.a.b`, `.["a"]`), array indexes (`.[0]` and negative indexes), iteration (`.[]`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
 
-A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message and exits 5. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
+A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
 

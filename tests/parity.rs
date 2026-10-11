@@ -472,6 +472,9 @@ fn filters_match_jq() {
         (".[]", "-Infinity"),
         (".[]", r#""xxxxxxxxxxxx""#),
         (".a", "1\n{\"a\":2}\ntrue\n"),
+        (".a", "1\n{\"a\":2}\n"),
+        (".a", "{\"a\":2}\n1\n"),
+        (".[]", "1\n[]\n"),
         (".[] | .a", r#"[{"a":1},2]"#),
         (".a, .b", "1"),
     ];
@@ -513,6 +516,14 @@ fn filters_match_jq() {
         ],
         b"",
     );
+    let bad = dir.join("bad.json");
+    let good = dir.join("good.json");
+    fs::write(&bad, "1\n").expect("write");
+    fs::write(&good, "{\"a\":2}\n").expect("write");
+    let bad = bad.to_str().expect("utf-8");
+    let good = good.to_str().expect("utf-8");
+    compare_exact("file error then value", &[".a", bad, good], b"");
+    compare_exact("file value then error", &[".a", good, bad], b"");
 }
 
 #[test]
