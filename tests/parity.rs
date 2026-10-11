@@ -515,6 +515,57 @@ fn filters_match_jq() {
     );
 }
 
+#[test]
+fn truncated_tail_matches_jq() {
+    require_jq();
+    // A cut-off final value must not drop the values parsed before it.
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("cut object", &["."], "1\n{\"a\":"),
+        ("cut object compact", &["-c", "."], "1\n{\"a\":"),
+        ("second object cut", &["."], "{\"a\":1}\n{\"b\":"),
+        ("cut array", &["."], "1\n2\n["),
+        ("cut string", &["."], "1\n\"abc"),
+        ("string cut by newline", &["."], "\"abc\n"),
+        ("unmatched after values", &["."], "1\n2\n]"),
+        ("field on cut stream", &[".a"], "1\n{\"a\":"),
+        ("optional field", &[".a?"], "1\n{\"a\":"),
+        (
+            "compact field of good value",
+            &["-c", ".n"],
+            "{\"n\":1}\n{\"n\":",
+        ),
+        ("iterate then cut", &[".[]"], "[1,2]\n{\"a\":"),
+        ("glued bracket keeps earlier value", &[".a"], "1 2]"),
+        ("join", &["-j", "."], "1\n{\"a\":"),
+        ("lone low surrogate", &["-c", "."], "\"\\uDC00\""),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input.as_bytes());
+    }
+    compare(
+        "nested 256",
+        &["-c", "."],
+        format!("{}{}", "[".repeat(256), "]".repeat(256)).as_bytes(),
+    );
+    compare_exact("nested 257", &["."], "[".repeat(257).as_bytes());
+
+    let dir = std::env::temp_dir().join(format!(
+        "tumulus-cut-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _cleanup = DirGuard(dir.clone());
+    fs::create_dir_all(&dir).expect("temp dir");
+    let cut = dir.join("cut.json");
+    fs::write(&cut, "{\"n\":1}\n{\"n\":").expect("write");
+    let cut = cut.to_str().expect("utf-8 path");
+    compare_exact("cut file", &[".", cut], b"");
+    compare_exact("cut file field", &["-c", ".n", cut], b"");
+}
+
 struct DirGuard(std::path::PathBuf);
 
 impl Drop for DirGuard {

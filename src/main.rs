@@ -35,7 +35,8 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
         }
     };
     if options.files.is_empty() {
-        return apply(&read_stdin()?, options.style, &program, "<stdin>", out);
+        let outcome = apply(&read_stdin()?, options.style, &program, "<stdin>", out)?;
+        return Ok(outcome.status);
     }
     let mut status = 0;
     for path in &options.files {
@@ -46,9 +47,12 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
                 } else {
                     path.as_str()
                 };
-                let code = apply(&bytes, options.style, &program, source, out)?;
-                if code != 0 {
-                    status = code;
+                let outcome = apply(&bytes, options.style, &program, source, out)?;
+                if outcome.status != 0 {
+                    status = outcome.status;
+                }
+                if outcome.halt {
+                    break;
                 }
             }
             Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
@@ -64,15 +68,21 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     Ok(status)
 }
 
+struct Outcome {
+    status: i32,
+    halt: bool,
+}
+
 fn apply(
     bytes: &[u8],
     style: Style,
     program: &tumulus::Filter,
     source: &str,
     out: &mut dyn Write,
-) -> Result<i32, Error> {
+) -> Result<Outcome, Error> {
+    let parsed = parse_stream(bytes)?;
     let mut failed = false;
-    for item in parse_stream(bytes)? {
+    for item in &parsed.values {
         match eval(program, &item.value) {
             Ok(values) => write_values(&values, style, out)?,
             Err(failure) => {
@@ -82,7 +92,17 @@ fn apply(
             }
         }
     }
-    Ok(if failed { 5 } else { 0 })
+    if let Some(message) = parsed.error {
+        eprintln!("jq: parse error: {message}");
+        return Ok(Outcome {
+            status: 5,
+            halt: true,
+        });
+    }
+    Ok(Outcome {
+        status: if failed { 5 } else { 0 },
+        halt: false,
+    })
 }
 
 fn write_values(values: &[tumulus::Value], style: Style, out: &mut dyn Write) -> Result<(), Error> {
