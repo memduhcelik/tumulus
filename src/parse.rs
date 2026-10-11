@@ -1,13 +1,13 @@
 use std::io::Write;
 
 use crate::error::Error;
+use crate::number;
 use crate::print;
 use crate::value::Value;
 
 /// Parse every JSON value in `bytes` and write jq's layout for each one.
 ///
-/// A leading UTF-8 BOM is ignored. Number text is kept as it appeared;
-/// exponent rewriting and non-standard spellings are left for later.
+/// A leading UTF-8 BOM is ignored. Numbers are rewritten the way jq rewrites them.
 pub fn write_input(bytes: &[u8], compact: bool, out: &mut dyn Write) -> Result<(), Error> {
     let bytes = strip_bom(bytes);
     let text = std::str::from_utf8(bytes).map_err(|_| Error::new("input is not utf-8"))?;
@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 self.parse_object()
             }
-            Some('-' | '0'..='9') => self.parse_number(),
+            Some('+' | '-' | '.' | '0'..='9') => self.parse_number(),
             Some(_) => Err(self.error("expected a value")),
             None => Err(self.error("expected a value")),
         }
@@ -270,52 +270,77 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_number(&mut self) -> Result<Value, Error> {
-        let start = self.index;
-        if self.peek() == Some('-') {
-            self.bump()?;
-        }
+        let mut negative = false;
         match self.peek() {
-            Some('0') => {
+            Some('+') => {
                 self.bump()?;
-                if matches!(self.peek(), Some('0'..='9')) {
-                    return Err(self.error("invalid number"));
-                }
             }
-            Some('1'..='9') => {
-                while matches!(self.peek(), Some('0'..='9')) {
-                    self.bump()?;
-                }
+            Some('-') => {
+                self.bump()?;
+                negative = true;
             }
-            _ => return Err(self.error("invalid number")),
+            _ => {}
         }
+
+        let mut int_digits = String::new();
+        let mut frac_digits = None;
         if self.peek() == Some('.') {
             self.bump()?;
-            let mut digits = 0;
-            while matches!(self.peek(), Some('0'..='9')) {
-                self.bump()?;
-                digits += 1;
-            }
-            if digits == 0 {
+            let frac = self.take_digits();
+            if frac.is_empty() {
                 return Err(self.error("invalid number"));
             }
+            frac_digits = Some(frac);
+        } else if matches!(self.peek(), Some('0'..='9')) {
+            int_digits = self.take_digits();
+            if self.peek() == Some('.') {
+                self.bump()?;
+                frac_digits = Some(self.take_digits());
+            }
+        } else {
+            return Err(self.error("invalid number"));
         }
+
+        let mut exponent = None;
         if matches!(self.peek(), Some('e' | 'E')) {
             self.bump()?;
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.bump()?;
+            let mut exp_negative = false;
+            match self.peek() {
+                Some('+') => {
+                    self.bump()?;
+                }
+                Some('-') => {
+                    self.bump()?;
+                    exp_negative = true;
+                }
+                _ => {}
             }
-            let mut digits = 0;
-            while matches!(self.peek(), Some('0'..='9')) {
-                self.bump()?;
-                digits += 1;
-            }
-            if digits == 0 {
+            let digits = self.take_digits();
+            if digits.is_empty() {
                 return Err(self.error("invalid number"));
             }
+            exponent = Some((exp_negative, digits));
         }
         if !self.token_boundary_ok() {
             return Err(self.error("invalid number"));
         }
-        Ok(Value::Number(self.src[start..self.index].to_string()))
+        let text = number::normalize(
+            negative,
+            &int_digits,
+            frac_digits.as_deref(),
+            exponent
+                .as_ref()
+                .map(|(exp_negative, digits)| (*exp_negative, digits.as_str())),
+        );
+        Ok(Value::Number(text))
+    }
+
+    fn take_digits(&mut self) -> String {
+        let mut digits = String::new();
+        while let Some(digit @ '0'..='9') = self.peek() {
+            digits.push(digit);
+            let _ = self.bump();
+        }
+        digits
     }
 }

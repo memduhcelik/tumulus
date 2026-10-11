@@ -2,7 +2,7 @@
 pub enum Value {
     Null,
     Bool(bool),
-    /// Digits as they appeared in the input.
+    /// Text jq would print for this number.
     Number(String),
     String(String),
     Array(Vec<Value>),
