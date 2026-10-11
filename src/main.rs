@@ -8,28 +8,50 @@ use tumulus::{write_input, Error};
 fn main() {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    if let Err(err) = run(&mut out) {
-        let _ = out.flush();
-        eprintln!("tumulus: {err}");
-        process::exit(1);
-    }
+    let code = match run(&mut out) {
+        Ok(code) => code,
+        Err(err) => {
+            let _ = out.flush();
+            eprintln!("tumulus: {err}");
+            1
+        }
+    };
     if let Err(err) = out.flush() {
         eprintln!("tumulus: {err}");
         process::exit(1);
     }
+    if code != 0 {
+        process::exit(code);
+    }
 }
 
-fn run(out: &mut dyn Write) -> Result<(), Error> {
+fn run(out: &mut dyn Write) -> Result<i32, Error> {
     let options = options()?;
     if options.files.is_empty() {
         write_input(&read_stdin()?, options.compact, out)?;
-        return Ok(());
+        return Ok(0);
     }
+    let mut missing = false;
     for path in &options.files {
-        let bytes = read_input(path)?;
-        write_input(&bytes, options.compact, out)?;
+        match read_input(path) {
+            Ok(bytes) => write_input(&bytes, options.compact, out)?,
+            Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
+                // jq names the missing file and keeps going.
+                eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
+                missing = true;
+            }
+            Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
+        }
     }
-    Ok(())
+    Ok(if missing { 2 } else { 0 })
+}
+
+fn os_reason(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
 }
 
 struct Options {
@@ -73,15 +95,15 @@ fn options() -> Result<Options, Error> {
     })
 }
 
-fn read_stdin() -> Result<Vec<u8>, Error> {
+fn read_stdin() -> Result<Vec<u8>, std::io::Error> {
     let mut buf = Vec::new();
     io::stdin().read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-fn read_input(path: &str) -> Result<Vec<u8>, Error> {
+fn read_input(path: &str) -> Result<Vec<u8>, std::io::Error> {
     if path == "-" {
         return read_stdin();
     }
-    fs::read(path).map_err(|err| Error::new(format!("cannot read {path}: {err}")))
+    fs::read(path)
 }
