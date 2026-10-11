@@ -197,9 +197,13 @@ fn run_filter(bin: &str, program: &str, input: &[u8], home: &Path) -> Outcome {
         .unwrap_or_else(|err| panic!("could not start {bin}: {err}"));
     {
         let mut stdin = child.stdin.take().expect("stdin pipe");
-        stdin
-            .write_all(input)
-            .unwrap_or_else(|err| panic!("write stdin to {bin}: {err}"));
+        // A program that exits before reading closes this pipe. The
+        // comparison is the child's output, so a broken pipe is not a failure.
+        match stdin.write_all(input) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(err) => panic!("write stdin to {bin}: {err}"),
+        }
     }
     let output = child
         .wait_with_output()
