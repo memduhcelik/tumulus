@@ -4,6 +4,8 @@ tumulus reads JSON and prints it the way jq does. The filter language is still s
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
+`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test.
+
 ## What works
 
 Input is standard input or files. `-` is standard input. With no filter, the filter is `.`.
