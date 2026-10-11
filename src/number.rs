@@ -10,6 +10,15 @@ const MAX_SCI: i128 = 999_999_999;
 const MIN_LSD: i128 = -1_147_483_646;
 const DBL_MAX: &str = "1.7976931348623157e+308";
 
+/// jq prints infinities as the maximum finite binary64 value.
+pub fn infinite(negative: bool) -> String {
+    if negative {
+        format!("-{DBL_MAX}")
+    } else {
+        DBL_MAX.to_string()
+    }
+}
+
 enum Exp {
     Value(i128),
     PosHuge,
