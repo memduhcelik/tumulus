@@ -32,11 +32,13 @@ An object key that is not a string fails the way jq fails. A bad string escape d
 
 An operator that is given values it cannot use fails the way jq fails, including division and remainder by zero. The exit status is 5.
 
+`$name` reads a variable. `as` binds a value for the rest of that expression. The pattern can take an array or an object apart, as in `. as [$a, $b]`, `. as {a: $x}`, and `{$a}` for `{a: $a}`. `reduce` and `foreach` walk a stream with that kind of pattern. A pattern that meets the wrong kind of value fails with jq's index message. The exit status is 5.
+
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
 
-Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`.
+Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too.
 
 `{$name}` and `{$name: value}` are rejected. jq uses the variable's name or the variable's value as an object key. `$__loc__` as a field is rejected too.
 
