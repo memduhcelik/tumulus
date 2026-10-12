@@ -55,18 +55,30 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # gh looks for a git checkout unless the repo is passed explicitly.
+          # --notes-from-tag cannot be combined with --repo, so the annotation
+          # is read from the tag object.
           tag="${GITHUB_REF_NAME}"
           mac=$(find dist -type f -name tumulus-macos-arm64)
           linux=$(find dist -type f -name tumulus-linux-x86_64)
           test "$(printf '%s\n' "$mac" | grep -c .)" -eq 1
           test "$(printf '%s\n' "$linux" | grep -c .)" -eq 1
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$mac" "$linux" --clobber
+          sha=$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.sha)
+          kind=$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.type)
+          if [ "$kind" = "tag" ]; then
+            gh api "repos/${GH_REPO}/git/tags/${sha}" --jq .message > notes.txt
+          else
+            gh api "repos/${GH_REPO}/commits/${sha}" --jq .commit.message > notes.txt
+          fi
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" "$mac" "$linux" --repo "$GH_REPO" --clobber
           else
             gh release create "$tag" "$mac" "$linux" \
+              --repo "$GH_REPO" \
               --verify-tag \
               --title "$tag" \
-              --notes-from-tag
+              --notes-file notes.txt
           fi
