@@ -42,9 +42,13 @@ pub enum Filter {
     Collect(Box<Filter>),
     Object(Vec<ObjField>),
     /// `base[key]`, with both sides run on the same input.
+    /// `optional` is set when `?` is written on this bracket, so a failed
+    /// index is skipped and the next key still runs. `?` after parentheses
+    /// leaves the flag off.
     At {
         base: Box<Filter>,
         key: Box<Filter>,
+        optional: bool,
     },
     Bin {
         op: Op,
@@ -232,7 +236,11 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
             }),
         },
         Filter::Object(fields) => eval_object(fields, input, env),
-        Filter::At { base, key } => eval_at(base, key, input, env),
+        Filter::At {
+            base,
+            key,
+            optional,
+        } => eval_at(base, key, *optional, input, env),
         Filter::Bin { op, left, right } => eval_bin(*op, left, right, input, env),
         Filter::Neg(inner) => eval_neg(inner, input, env),
         Filter::Not => Ok(vec![Value::Bool(!truthy(input))]),
@@ -1357,7 +1365,7 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
             }
             Ok(())
         }
-        Filter::At { base, key } => {
+        Filter::At { base, key, .. } => {
             check_vars(base, scope)?;
             check_vars(key, scope)
         }
@@ -2658,6 +2666,13 @@ fn chain(left: Option<Filter>, right: Filter) -> Filter {
 fn optional_last(filter: Filter) -> Filter {
     match filter {
         Filter::Pipe(left, right) => Filter::Pipe(left, Box::new(Filter::Optional(right))),
+        // The outer Optional still swallows an error in the base or the key.
+        // Only the index step itself keeps going.
+        Filter::At { base, key, .. } => Filter::Optional(Box::new(Filter::At {
+            base,
+            key,
+            optional: true,
+        })),
         other => Filter::Optional(Box::new(other)),
     }
 }
@@ -2687,6 +2702,7 @@ fn at_key(base: Option<Filter>, key: Filter) -> Filter {
     Filter::At {
         base: Box::new(base.unwrap_or(Filter::Identity)),
         key: Box::new(key),
+        optional: false,
     }
 }
 
@@ -3026,6 +3042,7 @@ fn combine_fields(
 fn eval_at(
     base: &Filter,
     key: &Filter,
+    optional: bool,
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
@@ -3061,10 +3078,12 @@ fn eval_at(
                 Ok(got) => out.extend(got),
                 Err(failure) => {
                     out.extend(failure.partial);
-                    return Err(Failure {
-                        partial: out,
-                        message: failure.message,
-                    });
+                    if !optional {
+                        return Err(Failure {
+                            partial: out,
+                            message: failure.message,
+                        });
+                    }
                 }
             }
         }
