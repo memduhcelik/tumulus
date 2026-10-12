@@ -1,4 +1,4 @@
-//! Paths, slices, iteration, recurse, pipe, comma, operators, bindings, and values.
+//! Paths, slices, iteration, recurse, pipe, comma, operators, bindings, builtins, and values.
 
 use crate::number::{self, array_index, slice_bound};
 use crate::print::{self, Layout, Style};
@@ -86,6 +86,18 @@ pub enum Filter {
         /// `None` emits each update. `Some` emits the extract instead.
         extract: Option<Box<Filter>>,
     },
+    /// `empty`. No outputs.
+    Empty,
+    /// `length`
+    Length,
+    /// `keys`
+    Keys,
+    /// `has(expr)`
+    Has(Box<Filter>),
+    /// `select(expr)`
+    Select(Box<Filter>),
+    /// `map(expr)`. One array, from every output on each element or value.
+    Map(Box<Filter>),
 }
 
 /// A name, or an array or object taken apart by indexing.
@@ -259,6 +271,12 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
             input,
             env,
         ),
+        Filter::Empty => Ok(Vec::new()),
+        Filter::Length => eval_length(input),
+        Filter::Keys => eval_keys(input),
+        Filter::Has(arg) => eval_has(arg, input, env),
+        Filter::Select(arg) => eval_select(arg, input, env),
+        Filter::Map(arg) => eval_map(arg, input, env),
     }
 }
 
@@ -808,6 +826,136 @@ fn eval_if(
     finish(out, err)
 }
 
+fn eval_length(input: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Null => Ok(vec![Value::Number("0".to_string())]),
+        Value::String(text) => Ok(vec![Value::Number(text.chars().count().to_string())]),
+        Value::Array(items) => Ok(vec![Value::Number(items.len().to_string())]),
+        Value::Object(items) => Ok(vec![Value::Number(items.len().to_string())]),
+        Value::Number(text) => Ok(vec![number_length(text)]),
+        other => Err(fail(format!(
+            "{} ({}) has no length",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+/// The absolute value is a computed number. A preserved literal and its
+/// length can therefore print differently.
+fn number_length(text: &str) -> Value {
+    let abs = match number::real(text) {
+        number::Real::Nan => number::nan_text(),
+        number::Real::Num(n) => number::format_jq_f64(n.abs()),
+    };
+    Value::Number(number::mark_f64(abs))
+}
+
+fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Array(items) => {
+            let keys = (0..items.len())
+                .map(|index| Value::Number(index.to_string()))
+                .collect();
+            Ok(vec![Value::Array(keys)])
+        }
+        Value::Object(items) => {
+            let mut names: Vec<&str> = items.iter().map(|(name, _)| name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            let keys = names
+                .into_iter()
+                .map(|name| Value::String(name.to_string()))
+                .collect();
+            Ok(vec![Value::Array(keys)])
+        }
+        other => Err(fail(format!(
+            "{} ({}) has no keys",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+fn eval_has(arg: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Value>, Failure> {
+    let (keys, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for key in keys {
+        match has_key(input, &key) {
+            Ok(value) => out.push(value),
+            Err(message) => {
+                return Err(Failure {
+                    partial: out,
+                    message,
+                })
+            }
+        }
+    }
+    finish(out, err)
+}
+
+/// Null has no keys, and asking is false for every key. An array index is
+/// truncated toward zero and does not wrap; `-0.1` truncates to `-0`, which
+/// is present in a non-empty array.
+fn has_key(input: &Value, key: &Value) -> Result<Value, String> {
+    if matches!(input, Value::Null) {
+        return Ok(Value::Bool(false));
+    }
+    match (input, key) {
+        (Value::Object(items), Value::String(name)) => {
+            Ok(Value::Bool(items.iter().any(|(key, _)| key == name)))
+        }
+        (Value::Array(items), Value::Number(text)) => Ok(Value::Bool(array_has(items.len(), text))),
+        _ => Err(format!(
+            "Cannot check whether {} has a {} key",
+            input.type_name(),
+            key.type_name()
+        )),
+    }
+}
+
+fn array_has(len: usize, text: &str) -> bool {
+    let number::Real::Num(n) = number::real(text) else {
+        return false;
+    };
+    if !n.is_finite() {
+        return false;
+    }
+    let index = n.trunc();
+    index >= 0.0 && index < len as f64
+}
+
+fn eval_select(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for value in values {
+        if truthy(&value) {
+            out.push(input.clone());
+        }
+    }
+    finish(out, err)
+}
+
+/// `map` is `[.[] | f]`. A failure inside drops the array.
+fn eval_map(inner: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Value>, Failure> {
+    let items = match iterate(input) {
+        Ok(items) => items,
+        Err(failure) => return Err(failure),
+    };
+    let mut collected = Vec::new();
+    for item in items {
+        match eval_in(inner, &item, env) {
+            Ok(more) => collected.extend(more),
+            Err(failure) => return Err(fail(failure.message)),
+        }
+    }
+    Ok(vec![Value::Array(collected)])
+}
+
 fn apply_op(op: Op, left: &Value, right: &Value) -> Result<Value, String> {
     match op {
         Op::Add => add_values(left, right),
@@ -1160,7 +1308,10 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Iterate
         | Filter::Recurse
         | Filter::Literal(_)
-        | Filter::Not => Ok(()),
+        | Filter::Not
+        | Filter::Empty
+        | Filter::Length
+        | Filter::Keys => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -1180,9 +1331,12 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
             check_vars(left, scope)?;
             check_vars(right, scope)
         }
-        Filter::Optional(inner) | Filter::Collect(inner) | Filter::Neg(inner) => {
-            check_vars(inner, scope)
-        }
+        Filter::Optional(inner)
+        | Filter::Collect(inner)
+        | Filter::Neg(inner)
+        | Filter::Has(inner)
+        | Filter::Select(inner)
+        | Filter::Map(inner) => check_vars(inner, scope),
         Filter::Interpolate(pieces) => {
             for piece in pieces {
                 if let Piece::Interp(inner) = piece {
@@ -1443,8 +1597,9 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             if matches!(self.peek(), Some('.' | '(')) {
-                // `not(1)` is a function call. Calls are not in this version.
-                if self.peek() == Some('(') && matches!(filter, Filter::Not) {
+                // `length(1)` and `map(f)(1)` are calls. A call this version
+                // does not take is a syntax error, not a pipe.
+                if self.peek() == Some('(') && forbids_call(&filter) {
                     return Err(ProgramError::Syntax);
                 }
                 let right = self.parse_postfix()?;
@@ -1545,6 +1700,12 @@ impl<'a> Parser<'a> {
                 "nan" => Ok(Filter::Literal(Value::Number(number::nan_text()))),
                 "infinite" => Ok(Filter::Literal(Value::Number(number::pos_inf()))),
                 "not" => Ok(Filter::Not),
+                "empty" => Ok(Filter::Empty),
+                "length" => Ok(Filter::Length),
+                "keys" => Ok(Filter::Keys),
+                "has" => Ok(Filter::Has(self.parse_one_arg()?)),
+                "select" => Ok(Filter::Select(self.parse_one_arg()?)),
+                "map" => Ok(Filter::Map(self.parse_one_arg()?)),
                 "if" if !self.reject_block => self.parse_if(),
                 "reduce" if !self.reject_block => self.parse_fold(false),
                 "foreach" if !self.reject_block => self.parse_fold(true),
@@ -1552,6 +1713,28 @@ impl<'a> Parser<'a> {
             };
         }
         Err(ProgramError::Syntax)
+    }
+
+    /// One filter argument, as in `has(expr)`. A second argument, separated
+    /// by `;`, is rejected. `if`, `reduce`, and `foreach` are allowed inside.
+    fn parse_one_arg(&mut self) -> Result<Box<Filter>, ProgramError> {
+        self.skip_ws();
+        if !self.eat('(') {
+            return Err(ProgramError::Syntax);
+        }
+        let saved = self.reject_block;
+        self.reject_block = false;
+        let arg = self.parse_pipe();
+        self.reject_block = saved;
+        let arg = arg?;
+        self.skip_ws();
+        if self.peek() == Some(';') {
+            return Err(ProgramError::Syntax);
+        }
+        if !self.eat(')') {
+            return Err(ProgramError::Syntax);
+        }
+        Ok(Box::new(arg))
     }
 
     /// One juxtaposition term. `if`, `reduce`, and `foreach` need parentheses.
@@ -2602,6 +2785,21 @@ fn const_outputs(filter: &Filter) -> Option<Vec<Value>> {
 
 fn is_identity(filter: &Filter) -> bool {
     matches!(filter, Filter::Identity)
+}
+
+/// `not(1)`, `length(1)`, and a second call such as `map(f)(1)`.
+fn forbids_call(filter: &Filter) -> bool {
+    match filter {
+        Filter::Not
+        | Filter::Empty
+        | Filter::Length
+        | Filter::Keys
+        | Filter::Has(_)
+        | Filter::Select(_)
+        | Filter::Map(_) => true,
+        Filter::Optional(inner) => forbids_call(inner),
+        _ => false,
+    }
 }
 
 fn const_object(fields: &[ObjField]) -> Option<Value> {

@@ -34,6 +34,8 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `$name` reads a variable. `as` binds a value for the rest of that expression. The pattern can take an array or an object apart, as in `. as [$a, $b]`, `. as {a: $x}`, and `{$a}` for `{a: $a}`. `reduce` and `foreach` walk a stream with that kind of pattern. A pattern that meets the wrong kind of value fails with jq's index message. The exit status is 5.
 
+`empty` yields no values. `length` is the number of Unicode code points in a string, the number of elements in an array, and the number of keys in an object. Null has length 0. The length of a number is its absolute value. `keys` is the indexes of an array, or the keys of an object in order. `has(expr)`, `select(expr)`, and `map(expr)` take that one filter. `select` repeats the input for each truthy result. `map` runs the filter on each array element or object value and collects the results. The wrong kind of value fails the way jq fails, and the exit status is 5.
+
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
