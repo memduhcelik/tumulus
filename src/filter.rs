@@ -162,6 +162,11 @@ pub struct Failure {
 }
 
 pub fn compile(source: &str) -> Result<Filter, ProgramError> {
+    compile_with(source, &[])
+}
+
+/// `scope` names variables that are already bound, ahead of the program.
+pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramError> {
     let mut parser = Parser {
         src: source,
         index: 0,
@@ -173,12 +178,21 @@ pub fn compile(source: &str) -> Result<Filter, ProgramError> {
     if !parser.eof() {
         return Err(ProgramError::Syntax);
     }
-    check_vars(&filter, &[])?;
+    check_vars(&filter, scope)?;
     Ok(filter)
 }
 
 pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
-    eval_in(filter, input, &[])
+    eval_with(filter, input, &[])
+}
+
+/// `env` is the outer binding list. The first binding of a name wins.
+pub fn eval_with(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    eval_in(filter, input, env)
 }
 
 fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Value>, Failure> {

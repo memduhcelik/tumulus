@@ -3,7 +3,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process;
 
-use tumulus::{compile, eval, parse_stream, render, Error, Indent, Layout, ProgramError, Style};
+use tumulus::{
+    compile_with, eval_with, parse_stream, render, Error, Filter, Indent, Layout, ProgramError,
+    Style, Value,
+};
 
 fn main() {
     // The runtime ignores SIGPIPE and turns a closed pipe into an error.
@@ -41,7 +44,18 @@ fn reset_sigpipe() {
 
 fn run(out: &mut dyn Write) -> Result<i32, Error> {
     let options = options()?;
-    let program = match compile(&options.program) {
+    let source = match &options.program {
+        Program::Text(text) => text.clone(),
+        Program::File(path) => match read_filter(path) {
+            Ok(text) => text,
+            Err(line) => {
+                eprintln!("{line}");
+                return Ok(2);
+            }
+        },
+    };
+    let scope = defined_names(&options.named);
+    let program = match compile_with(&source, &scope) {
         Ok(program) => program,
         Err(ProgramError::Syntax) => {
             eprintln!("tumulus: syntax error");
@@ -52,47 +66,57 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
             return Ok(3);
         }
     };
+    let env = initial_env(&options.named);
+    let mut run = Run::new();
     // `-n` runs the filter once on null and does not read stdin or files.
     if options.null_input {
-        return apply_null(options.style, &program, out);
+        apply_null(options.style, &program, &env, &mut run, out)?;
+    } else if options.raw_input && options.slurp {
+        apply_raw_slurp(&options.files, options.style, &program, &env, &mut run, out)?;
+    } else if options.raw_input {
+        apply_raw(&options.files, options.style, &program, &env, &mut run, out)?;
+    } else if options.slurp {
+        apply_slurp(&options.files, options.style, &program, &env, &mut run, out)?;
+    } else {
+        apply_values(&options.files, options.style, &program, &env, &mut run, out)?;
     }
-    if options.files.is_empty() {
-        let outcome = apply(&read_stdin()?, options.style, &program, "<stdin>", out)?;
-        return Ok(outcome.status);
-    }
-    let mut status = 0;
-    let mut missing = false;
-    for path in &options.files {
-        match read_input(path) {
-            Ok(bytes) => {
-                let source = if path == "-" {
-                    "<stdin>"
-                } else {
-                    path.as_str()
-                };
-                let outcome = apply(&bytes, options.style, &program, source, out)?;
-                if outcome.status != 0 {
-                    status = outcome.status;
-                } else if outcome.clear_failure && status == 5 && !missing {
-                    // A later value that runs cleanly clears an earlier filter failure.
-                    status = 0;
-                }
-                if outcome.halt {
-                    break;
-                }
-            }
-            Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
-                // jq names the missing file and keeps going.
-                eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
-                if status == 0 {
-                    status = 2;
-                }
-                missing = true;
-            }
-            Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
+    apply_exit_status(&mut run, options.exit_status);
+    Ok(run.status)
+}
+
+struct Run {
+    status: i32,
+    missing: bool,
+    produced: bool,
+    /// The last value written was `null` or `false`.
+    last_false: bool,
+}
+
+impl Run {
+    fn new() -> Self {
+        Self {
+            status: 0,
+            missing: false,
+            produced: false,
+            last_false: false,
         }
     }
-    Ok(status)
+}
+
+/// `-e` replaces a successful exit. No output is 4. A last `null` or
+/// `false` is 1. Any other value, including `0` and `""`, stays 0.
+/// Status 2, 3, and 5 are left as they are.
+fn apply_exit_status(run: &mut Run, enabled: bool) {
+    if !enabled || run.status != 0 {
+        return;
+    }
+    run.status = if !run.produced {
+        4
+    } else if run.last_false {
+        1
+    } else {
+        0
+    };
 }
 
 struct Outcome {
@@ -102,23 +126,67 @@ struct Outcome {
     clear_failure: bool,
 }
 
+fn apply_values(
+    files: &[String],
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    if files.is_empty() {
+        let outcome = apply(&read_stdin()?, style, program, "<stdin>", env, run, out)?;
+        run.status = outcome.status;
+        return Ok(());
+    }
+    for path in files {
+        match read_input(path) {
+            Ok(bytes) => {
+                let source = if path == "-" { "<stdin>" } else { path };
+                let outcome = apply(&bytes, style, program, source, env, run, out)?;
+                if outcome.status != 0 {
+                    run.status = outcome.status;
+                } else if outcome.clear_failure && run.status == 5 && !run.missing {
+                    // A later value that runs cleanly clears an earlier filter failure.
+                    run.status = 0;
+                }
+                if outcome.halt {
+                    break;
+                }
+            }
+            Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
+                // jq names the missing file and keeps going.
+                eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
+                if run.status == 0 {
+                    run.status = 2;
+                }
+                run.missing = true;
+            }
+            Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
+        }
+    }
+    Ok(())
+}
+
 fn apply(
     bytes: &[u8],
     style: Style,
-    program: &tumulus::Filter,
+    program: &Filter,
     source: &str,
+    env: &[(String, Value)],
+    run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<Outcome, Error> {
     let parsed = parse_stream(bytes)?;
     let mut failed = false;
     for item in &parsed.values {
-        match eval(program, &item.value) {
+        match eval_with(program, &item.value, env) {
             Ok(values) => {
-                write_values(&values, style, out)?;
+                write_values(&values, style, run, out)?;
                 failed = false;
             }
             Err(failure) => {
-                write_values(&failure.partial, style, out)?;
+                write_values(&failure.partial, style, run, out)?;
                 eprintln!("jq: error (at {source}:{}): {}", item.line, failure.message);
                 failed = true;
             }
@@ -139,13 +207,288 @@ fn apply(
     })
 }
 
-fn write_values(values: &[tumulus::Value], style: Style, out: &mut dyn Write) -> Result<(), Error> {
+fn apply_null(
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    match eval_with(program, &Value::Null, env) {
+        Ok(values) => {
+            write_values(&values, style, run, out)?;
+            run.status = 0;
+        }
+        Err(failure) => {
+            write_values(&failure.partial, style, run, out)?;
+            eprintln!("jq: error (at <unknown>): {}", failure.message);
+            run.status = 5;
+        }
+    }
+    Ok(())
+}
+
+/// Where a slurped value or a raw line is reported.
+struct At {
+    source: String,
+    line: usize,
+}
+
+enum Opened {
+    Bytes(Vec<u8>),
+    Missing,
+}
+
+fn open_input(path: &str) -> Result<Opened, Error> {
+    match read_input(path) {
+        Ok(bytes) => Ok(Opened::Bytes(bytes)),
+        Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
+            eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
+            Ok(Opened::Missing)
+        }
+        Err(err) => Err(Error::new(format!("cannot read {path}: {err}"))),
+    }
+}
+
+fn input_paths(files: &[String]) -> Vec<&str> {
+    if files.is_empty() {
+        vec!["-"]
+    } else {
+        files.iter().map(String::as_str).collect()
+    }
+}
+
+fn source_name(path: &str) -> &str {
+    if path == "-" {
+        "<stdin>"
+    } else {
+        path
+    }
+}
+
+fn newline_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+}
+
+/// A parse error jq would raise before asking for another file.
+/// An error at EOF can still be repaired by the next file's bytes.
+fn committed_parse_error(bytes: &[u8]) -> Option<String> {
+    let message = parse_stream(bytes).ok()?.error?;
+    if message.contains(" at EOF ") {
+        None
+    } else {
+        Some(message)
+    }
+}
+
+fn finish_input(missing: bool, failed: bool) -> i32 {
+    // A missing file wins over a later filter or parse failure.
+    if missing {
+        2
+    } else if failed {
+        5
+    } else {
+        0
+    }
+}
+
+/// JSON values from every opened file, one array, one run.
+/// Bytes are concatenated, so a token can cross a file boundary.
+fn apply_slurp(
+    files: &[String],
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let mut buf = Vec::new();
+    let mut at = At {
+        source: "<stdin>".to_string(),
+        line: 0,
+    };
+    let mut missing = false;
+    let mut early = None;
+    for path in input_paths(files) {
+        at.source = source_name(path).to_string();
+        at.line = 0;
+        match open_input(path)? {
+            Opened::Missing => missing = true,
+            Opened::Bytes(bytes) => {
+                at.line = newline_count(&bytes);
+                buf.extend_from_slice(&bytes);
+                if let Some(message) = committed_parse_error(&buf) {
+                    early = Some(message);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(message) = early {
+        eprintln!("jq: parse error: {message}");
+        run.status = finish_input(missing, true);
+        return Ok(());
+    }
+    let parsed = parse_stream(&buf)?;
+    if let Some(message) = parsed.error {
+        eprintln!("jq: parse error: {message}");
+        run.status = finish_input(missing, true);
+        return Ok(());
+    }
+    let input = Value::Array(parsed.values.into_iter().map(|item| item.value).collect());
+    let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
+    run.status = finish_input(missing, failed);
+    Ok(())
+}
+
+/// One string of every opened file, including a trailing newline.
+fn apply_raw_slurp(
+    files: &[String],
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let mut buf = Vec::new();
+    let mut at = At {
+        source: "<stdin>".to_string(),
+        line: 0,
+    };
+    let mut missing = false;
+    for path in input_paths(files) {
+        at.source = source_name(path).to_string();
+        at.line = 0;
+        match open_input(path)? {
+            Opened::Missing => missing = true,
+            Opened::Bytes(bytes) => {
+                at.line = newline_count(&bytes);
+                buf.extend_from_slice(&bytes);
+            }
+        }
+    }
+    let input = Value::String(decode_raw(&buf));
+    let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
+    run.status = finish_input(missing, failed);
+    Ok(())
+}
+
+/// One string per line. A line with no newline runs on into the next file.
+/// After a missing file, jq reads one more line and then stops.
+fn apply_raw(
+    files: &[String],
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let mut pending = Vec::new();
+    let mut at = At {
+        source: "<stdin>".to_string(),
+        line: 0,
+    };
+    let mut missing = false;
+    let mut one_left = false;
+    let mut stop = false;
+    let mut last_failed = false;
+    for path in input_paths(files) {
+        if stop {
+            break;
+        }
+        at.source = source_name(path).to_string();
+        at.line = 0;
+        match open_input(path)? {
+            Opened::Missing => {
+                missing = true;
+                one_left = true;
+            }
+            Opened::Bytes(bytes) => {
+                let mut line = 0;
+                for byte in bytes {
+                    if byte == b'\n' {
+                        line += 1;
+                        let text = decode_raw(&pending);
+                        pending.clear();
+                        last_failed = emit(
+                            program,
+                            &Value::String(text),
+                            env,
+                            style,
+                            &at.source,
+                            line,
+                            run,
+                            out,
+                        )?;
+                        if one_left {
+                            stop = true;
+                            break;
+                        }
+                    } else {
+                        pending.push(byte);
+                    }
+                }
+                at.line = line;
+            }
+        }
+    }
+    if !stop && !pending.is_empty() {
+        last_failed = emit(
+            program,
+            &Value::String(decode_raw(&pending)),
+            env,
+            style,
+            &at.source,
+            at.line,
+            run,
+            out,
+        )?;
+    }
+    run.status = finish_input(missing, last_failed);
+    Ok(())
+}
+
+fn emit(
+    program: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    style: Style,
+    source: &str,
+    line: usize,
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<bool, Error> {
+    match eval_with(program, input, env) {
+        Ok(values) => {
+            write_values(&values, style, run, out)?;
+            Ok(false)
+        }
+        Err(failure) => {
+            write_values(&failure.partial, style, run, out)?;
+            eprintln!("jq: error (at {source}:{line}): {}", failure.message);
+            Ok(true)
+        }
+    }
+}
+
+fn decode_raw(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn write_values(
+    values: &[Value],
+    style: Style,
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
     for value in values {
         let rendered = render(value, style);
         out.write_all(rendered.as_bytes())?;
         if !style.join {
             out.write_all(b"\n")?;
         }
+        run.produced = true;
+        run.last_false = matches!(value, Value::Null | Value::Bool(false));
     }
     Ok(())
 }
@@ -158,24 +501,49 @@ fn os_reason(err: &std::io::Error) -> String {
     }
 }
 
+enum Program {
+    Text(String),
+    File(String),
+}
+
 struct Options {
     style: Style,
     null_input: bool,
-    program: String,
+    slurp: bool,
+    raw_input: bool,
+    exit_status: bool,
+    program: Program,
     files: Vec<String>,
+    named: Vec<(String, Value)>,
+}
+
+struct Flags {
+    style: Style,
+    null_input: bool,
+    slurp: bool,
+    raw_input: bool,
+    exit_status: bool,
+    from_file: bool,
 }
 
 fn options() -> Result<Options, Error> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut style = Style::default();
-    let mut null_input = false;
+    let mut flags = Flags {
+        style: Style::default(),
+        null_input: false,
+        slurp: false,
+        raw_input: false,
+        exit_status: false,
+        from_file: false,
+    };
+    let mut named = Vec::new();
     let mut operands = Vec::new();
     let mut end = false;
     let mut index = 0;
     while index < args.len() {
-        let arg = &args[index];
+        let arg = args[index].clone();
         if end {
-            operands.push(arg.clone());
+            operands.push(arg);
             index += 1;
             continue;
         }
@@ -189,63 +557,91 @@ fn options() -> Result<Options, Error> {
                 jq_usage("jq: --indent takes one parameter");
             };
             index += 2;
-            style.layout = indent_layout(value);
+            flags.style.layout = indent_layout(value);
+            continue;
+        }
+        if arg == "--arg" || arg == "--argjson" {
+            let json = arg == "--argjson";
+            let usage = if json {
+                "jq: --argjson takes two parameters (e.g. --argjson varname text)"
+            } else {
+                "jq: --arg takes two parameters (e.g. --arg varname value)"
+            };
+            let Some(name) = args.get(index + 1).cloned() else {
+                jq_usage(usage);
+            };
+            let Some(text) = args.get(index + 2).cloned() else {
+                jq_usage(usage);
+            };
+            index += 3;
+            // The first definition wins. A repeat is not parsed again, so a
+            // later `--argjson` with bad text is not an error.
+            if named.iter().any(|(have, _)| have == &name) {
+                continue;
+            }
+            let value = if json {
+                match one_json(&text) {
+                    Some(value) => value,
+                    None => jq_usage("jq: invalid JSON text passed to --argjson"),
+                }
+            } else {
+                Value::String(text)
+            };
+            named.push((name, value));
             continue;
         }
         match arg.as_str() {
-            "-c" | "--compact-output" => style.layout = Layout::Compact,
-            "-n" | "--null-input" => null_input = true,
-            "--tab" => style.layout = Layout::Pretty(Indent::Tabs),
-            "-r" | "--raw-output" => style.raw = true,
+            "-c" | "--compact-output" => flags.style.layout = Layout::Compact,
+            "-n" | "--null-input" => flags.null_input = true,
+            "--tab" => flags.style.layout = Layout::Pretty(Indent::Tabs),
+            "-r" | "--raw-output" => flags.style.raw = true,
             "-j" | "--join-output" => {
-                style.join = true;
-                style.raw = true;
+                flags.style.join = true;
+                flags.style.raw = true;
             }
-            "-a" | "--ascii-output" => style.ascii = true,
-            "-S" | "--sort-keys" => style.sort_keys = true,
-            "-" => operands.push(arg.clone()),
+            "-a" | "--ascii-output" => flags.style.ascii = true,
+            "-S" | "--sort-keys" => flags.style.sort_keys = true,
+            "-s" | "--slurp" => flags.slurp = true,
+            "-e" | "--exit-status" => flags.exit_status = true,
+            "-R" | "--raw-input" => flags.raw_input = true,
+            // The file name is the first operand, not the next argument.
+            "-f" | "--from-file" => flags.from_file = true,
+            "-" => operands.push(arg),
             other if other.starts_with("--") => {
                 return Err(Error::new(format!("unknown option: {other}")));
             }
             // `-nc` is options. `-1` and `-.a` are programs, because the
             // character after the dash is not a letter.
             other if is_option_cluster(other) => {
-                apply_short_cluster(&mut style, &mut null_input, other)?;
+                apply_short_cluster(&mut flags, other)?;
             }
-            _ => operands.push(arg.clone()),
+            _ => operands.push(arg),
         }
         index += 1;
     }
-    if operands.is_empty() {
-        // With no filter argument, jq applies `.`.
-        return Ok(Options {
-            style,
-            null_input,
-            program: ".".to_string(),
-            files: Vec::new(),
-        });
-    }
-    let program = operands.remove(0);
+    let (program, files) = if flags.from_file {
+        if operands.is_empty() {
+            (Program::File(".".to_string()), Vec::new())
+        } else {
+            let path = operands.remove(0);
+            (Program::File(path), operands)
+        }
+    } else if operands.is_empty() {
+        (Program::Text(".".to_string()), Vec::new())
+    } else {
+        let text = operands.remove(0);
+        (Program::Text(text), operands)
+    };
     Ok(Options {
-        style,
-        null_input,
+        style: flags.style,
+        null_input: flags.null_input,
+        slurp: flags.slurp,
+        raw_input: flags.raw_input,
+        exit_status: flags.exit_status,
         program,
-        files: operands,
+        files,
+        named,
     })
-}
-
-fn apply_null(style: Style, program: &tumulus::Filter, out: &mut dyn Write) -> Result<i32, Error> {
-    match eval(program, &tumulus::Value::Null) {
-        Ok(values) => {
-            write_values(&values, style, out)?;
-            Ok(0)
-        }
-        Err(failure) => {
-            write_values(&failure.partial, style, out)?;
-            eprintln!("jq: error (at <unknown>): {}", failure.message);
-            Ok(5)
-        }
-    }
 }
 
 fn is_option_cluster(arg: &str) -> bool {
@@ -253,22 +649,93 @@ fn is_option_cluster(arg: &str) -> bool {
     chars.next() == Some('-') && chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
 }
 
-fn apply_short_cluster(style: &mut Style, null_input: &mut bool, arg: &str) -> Result<(), Error> {
+fn apply_short_cluster(flags: &mut Flags, arg: &str) -> Result<(), Error> {
     for flag in arg.chars().skip(1) {
         match flag {
-            'c' => style.layout = Layout::Compact,
-            'n' => *null_input = true,
-            'r' => style.raw = true,
+            'c' => flags.style.layout = Layout::Compact,
+            'n' => flags.null_input = true,
+            'r' => flags.style.raw = true,
             'j' => {
-                style.join = true;
-                style.raw = true;
+                flags.style.join = true;
+                flags.style.raw = true;
             }
-            'a' => style.ascii = true,
-            'S' => style.sort_keys = true,
+            'a' => flags.style.ascii = true,
+            'S' => flags.style.sort_keys = true,
+            's' => flags.slurp = true,
+            'e' => flags.exit_status = true,
+            'R' => flags.raw_input = true,
+            'f' => flags.from_file = true,
             _ => return Err(Error::new(format!("unknown option: {arg}"))),
         }
     }
     Ok(())
+}
+
+fn one_json(text: &str) -> Option<Value> {
+    let parsed = parse_stream(text.as_bytes()).ok()?;
+    if parsed.error.is_some() || parsed.values.len() != 1 {
+        return None;
+    }
+    parsed.values.into_iter().next().map(|item| item.value)
+}
+
+/// Names a program can read. `$ARGS` is always one of them.
+/// A name that is not a `$name` spelling still lands in `$ARGS.named`.
+fn defined_names(named: &[(String, Value)]) -> Vec<String> {
+    let mut names = vec!["ARGS".to_string()];
+    for (name, _) in named {
+        if name != "ARGS" && is_binding_name(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn initial_env(named: &[(String, Value)]) -> Vec<(String, Value)> {
+    let mut fields = Vec::new();
+    let mut env = Vec::new();
+    for (name, value) in named {
+        fields.push((name.clone(), value.clone()));
+        if name != "ARGS" && is_binding_name(name) {
+            env.push((name.clone(), value.clone()));
+        }
+    }
+    let args = Value::Object(vec![
+        ("positional".to_string(), Value::Array(Vec::new())),
+        ("named".to_string(), Value::Object(fields)),
+    ]);
+    env.insert(0, ("ARGS".to_string(), args));
+    env
+}
+
+fn is_binding_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn read_filter(path: &str) -> Result<String, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(err) => Err(format!(
+            "jq: Could not open {path}: {}",
+            filter_reason(path, &err)
+        )),
+    }
+}
+
+fn filter_reason(path: &str, err: &std::io::Error) -> String {
+    if err.kind() == io::ErrorKind::IsADirectory
+        || err.raw_os_error() == Some(21)
+        || fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+    {
+        "It's a directory".to_string()
+    } else {
+        os_reason(err)
+    }
 }
 
 fn indent_layout(text: &str) -> Layout {

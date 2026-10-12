@@ -1864,3 +1864,744 @@ impl Drop for DirGuard {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+fn scratch(label: &str) -> (std::path::PathBuf, DirGuard) {
+    let dir = std::env::temp_dir().join(format!(
+        "tumulus-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let guard = DirGuard(dir.clone());
+    (dir, guard)
+}
+
+fn write_bytes(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+    let path = dir.join(name);
+    fs::write(&path, bytes).unwrap_or_else(|err| panic!("write {name}: {err}"));
+    path.to_str().expect("utf-8 path").to_string()
+}
+
+fn assert_rejects(name: &str, args: &[&str], input: &[u8], stderr: &[u8], code: i32) {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let got = run(bin, &owned, input);
+    assert!(
+        got.stdout.is_empty(),
+        "{name}: stdout {}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+    assert_eq!(
+        got.stderr,
+        stderr,
+        "{name}: stderr {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert_eq!(got.status.code(), Some(code), "{name}");
+}
+
+#[test]
+fn exit_status_matches_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("no input", &["-e", "."], b""),
+        ("false", &["-e", "."], b"false\n"),
+        ("null", &["-e", "."], b"null\n"),
+        ("zero", &["-e", "."], b"0\n"),
+        ("empty string", &["-e", "."], b"\"\"\n"),
+        ("empty array", &["-e", "."], b"[]\n"),
+        ("empty object", &["-e", "."], b"{}\n"),
+        ("iterate empty", &["-e", ".[]"], b"[]\n"),
+        ("iterate false last", &["-e", ".[]"], b"[true,false]\n"),
+        ("iterate true last", &["-e", ".[]"], b"[false,true]\n"),
+        ("select false", &["-e", "select(false)"], b"1\n"),
+        ("select on false", &["-e", "select(.)"], b"false\n"),
+        ("select on zero", &["-e", "select(.)"], b"0\n"),
+        ("select false then one", &["-e", "select(.)"], b"false\n1\n"),
+        ("null input empty", &["-n", "-e", "empty"], b""),
+        ("null input dot", &["-n", "-e", "."], b""),
+        ("null input false", &["-n", "-e", "false"], b""),
+        ("one then false", &["-n", "-e", "1,false"], b""),
+        ("false then one", &["-n", "-e", "false,1"], b""),
+        ("one then empty", &["-n", "-e", "1,empty"], b""),
+        ("empty then false", &["-n", "-e", "empty,false"], b""),
+        ("false then empty", &["-n", "-e", "false,empty"], b""),
+        ("empty then empty", &["-n", "-e", "empty,empty"], b""),
+        ("join false", &["-je", "-n", "false"], b""),
+        ("join empty string", &["-je", "-n", "\"\""], b""),
+        ("slurp empty", &["-e", "-s", "."], b""),
+        ("raw slurp empty", &["-e", "-Rs", "."], b""),
+        ("raw empty", &["-e", "-R", "."], b""),
+        ("raw blank line", &["-e", "-R", "."], b"\n"),
+        ("raw text false", &["-e", "-R", "."], b"false\n"),
+        ("raw string false", &["-er", "-n", "\"false\""], b""),
+        ("null wins", &["-n", "-e", "-s", "-R", "."], b"1\n2\n"),
+        ("later length clears", &["-e", "length"], b"true\n\"ab\"\n"),
+        ("last length fails", &["-e", "length"], b"\"ab\"\ntrue\n"),
+        (
+            "error then empty",
+            &["-e", "if .==true then .a else empty end"],
+            b"true\n1\n",
+        ),
+        (
+            "error then false",
+            &["-e", "if .==true then .a else false end"],
+            b"true\n1\n",
+        ),
+        (
+            "empty then value",
+            &["-e", "if .==1 then empty else . end"],
+            b"1\n2\n",
+        ),
+        ("one then false values", &["-e", "."], b"1\nfalse\n"),
+        ("false then one values", &["-e", "."], b"false\n1\n"),
+        ("partial then error", &["-n", "-e", "1,(0|.a)"], b""),
+        ("value then parse error", &["-e", "."], b"false\n{\n"),
+        (
+            "nan is truthy",
+            &["--argjson", "a", "nan", "-ne", "$a"],
+            b"",
+        ),
+        (
+            "null arg is false",
+            &["--argjson", "a", "null", "-ne", "$a"],
+            b"",
+        ),
+        (
+            "nan is not null",
+            &["--argjson", "a", "nan", "-n", "-c", "$a == null"],
+            b"",
+        ),
+        (
+            "slurp false is truthy",
+            &["-e", "-c", "-s", "."],
+            b"false\n",
+        ),
+        ("slurp empty filter", &["-e", "-s", "empty"], b"1\n"),
+        ("join raw blank", &["-ej", "-R", "."], b"\n"),
+        ("join raw slurp empty", &["-ej", "-Rs", "."], b""),
+        (
+            "long names null",
+            &["--exit-status", "--slurp", "--null-input", "."],
+            b"1\n",
+        ),
+        ("cluster", &["-ncesRajS", "--", "1"], b"ignored"),
+        ("se empty", &["-se", "."], b""),
+        ("runtime stays", &["-n", "-e", "0|.a"], b""),
+        (
+            "missing stays",
+            &["-e", "-c", ".", "no-such-exit-status.json"],
+            b"",
+        ),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    let (dir, _guard) = scratch("exit");
+    let one = write_bytes(&dir, "one.json", b"1\n");
+    let two = write_bytes(&dir, "two.json", b"2\n");
+    let yes = write_bytes(&dir, "true.json", b"true\n");
+    let text = write_bytes(&dir, "ab.json", b"\"ab\"\n");
+    let blank = write_bytes(&dir, "blank.json", b"");
+    let present = write_bytes(&dir, "present.json", b"{\"a\":1}\n");
+    let missing = dir.join("missing.json");
+    let missing = missing.to_str().expect("utf-8 path");
+    compare_exact(
+        "empty across files",
+        &["-e", "-c", "if .==1 then empty else . end", &one, &two],
+        b"",
+    );
+    compare_exact(
+        "length across files",
+        &["-e", "-c", "length", &yes, &blank, &text],
+        b"",
+    );
+    compare_exact(
+        "present then missing",
+        &["-e", "-c", ".", &present, missing],
+        b"",
+    );
+    compare_exact(
+        "missing then present",
+        &["-e", "-c", ".", missing, &present],
+        b"",
+    );
+}
+
+#[test]
+fn slurp_matches_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("slurp");
+    let one = write_bytes(&dir, "one", b"1");
+    let two = write_bytes(&dir, "two", b"2\n");
+    let empty = write_bytes(&dir, "empty", b"");
+    let separated_a = write_bytes(&dir, "a.json", b"1\n");
+    let separated_b = write_bytes(&dir, "b.json", b"2\n");
+    let unf = write_bytes(&dir, "unf", b"{\"a\":");
+    let close = write_bytes(&dir, "close", b"1}\n");
+    let hel = write_bytes(&dir, "hel", b"\"hel");
+    let lo = write_bytes(&dir, "lo", b"lo\"\n");
+    let nums = write_bytes(&dir, "nums.json", b"1\n2\n");
+    let obj = write_bytes(&dir, "obj.json", b"{\"a\":1}\n{\"a\":2}\n");
+    let good = write_bytes(&dir, "good", b"1\n2\n3\n");
+    let bad = write_bytes(&dir, "bad", b"not\n");
+    let part = write_bytes(&dir, "part", b"1\nnot\n");
+    let hello = write_bytes(&dir, "hello", b"hello");
+    let justx = write_bytes(&dir, "justx", b"x");
+    let stream = write_bytes(&dir, "stream.json", b"1\n2\n");
+    let missing = dir.join("nope").to_str().expect("utf-8").to_string();
+    let missing_b = dir.join("nope2").to_str().expect("utf-8").to_string();
+
+    compare_exact("glue", &["-c", "-s", ".", &one, &two], b"");
+    compare_exact(
+        "glue across empty",
+        &["-c", "-s", ".", &one, &empty, &two],
+        b"",
+    );
+    compare_exact("object across files", &["-c", "-s", ".", &unf, &close], b"");
+    compare_exact("string across files", &["-c", "-s", ".", &hel, &lo], b"");
+    compare_exact(
+        "separate values",
+        &["-c", "-s", ".", &separated_a, &separated_b],
+        b"",
+    );
+    compare_exact("pretty", &["-s", ".", &separated_a, &separated_b], b"");
+    compare_exact(
+        "tabs",
+        &["--tab", "--slurp", ".", &separated_a, &separated_b],
+        b"",
+    );
+    compare_exact(
+        "indent",
+        &["--indent", "4", "-s", ".", &separated_a, &separated_b],
+        b"",
+    );
+    compare_exact("committed parse", &["-c", "-s", ".", &good, &bad], b"");
+    compare_exact(
+        "parse stops later file",
+        &["-c", "-s", ".", &part, &missing],
+        b"",
+    );
+    compare_exact(
+        "missing then parse",
+        &["-c", "-s", ".", &missing, &part],
+        b"",
+    );
+    compare_exact(
+        "eof parse continues",
+        &["-c", "-s", ".", &hello, &missing, &justx],
+        b"",
+    );
+    compare_exact("all missing", &["-c", "-s", ".", &missing, &missing_b], b"");
+    compare_exact(
+        "all missing stays 2",
+        &["-e", "-c", "-s", ".", &missing, &missing_b],
+        b"",
+    );
+    compare_exact("whitespace", &["-c", "-s", "."], b" \n \n");
+    compare_exact("stdin", &["-c", "-s", "."], b"1\n2\n");
+    compare_exact("flag after program", &["-c", ".", "-s"], b"1\n2\n");
+    compare_exact("flags after file", &[".", &stream, "-s", "-c"], b"");
+    compare_exact("end of options", &["-c", "--", ".", "-s"], b"");
+    compare_exact("long name", &["--slurp", "-c", "."], b"1\n2\n");
+    compare_exact("location full", &["-s", "0|.a"], b"1\n2\n3\n");
+    compare_exact("location no newline", &["-s", "0|.a"], b"1");
+    compare_exact("location partial", &["-s", "0|.a"], b"1\n2");
+    compare_exact("location file", &["-s", "0|.a", &obj], b"");
+    compare_exact("location last file", &["-s", "0|.a", &obj, &nums], b"");
+    compare_exact("missing wins", &["-s", "0|.a", &nums, &missing], b"");
+    compare_exact(
+        "missing then later file",
+        &["-s", "0|.a", &nums, &missing, &obj],
+        b"",
+    );
+    compare_exact(
+        "slurp reads every value",
+        &["-c", "-s", ".", &separated_a, &missing, &stream],
+        b"",
+    );
+    compare_exact(
+        "arg with slurp",
+        &["-c", "--arg", "a", "z", "-s", "[$a,.]"],
+        b"1\n2\n",
+    );
+    compare_exact(
+        "argjson with slurp",
+        &["-c", "-s", "--argjson", "a", "[3]", "$a+."],
+        b"1\n2\n",
+    );
+    compare_exact(
+        "null ignores slurp",
+        &["-n", "-c", "-s", ".", &stream],
+        b"9\n",
+    );
+    compare_exact(
+        "null ignores missing",
+        &["-n", "-e", "-s", "-R", ".", &missing],
+        b"",
+    );
+}
+
+#[test]
+fn raw_input_matches_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("raw");
+    let hello = write_bytes(&dir, "hello", b"hello");
+    let empty = write_bytes(&dir, "emptyf", b"");
+    let justx = write_bytes(&dir, "justx", b"x");
+    let xnl = write_bytes(&dir, "xnl", b"x\n");
+    let mid = write_bytes(&dir, "mid", b"hello\nworld");
+    let zed = write_bytes(&dir, "Z", b"Z");
+    let pq = write_bytes(&dir, "pq", b"p\nq\n");
+    let lines = write_bytes(&dir, "lines", b"a\nb\nc\n");
+    let de = write_bytes(&dir, "de", b"d\ne\n");
+    let hx = write_bytes(&dir, "hx", b"hello");
+    let xy = write_bytes(&dir, "xy", b"x\ny\n");
+    let cr = write_bytes(&dir, "cr", b"a\r\nb\n");
+    let nul = write_bytes(&dir, "nul", b"a\x00b\n");
+    let badutf = write_bytes(&dir, "badutf", b"\xff\n\xff\xfe\n\x80\n\xc3\x28\n");
+    let ab = write_bytes(&dir, "ab", b"a\nb\n");
+    let more = write_bytes(&dir, "more", b"c\nd\n");
+    let bad_line = write_bytes(&dir, "badline", b"bad\n");
+    let ok_line = write_bytes(&dir, "okline", b"ok\n");
+    let text = write_bytes(&dir, "text", b"ab\ncd");
+    let missing = dir.join("nope").to_str().expect("utf-8").to_string();
+    let missing_b = dir.join("nope2").to_str().expect("utf-8").to_string();
+    let missing_c = dir.join("nope3").to_str().expect("utf-8").to_string();
+    let when = "if .==\"bad\" then 0|.a else . end";
+
+    compare_exact(
+        "span empty",
+        &["-c", "-R", ".", &hello, &empty, &justx],
+        b"",
+    );
+    compare_exact("span location", &["-R", "0|.a", &hello, &empty], b"");
+    compare_exact("missing location", &["-R", "0|.a", &hello, &missing], b"");
+    compare_exact("carry newline", &["-c", "-R", ".", &xnl, &mid], b"");
+    compare_exact("carry locations", &["-R", "0|.a", &xnl, &mid], b"");
+    compare_exact("owned by next file", &["-c", "-R", ".", &zed, &pq], b"");
+    compare_exact("owned locations", &["-R", "0|.a", &zed, &pq], b"");
+    compare_exact("no newline", &["-c", "-R", ".", &justx], b"");
+    compare_exact("no newline location", &["-R", "0|.a", &justx], b"");
+    compare_exact(
+        "one after missing",
+        &["-c", "-R", ".", &missing, &lines],
+        b"",
+    );
+    compare_exact(
+        "line after missing",
+        &["-c", "-R", ".", &lines, &missing, &de],
+        b"",
+    );
+    compare_exact(
+        "span after missing",
+        &["-c", "-R", ".", &missing, &hx, &xy],
+        b"",
+    );
+    compare_exact(
+        "two missing then one line",
+        &["-c", "-R", ".", &missing, &missing_b, &lines],
+        b"",
+    );
+    compare_exact(
+        "empty then missing",
+        &["-c", "-R", ".", &empty, &missing, &lines],
+        b"",
+    );
+    compare_exact(
+        "span is the one line",
+        &["-c", "-R", ".", &ab, &missing, &hx, &xy],
+        b"",
+    );
+    compare_exact(
+        "stop before a later missing file",
+        &["-c", "-R", ".", &ab, &missing, &more, &missing_c],
+        b"",
+    );
+    compare_exact("cr", &["-c", "-R", ".", &cr], b"");
+    compare_exact("nul json", &["-c", "-R", ".", &nul], b"");
+    compare_exact("nul raw", &["-Rr", ".", &nul], b"");
+    compare_exact("bad utf", &["-c", "-R", ".", &badutf], b"");
+    compare_exact("bad utf raw", &["-c", "-Rr", ".", &badutf], b"");
+    compare_exact(
+        "trailing after missing",
+        &["-c", "-R", ".", &hello, &missing],
+        b"",
+    );
+    compare_exact("trailing location", &["-R", "0|.a", &hello, &missing], b"");
+    compare_exact("earlier failure clears", &["-c", "-R", when], b"bad\nok\n");
+    compare_exact(
+        "last failure stays",
+        &["-e", "-c", "-R", when],
+        b"ok\nbad\n",
+    );
+    compare_exact(
+        "missing wins over a cleared line",
+        &["-e", "-c", "-R", when, &bad_line, &missing, &ok_line],
+        b"",
+    );
+    compare_exact("join", &["-j", "-R", "."], b"a\nb\n");
+    compare_exact("ascii", &["-a", "-c", "-R", "."], "é\n".as_bytes());
+    compare_exact("raw output", &["-Rr", "."], b"a\n");
+    compare_exact("raw output other order", &["-rR", "."], b"a\n");
+    compare_exact("long names", &["--raw-input", "--raw-output", "."], b"a\n");
+    compare_exact("slurp bytes", &["-c", "-Rs", "."], b"a\n");
+    compare_exact("slurp other order", &["-c", "-sR", "."], b"a\n");
+    compare_exact(
+        "slurp across missing",
+        &["-c", "-Rs", ".", &hello, &missing, &xnl],
+        b"",
+    );
+    compare_exact(
+        "slurp all missing",
+        &["-c", "-Rs", ".", &missing, &missing_b],
+        b"",
+    );
+    compare_exact("slurp location", &["-Rs", "0|.a"], b"1\n2\n3\n");
+    compare_exact("slurp location short", &["-Rs", "0|.a"], b"1");
+    compare_exact("slurp missing wins", &["-Rs", "0|.a", &text, &missing], b"");
+    compare_exact("stdin line", &["-c", "-R", "."], b"a\nb\n");
+    compare_exact("null ignores raw", &["-n", "-c", "-R", ".", &lines], b"9\n");
+}
+
+#[test]
+fn named_arguments_match_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("no args", &["-n", "-c", "$ARGS"], b""),
+        (
+            "pretty",
+            &["--arg", "b", "1", "--arg", "a", "2", "-n", "$ARGS"],
+            b"",
+        ),
+        (
+            "sorted",
+            &["--arg", "b", "1", "--arg", "a", "2", "-n", "-S", "$ARGS"],
+            b"",
+        ),
+        (
+            "compact",
+            &["--arg", "b", "1", "--arg", "a", "2", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        (
+            "args name",
+            &["--arg", "ARGS", "z", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        (
+            "args field",
+            &["--arg", "ARGS", "z", "-n", "-c", "$ARGS.named.ARGS"],
+            b"",
+        ),
+        (
+            "string wins over later json",
+            &["--arg", "a", "1", "--argjson", "a", "{", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "json wins over later string",
+            &["--argjson", "a", "1", "--arg", "a", "2", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "first string wins",
+            &["--arg", "a", "1", "--arg", "a", "2", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "repeat json is not parsed",
+            &[
+                "--argjson",
+                "a",
+                "1",
+                "--argjson",
+                "a",
+                "{",
+                "-n",
+                "-c",
+                "$a",
+            ],
+            b"",
+        ),
+        (
+            "later name still binds",
+            &[
+                "--arg",
+                "a",
+                "1",
+                "--argjson",
+                "a",
+                "{",
+                "--arg",
+                "b",
+                "2",
+                "-n",
+                "-c",
+                "$ARGS",
+            ],
+            b"",
+        ),
+        (
+            "bad json first",
+            &["--argjson", "a", "{", "--arg", "a", "1", "-n", "$a"],
+            b"",
+        ),
+        (
+            "compact is a value",
+            &["--arg", "a", "--compact-output", "-n", "$ARGS"],
+            b"",
+        ),
+        (
+            "dash dash value",
+            &["--arg", "a", "--", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "slurp is a value",
+            &["--arg", "a", "--slurp", "$a"],
+            b"1\n2\n",
+        ),
+        (
+            "slurp name",
+            &["--arg", "--slurp", "1", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        ("dash name", &["--arg", "--", "a", "-n", "-c", "$ARGS"], b""),
+        ("keyword", &["--arg", "if", "x", "-n", "-c", "$if"], b""),
+        (
+            "hyphen name",
+            &["--arg", "a-b", "x", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        ("empty name", &["--arg", "", "z", "-n", "-c", "$ARGS"], b""),
+        (
+            "digit name",
+            &["--arg", "1a", "y", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        (
+            "unicode name",
+            &["--arg", "é", "x", "-n", "-c", "$ARGS"],
+            b"",
+        ),
+        (
+            "padded",
+            &["--argjson", "a", "  1  ", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "padded lines",
+            &["--argjson", "a", "\n 1 \n", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "trailing space",
+            &["--argjson", "a", "true ", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "kept fraction",
+            &["--argjson", "a", "1.50", "-n", "$a"],
+            b"",
+        ),
+        (
+            "leading zero",
+            &["--argjson", "a", "01", "-n", "-c", "$a"],
+            b"",
+        ),
+        (
+            "dot fraction",
+            &["--argjson", "a", ".5", "-n", "-c", "$a"],
+            b"",
+        ),
+        ("plus", &["--argjson", "a", "+1", "-n", "-c", "$a"], b""),
+        ("infinity", &["--argjson", "a", "Infinity", "-n", "$a"], b""),
+        (
+            "negative infinity",
+            &["--argjson", "a", "-Infinity", "-n", "$a"],
+            b"",
+        ),
+        ("inf", &["--argjson", "a", "+inf", "-n", "$a"], b""),
+        ("nan", &["--argjson", "a", "nan", "-n", "$a"], b""),
+        (
+            "bom",
+            &["--argjson", "a", "\u{feff}1", "-n", "-c", "$a"],
+            b"",
+        ),
+        ("two values", &["--argjson", "a", "1 2", "-n", "$a"], b""),
+        ("two lines", &["--argjson", "a", "1\n2", "-n", "$a"], b""),
+        ("trailing comma", &["--argjson", "a", "1,", "-n", "$a"], b""),
+        ("comment", &["--argjson", "a", "1 #x", "-n", "$a"], b""),
+        ("dot", &["--argjson", "a", ".", "-n", "$a"], b""),
+        ("empty text", &["--argjson", "a", "", "-n", "$a"], b""),
+        ("blank text", &["--argjson", "a", "   ", "-n", "$a"], b""),
+        ("open brace", &["--argjson", "a", "{", "-n", "$a"], b""),
+        ("arg missing", &["--arg"], b""),
+        ("arg one", &["--arg", "a"], b""),
+        ("argjson missing", &["--argjson"], b""),
+        ("argjson one", &["--argjson", "a"], b""),
+        (
+            "shadow",
+            &["--arg", "a", "hello", "-n", "-c", "1 as $a | $a"],
+            b"",
+        ),
+        (
+            "reduce",
+            &[
+                "--argjson",
+                "a",
+                "10",
+                "-c",
+                "reduce .[] as $x ($a; . + $x)",
+            ],
+            b"[1,2,3]\n",
+        ),
+        (
+            "interpolate",
+            &["--arg", "a", "world", "-n", "-c", r#""hello \($a)""#],
+            b"",
+        ),
+        ("zero is truthy", &["--argjson", "a", "0", "-ne", "$a"], b""),
+        ("false arg", &["--argjson", "a", "false", "-ne", "$a"], b""),
+        (
+            "empty string arg",
+            &["--argjson", "a", "\"\"", "-ne", "$a"],
+            b"",
+        ),
+        (
+            "empty array arg",
+            &["--argjson", "a", "[]", "-ne", "$a"],
+            b"",
+        ),
+        (
+            "object",
+            &["--argjson", "a", "{\"z\":1,\"y\":2}", "-n", "-S", "$a"],
+            b"",
+        ),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+}
+
+#[test]
+fn filter_files_match_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("filter");
+    let prog = write_bytes(&dir, "prog.jq", b".a\n");
+    let commented = write_bytes(&dir, "comment.jq", b"# comment\n.a\n");
+    let data = write_bytes(&dir, "obj.json", b"{\"a\":1}\n");
+    let a = write_bytes(&dir, "a.json", b"1\n");
+    let b = write_bytes(&dir, "b.json", b"2\n");
+    let len = write_bytes(&dir, "len.jq", b"length\n");
+    let text = write_bytes(&dir, "text.txt", b"ab\ncd");
+    let second = write_bytes(&dir, "second.json", b"{\"b\":2}\n");
+    let dot = write_bytes(&dir, "dot.jq", b".\n");
+    let just = write_bytes(&dir, "one.jq", b"1\n");
+    let fals = write_bytes(&dir, "false.jq", b"false\n");
+    let none = write_bytes(&dir, "none.jq", b"empty\n");
+    let argp = write_bytes(&dir, "arg.jq", b"$a\n");
+    let sub = dir.join("sub");
+    fs::create_dir(&sub).expect("subdir");
+    let sub = sub.to_str().expect("utf-8").to_string();
+    let missing = dir.join("missing.jq").to_str().expect("utf-8").to_string();
+    let absent = dir.join("absent.json").to_str().expect("utf-8").to_string();
+
+    compare_exact("file", &["-c", "-f", &prog, &data], b"");
+    compare_exact("long name", &["-c", "--from-file", &prog, &data], b"");
+    compare_exact("comment", &["-c", "-f", &commented, &data], b"");
+    compare_exact("exit and compact", &["-cfe", &prog, &data], b"");
+    compare_exact("cluster slurp", &["-c", "-nfs", &len, &a, &b], b"");
+    compare_exact("flag then file", &["-c", "-f", "-s", &len, &a, &b], b"");
+    compare_exact(
+        "long slurp",
+        &["-c", "--from-file", "--slurp", &len, &a, &b],
+        b"",
+    );
+    compare_exact("raw slurp file", &["-c", "-Rsf", &len, &text], b"");
+    compare_exact(
+        "second flag is an input",
+        &["-c", "-f", &prog, "-f", &second, &data],
+        b"",
+    );
+    compare_exact("first positional", &["-c", &dot, "-f", &data], b"");
+    compare_exact(
+        "program text is the input",
+        &["-c", &data, "-f", &prog, &second],
+        b"",
+    );
+    compare_exact(
+        "filter path is an operand",
+        &["-c", ".b", "-f", &prog, &data],
+        b"",
+    );
+    compare_exact("after end", &["-c", "-f", "--", &prog, &data], b"");
+    compare_exact("stdin", &["-c", "-f", &prog], b"{\"a\":7}\n");
+    compare_exact("slurp stdin", &["-c", "-f", &len, "-s"], b"1\n2\n");
+    compare_exact(
+        "null skips a missing input",
+        &["-n", "-c", "-f", &just, &absent],
+        b"",
+    );
+    compare_exact(
+        "arg before",
+        &["-n", "-c", "--arg", "a", "9", "-f", &argp],
+        b"",
+    );
+    compare_exact(
+        "arg after",
+        &["-n", "-c", "-f", &argp, "--arg", "a", "9"],
+        b"",
+    );
+    compare_exact("false file", &["-n", "-e", "-f", &fals], b"");
+    compare_exact("empty result", &["-n", "-e", "-f", &none], b"");
+    compare_exact("dot directory", &["-n", "-f", "."], b"");
+    compare_exact("subdirectory", &["-n", "-e", "-f", &sub], b"");
+    compare_exact("missing filter", &["-n", "-e", "-f", &missing], b"");
+    compare_exact("empty path", &["-n", "-f", ""], b"");
+    compare_exact("dash is not stdin", &["-n", "-f", "-"], b"1\n");
+    compare_exact("no name opens dot", &["-f", "-s"], b"");
+    compare_exact("end opens dot", &["-f", "--"], b"");
+}
+
+#[test]
+fn rejected_options_stay_ours() {
+    require_jq();
+    let unknown = [
+        "--arg=a",
+        "--argjson=a",
+        "--from-file=prog.jq",
+        "--indent=4",
+        "-fprog.jq",
+        "--slurpfile",
+        "--args",
+        "-eQ",
+    ];
+    for option in unknown {
+        let stderr = format!("tumulus: unknown option: {option}\n");
+        assert_rejects(option, &[option], b"", stderr.as_bytes(), 1);
+    }
+
+    let (dir, _guard) = scratch("reject");
+    let empty = write_bytes(&dir, "empty.jq", b"");
+    let bad = write_bytes(&dir, "bad.jq", b"{\n");
+    let badb = write_bytes(&dir, "badb.jq", b"\xff");
+    let syntax = b"tumulus: syntax error\n";
+    assert_rejects("empty filter", &["-n", "-e", "-f", &empty], b"", syntax, 3);
+    assert_rejects("bad filter", &["-n", "-f", &bad], b"", syntax, 3);
+    assert_rejects("bad byte", &["-n", "-f", &badb], b"", syntax, 3);
+    assert_rejects(
+        "unbound",
+        &["--arg", "a", "1", "-n", "-e", "$b"],
+        b"",
+        syntax,
+        3,
+    );
+    assert_rejects("dash f", &["-n", "--", "-f"], b"", syntax, 3);
+    assert_rejects("dash arg", &["-n", "--", "--arg"], b"", syntax, 3);
+}
