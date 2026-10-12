@@ -1,10 +1,10 @@
 # tumulus
 
-tumulus reads JSON and prints it the way jq does. The filter language is still small. Version 0.1.0 is the first cut of it.
+tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.2.0.
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test.
+`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 141 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -58,19 +58,17 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 1.85 | 4.49 | 2.00 | 0.75 |
-| 2 | 1.87 | 0.73 | 2.00 | 0.75 |
-| 3 | 1.86 | 0.74 | 2.01 | 0.76 |
-
-The 4.49 second wall time on the first compact tumulus run had a user time of 0.71 seconds.
+| 1 | 1.90 | 0.78 | 2.08 | 0.79 |
+| 2 | 1.91 | 0.78 | 2.11 | 0.80 |
+| 3 | 1.94 | 0.78 | 2.01 | 0.80 |
 
 `citylots.json` is 189778220 bytes and 413125 lines. Compact output was 169215413 bytes. Pretty output was 395218854 bytes.
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 3.61 | 2.26 | 7.11 | 2.45 |
-| 2 | 3.54 | 2.27 | 7.09 | 2.41 |
-| 3 | 3.57 | 2.29 | 7.17 | 2.46 |
+| 1 | 3.56 | 2.22 | 7.15 | 2.45 |
+| 2 | 3.63 | 2.24 | 7.26 | 2.48 |
+| 3 | 3.53 | 2.23 | 7.42 | 2.42 |
 
 Times are seconds.
 
