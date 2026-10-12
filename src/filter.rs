@@ -1,5 +1,8 @@
 //! Paths, slices, iteration, recurse, pipe, comma, operators, bindings, builtins, and values.
 
+#[path = "update.rs"]
+mod update;
+
 use crate::number::{self, array_index, slice_bound};
 use crate::print::{self, Layout, Style};
 use crate::value::Value;
@@ -102,6 +105,25 @@ pub enum Filter {
     Select(Box<Filter>),
     /// `map(expr)`. One array, from every output on each element or value.
     Map(Box<Filter>),
+    /// `=`, `|=`, or one of `+=` `-=` `*=` `/=` `%=` `//=`.
+    Update {
+        op: UpdateOp,
+        path: Box<Filter>,
+        expr: Box<Filter>,
+    },
+}
+
+/// How an update writes. `Modify` is `|=`. `Alt` is `//=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOp {
+    Assign,
+    Modify,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Alt,
 }
 
 /// A name, or an array or object taken apart by indexing.
@@ -299,6 +321,7 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),
         Filter::Map(arg) => eval_map(arg, input, env),
+        Filter::Update { op, path, expr } => update::eval_update(*op, path, expr, input, env),
     }
 }
 
@@ -1359,6 +1382,10 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner) => check_vars(inner, scope),
+        Filter::Update { path, expr, .. } => {
+            check_vars(path, scope)?;
+            check_vars(expr, scope)
+        }
         Filter::Interpolate(pieces) => {
             for piece in pieces {
                 if let Piece::Interp(inner) = piece {
@@ -1499,14 +1526,31 @@ impl<'a> Parser<'a> {
         Ok(filter)
     }
 
-    /// `//` is right-associative and looser than `or`.
+    /// `//` is right-associative. It is looser than an update and tighter than `,`.
     fn parse_alt(&mut self) -> Result<Filter, ProgramError> {
-        let left = self.parse_or()?;
+        let left = self.parse_update()?;
         if self.eat_alt() {
             let right = self.parse_alt()?;
             return Ok(Filter::Alt(Box::new(left), Box::new(right)));
         }
         Ok(left)
+    }
+
+    /// `=` does not chain. `//=` is one operator, not `//` followed by `=`.
+    fn parse_update(&mut self) -> Result<Filter, ProgramError> {
+        let left = self.parse_or()?;
+        let Some(op) = self.take_update() else {
+            return Ok(left);
+        };
+        let right = self.parse_or()?;
+        if self.sees_update() {
+            return Err(ProgramError::Syntax);
+        }
+        Ok(Filter::Update {
+            op,
+            path: Box::new(left),
+            expr: Box::new(right),
+        })
     }
 
     fn parse_or(&mut self) -> Result<Filter, ProgramError> {
@@ -1548,9 +1592,11 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_signed()?;
         loop {
             self.skip_ws();
-            let op = match self.peek() {
-                Some('+') => Op::Add,
-                Some('-') => Op::Sub,
+            // `+=` and `-=` are updates, not addition followed by assignment.
+            let op = match (self.peek(), self.peek_at(1)) {
+                (Some('+'), Some('=')) | (Some('-'), Some('=')) => break,
+                (Some('+'), _) => Op::Add,
+                (Some('-'), _) => Op::Sub,
                 _ => break,
             };
             self.bump();
@@ -1728,6 +1774,11 @@ impl<'a> Parser<'a> {
                 "has" => Ok(Filter::Has(self.parse_one_arg()?)),
                 "select" => Ok(Filter::Select(self.parse_one_arg()?)),
                 "map" => Ok(Filter::Map(self.parse_one_arg()?)),
+                "del" => Ok(Filter::Update {
+                    op: UpdateOp::Modify,
+                    path: self.parse_one_arg()?,
+                    expr: Box::new(Filter::Empty),
+                }),
                 "if" if !self.reject_block => self.parse_if(),
                 "reduce" if !self.reject_block => self.parse_fold(false),
                 "foreach" if !self.reject_block => self.parse_fold(true),
@@ -2015,12 +2066,47 @@ impl<'a> Parser<'a> {
 
     fn eat_alt(&mut self) -> bool {
         self.skip_ws();
-        if self.src[self.index..].starts_with("//") {
+        let rest = &self.src[self.index..];
+        // `//=` is an update, not an alternative followed by assignment.
+        if rest.starts_with("//") && !rest.starts_with("//=") {
             self.index += 2;
             true
         } else {
             false
         }
+    }
+
+    fn take_update(&mut self) -> Option<UpdateOp> {
+        self.skip_ws();
+        let rest = &self.src[self.index..];
+        let (op, len) = if rest.starts_with("|=") {
+            (UpdateOp::Modify, 2)
+        } else if rest.starts_with("+=") {
+            (UpdateOp::Add, 2)
+        } else if rest.starts_with("-=") {
+            (UpdateOp::Sub, 2)
+        } else if rest.starts_with("*=") {
+            (UpdateOp::Mul, 2)
+        } else if rest.starts_with("/=") {
+            (UpdateOp::Div, 2)
+        } else if rest.starts_with("%=") {
+            (UpdateOp::Rem, 2)
+        } else if rest.starts_with("//=") {
+            (UpdateOp::Alt, 3)
+        } else if rest.starts_with('=') && !rest.starts_with("==") {
+            (UpdateOp::Assign, 1)
+        } else {
+            return None;
+        };
+        self.index += len;
+        Some(op)
+    }
+
+    fn sees_update(&mut self) -> bool {
+        let saved = self.index;
+        let found = self.take_update().is_some();
+        self.index = saved;
+        found
     }
 
     fn sees(&mut self, expected: char) -> bool {
@@ -2045,6 +2131,11 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let rest = &self.src[self.index..];
         if rest.starts_with("//") {
+            return None;
+        }
+        // `*=`, `/=`, and `%=` are updates.
+        if rest.len() > 1 && rest.as_bytes()[1] == b'=' && matches!(rest.as_bytes()[0], b'*' | b'/' | b'%')
+        {
             return None;
         }
         let (op, len) = if rest.starts_with('*') {
@@ -2569,6 +2660,10 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> Option<char> {
         self.src[self.index..].chars().next()
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.src[self.index..].chars().nth(offset)
     }
 
     fn bump(&mut self) {
