@@ -1,6 +1,20 @@
 # tumulus
 
-tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.2.0.
+tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.3.0.
+
+macOS on Apple silicon:
+
+```sh
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.3.0/tumulus-macos-arm64
+chmod +x tumulus
+```
+
+Linux on x86_64:
+
+```sh
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.3.0/tumulus-linux-x86_64
+chmod +x tumulus
+```
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 

@@ -1,0 +1,72 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+            asset: tumulus-macos-arm64
+            kind: arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            asset: tumulus-linux-x86_64
+            kind: x86-64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check the runner
+        run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Name the binary
+        run: cp "target/${{ matrix.target }}/release/tumulus" "${{ matrix.asset }}"
+      - name: Check the binary
+        run: file "${{ matrix.asset }}" | grep -F "${{ matrix.kind }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mac=$(find dist -type f -name tumulus-macos-arm64)
+          linux=$(find dist -type f -name tumulus-linux-x86_64)
+          test "$(printf '%s\n' "$mac" | grep -c .)" -eq 1
+          test "$(printf '%s\n' "$linux" | grep -c .)" -eq 1
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$mac" "$linux" --clobber
+          else
+            gh release create "$tag" "$mac" "$linux" \
+              --verify-tag \
+              --title "$tag" \
+              --notes-from-tag
+          fi
