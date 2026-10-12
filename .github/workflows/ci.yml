@@ -18,4 +18,19 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Compare tumulus with jq
-        run: cargo test --locked
+        run: |
+          jq --version
+          cargo test --locked
+
+  parity-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare tumulus with jq
+        # Homebrew jq is earlier on PATH. The comparison is the system jq.
+        run: |
+          export PATH="/usr/bin:${PATH}"
+          test "$(command -v jq)" = /usr/bin/jq
+          jq --version
+          cargo test --locked
