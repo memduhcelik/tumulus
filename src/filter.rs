@@ -440,17 +440,23 @@ fn iterate(input: &Value) -> Result<Vec<Value>, Failure> {
 }
 
 fn shown(value: &Value) -> String {
+    clipped(value, 14)
+}
+
+/// Compact JSON, cut to `max` bytes. The last three bytes become `...`.
+/// A cut through a UTF-8 sequence keeps U+FFFD in their place.
+fn clipped(value: &Value, max: usize) -> String {
     let style = Style {
         layout: Layout::Compact,
         ..Style::default()
     };
     let rendered = print::render(value, style);
     let bytes = rendered.as_bytes();
-    if bytes.len() <= 14 {
+    if bytes.len() <= max {
         return rendered;
     }
-    // Keep 11 bytes. An incomplete UTF-8 sequence becomes U+FFFD.
-    let head = &bytes[..11];
+    let keep = max.saturating_sub(3);
+    let head = &bytes[..keep];
     let mut valid = 0;
     let mut index = 0;
     while index < head.len() {
@@ -2134,7 +2140,9 @@ impl<'a> Parser<'a> {
             return None;
         }
         // `*=`, `/=`, and `%=` are updates.
-        if rest.len() > 1 && rest.as_bytes()[1] == b'=' && matches!(rest.as_bytes()[0], b'*' | b'/' | b'%')
+        if rest.len() > 1
+            && rest.as_bytes()[1] == b'='
+            && matches!(rest.as_bytes()[0], b'*' | b'/' | b'%')
         {
             return None;
         }
