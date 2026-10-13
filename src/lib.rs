@@ -1,5 +1,6 @@
 //! Read JSON and write it back in jq's layout.
 
+mod date;
 mod error;
 mod filter;
 mod number;

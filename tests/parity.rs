@@ -2376,6 +2376,28 @@ fn builtin_syntax_stays_generic() {
         "(map(.+1))(2)",
         "lengthx",
         "hasx(1)",
+        "todate()",
+        "todate(1)",
+        "todate ()",
+        "fromdate()",
+        "fromdate(1)",
+        "gmtime()",
+        "gmtime(1)",
+        "mktime()",
+        "mktime(1)",
+        "(todate)(0)",
+        "(fromdate)(\"\")",
+        "(gmtime)(0)",
+        "(mktime)(0)",
+        "strftime",
+        "strftime()",
+        "strftime ()",
+        "strftime(1;2)",
+        "(strftime(\"%Y\"))(0)",
+        "localtime",
+        "strflocaltime(\"%Y\")",
+        "todateiso8601",
+        "fromdateiso8601",
     ];
     for program in programs {
         let args: Vec<String> = ["-n", "-c", "--", program]
@@ -2396,6 +2418,288 @@ fn builtin_syntax_stays_generic() {
         );
         assert_eq!(got.status.code(), Some(3), "{program}");
     }
+}
+
+#[test]
+fn dates_match_jq() {
+    require_jq();
+    let programs = [
+        "0 | todate",
+        "1 | todate",
+        "1.9 | todate",
+        "-0 | todate",
+        "-1 | todate",
+        "-1.9 | todate",
+        "-0.1 | todate",
+        "nan | todate",
+        "86400 | todate",
+        "1600000000 | todate",
+        "1600000000 | todate | fromdate",
+        "1e10 | todate",
+        "1e16 | todate",
+        "-1e16 | todate",
+        "-315619200 | todate",
+        "-2208988800 | todate",
+        "[1970,0,1,0,0,0,4,0] | todate",
+        "[2015,2,5,23,51,47,4,63] | strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "0 | gmtime",
+        "1 | gmtime",
+        "1.9 | gmtime",
+        "-0 | gmtime",
+        "-0.1 | gmtime",
+        "-0.9 | gmtime",
+        "-1 | gmtime",
+        "-1.1 | gmtime",
+        "-1.9 | gmtime",
+        "nan | gmtime",
+        "nan | gmtime | .[5] == null",
+        "nan | gmtime | .[5] | length",
+        "86400 | gmtime",
+        "1425599507 | gmtime",
+        "1425599507 | gmtime | .[0] == 2015",
+        "1600000000.9 | gmtime",
+        "1e16 | gmtime",
+        "1e16 | gmtime | mktime",
+        "-1e16 | gmtime",
+        "9007199254740993 | gmtime | .[0]",
+        "0 | gmtime | mktime",
+        "1.9 | gmtime | mktime",
+        "1600000000 | gmtime | mktime",
+        "86400 | gmtime | mktime | todate",
+        "[1970,0,1,0,0,0,4,0] | mktime",
+        "[1970,0,1,0,0,0,0,0] | mktime",
+        "[1970,0,1,0,0,0,4,99] | mktime",
+        "[1970,0,1,0,0,60,4,0] | mktime",
+        "[1970,0,1,0,0,61,4,0] | mktime",
+        "[1970,12,1,0,0,0,4,0] | mktime",
+        "[1970,0,0,0,0,0,4,0] | mktime",
+        "[1970,0,1,24,0,0,4,0] | mktime",
+        "[1970.9,0.9,1.9,0.9,0.9,0.9,4.9,0.9] | mktime",
+        "[1970,0,1,0,0,1.9,4,0] | mktime",
+        "[1970,0,1,0,0,nan,4,0] | mktime",
+        "[1970,0,1,0,0,infinite,4,0] | mktime",
+        "[1970,0,1,0,0,0,4,0,\"x\"] | mktime",
+        "[1970,0,1,0,0,0,4,0,null] | mktime",
+        "[infinite,0,1,0,0,0,4,0] | mktime",
+        "\"1970-01-01T00:00:00Z\" | fromdate",
+        "\"1970-01-01T00:00:01Z\" | fromdate",
+        "\"2000-01-01T00:00:00Z\" | fromdate",
+        "\"2000-02-29T00:00:00Z\" | fromdate",
+        "\"2016-12-31T23:59:59Z\" | fromdate | todate",
+        "\"1960-01-01T00:00:00Z\" | fromdate",
+        "\"1900-01-01T00:00:00Z\" | fromdate",
+        "\"1970-01-01T00:00:00Z \" | fromdate",
+        "\"1970-01-01T00:00:00Z\\n\" | fromdate",
+        "\"1970-01-01T00:00:00Z\\t\" | fromdate",
+        "\"1970-01-01T00:00:00Z\\r\" | fromdate",
+        "\"1970-01-01T00:00:00Z\\u000b\" | fromdate",
+        "\"1970-01-01T00:00:00Z\\u000c\" | fromdate",
+        "\"1970-01-01T00:00:00Z junk\" | fromdate",
+        "\"1970-01-01T00:00:00Z\\u00a0\" | fromdate",
+        "0 | strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "0 | strftime(\"%Y %m %d %H %M %S\")",
+        "0 | strftime(\"%Z\")",
+        "0 | strftime(\"year %Y\")",
+        "0 | strftime(\"年%Y月\")",
+        "0 | strftime(\"hello\")",
+        "0 | strftime(\"%Y\", \"%m\")",
+        "(0, 86400) | strftime(\"%d\")",
+        "1.9 | strftime(\"%S\")",
+        "1.9 | gmtime | strftime(\"%S\")",
+        "[1970,0,1,0,0,1.9,4,0] | strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "[1970,0,1,0,0,1.9,4,0] | strftime(\"%S\")",
+        "nan | strftime(\"%Y\")",
+        "0 | strftime(empty)",
+        "\"x\" | strftime(\"%Y\")?",
+        "true | todate?",
+        "(\"x\" | gmtime)?, 1",
+        "{todate: 1}",
+        "{todate}",
+        "{gmtime: 1}",
+        "{strftime: 1}",
+        "[0, 1.9, 86400] | map(todate)",
+        "0 | strftime (\"%Y\")",
+        "strftime(\"%Y\")",
+        "0 | gmtime | strftime(\"%Y-%m-%d\")",
+        "2 | gmtime | .[0]",
+        "[0] | .[0] |= todate",
+        "infinite | todate",
+        "-infinite | todate",
+        "true | todate",
+        "\"x\" | todate",
+        "null | todate",
+        "[1970,0,1,0,0,0] | todate",
+        "infinite | gmtime",
+        "-infinite | gmtime",
+        "true | gmtime",
+        "\"0\" | gmtime",
+        "null | gmtime",
+        "[0] | gmtime",
+        "1e17 | gmtime",
+        "1e18 | gmtime",
+        "-1 | gmtime | mktime",
+        "[1969,11,31,23,59,59,3,364] | mktime",
+        "[1969,11,31,23,59,58,3,364] | mktime",
+        "[1970,0,1,0,0] | mktime",
+        "[1970,0,1,0,0,0] | mktime",
+        "[1970,0,1,0,0,0,4] | mktime",
+        "[1970,0,1,0,0,0,4,null] | mktime",
+        "[1970,0,1,0,0,0,4,\"0\"] | mktime",
+        "[true,0,1,0,0,0,4,0] | mktime",
+        "true | mktime",
+        "0 | mktime",
+        "{} | mktime",
+        "[] | mktime",
+        "\"1970-01-01T00:00:00Zjunk\" | fromdate",
+        "\"1970-01-01T00:00:00ZZ\" | fromdate",
+        "\"1970-01-01T00:00:00\" | fromdate",
+        "\"1970-01-01t00:00:00Z\" | fromdate",
+        "\"1970-01-01T00:00:00.5Z\" | fromdate",
+        "\"1970-01-01T00:00:00+00:00\" | fromdate",
+        "\"bad\" | fromdate",
+        "0 | fromdate",
+        "true | fromdate",
+        "null | fromdate",
+        "[] | fromdate",
+        "\"1969-12-31T23:59:59Z\" | fromdate",
+        "\"1969-12-31T23:59:58Z\" | fromdate",
+        "\"0001-01-01T00:00:00Z\" | fromdate",
+        "\"1970\\n-01\" | fromdate",
+        "\"say \\\"hi\\\"\" | fromdate",
+        "true | strftime(\"%Y\")",
+        "\"x\" | strftime(\"%Y\")",
+        "null | strftime(\"%Y\")",
+        "[1970,0,1,0,0,0] | strftime(\"%Y\")",
+        "[true,0,1,0,0,0,4,0] | strftime(\"%Y\")",
+        "[1970,0,1,0,0,0,4,0] | strftime(1)",
+        "[1970,0,1] | strftime(1)",
+        "[true,0,1,0,0,0,4,0] | strftime(1)",
+        "infinite | strftime(\"%Y\")",
+        "infinite | strftime(1)",
+        "infinite | strftime(\"%Y\", \"%m\")",
+        "0 | strftime(\"\")",
+        "0 | strftime(\"%Y\", 1/0)",
+        "0 | strftime(1/0)",
+        "0 | strftime(1/0, \"%Y\")",
+        "1, (\"x\" | todate)",
+        "(\"x\" | todate), 1",
+        "1, (\"x\" | gmtime)",
+        "(\"no\" | fromdate), 1",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    let streams = [
+        ("todate", "0\n1\n\"x\"\n"),
+        ("gmtime", "0\n1\n\"x\"\n"),
+        ("todate", "0\n\"x\"\n1\n"),
+        ("fromdate", "\"1970-01-01T00:00:00Z\"\n\"bad\"\n"),
+        ("gmtime", "0\ntrue\n1\n"),
+    ];
+    for (program, input) in streams {
+        compare_exact(program, &["-c", "--", program], input.as_bytes());
+    }
+    for tz in ["UTC", "GMT", "America/Los_Angeles", "Asia/Kolkata"] {
+        compare_tz("epoch zone", "0 | strftime(\"%Z\")", tz);
+        compare_tz("summer zone", "1593561600 | strftime(\"%Z\")", tz);
+        compare_tz(
+            "utc fields",
+            "1593561600 | strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+            tz,
+        );
+    }
+}
+
+/// jq aborts when `strftime` is given a number and a format that is not a
+/// string. The message here is the one jq prints for an array. Other
+/// format letters are left for later, so they are not compared with jq.
+#[test]
+fn strftime_letters_are_limited() {
+    let cases = [
+        (r#"0 | strftime("%a")"#, "strftime does not support %a"),
+        (r#"0 | strftime("%%")"#, "strftime does not support %%"),
+        (r#"0 | strftime("%")"#, "strftime does not support %"),
+        (r#"0 | strftime("%Y%")"#, "strftime does not support %"),
+        (r#"0 | strftime("%j")"#, "strftime does not support %j"),
+        (r#"0 | strftime("%z")"#, "strftime does not support %z"),
+        (r#"0 | strftime("%n")"#, "strftime does not support %n"),
+        (r#"0 | strftime("%t")"#, "strftime does not support %t"),
+        (r#"0 | strftime("%EY")"#, "strftime does not support %E"),
+        (r#"0 | strftime("%-Y")"#, "strftime does not support %-"),
+        (r#"0 | strftime("%10Y")"#, "strftime does not support %1"),
+        (r#"0 | strftime("%Q%Y")"#, "strftime does not support %Q"),
+        (
+            r#"[1970,0,1,0,0,0,4,0] | strftime("%a")"#,
+            "strftime does not support %a",
+        ),
+        (r#"0 | strftime(1)"#, "strftime/1 requires a string format"),
+        (
+            r#"0 | strftime(null)"#,
+            "strftime/1 requires a string format",
+        ),
+        (
+            r#"0 | strftime(true)"#,
+            "strftime/1 requires a string format",
+        ),
+        (
+            r#"0 | strftime(["%Y"])"#,
+            "strftime/1 requires a string format",
+        ),
+    ];
+    for (program, message) in cases {
+        let stderr = format!("jq: error (at <unknown>): {message}\n");
+        assert_rejects(
+            program,
+            &["-n", "-c", "--", program],
+            b"",
+            stderr.as_bytes(),
+            5,
+        );
+    }
+    let program = r#"0 | strftime("%Y", "%a")"#;
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let args = ["-n", "-c", "--", program];
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let got = run(bin, &owned, b"");
+    assert_eq!(got.stdout, b"\"1970\"\n", "{program}");
+    assert_eq!(
+        got.stderr, b"jq: error (at <unknown>): strftime does not support %a\n",
+        "{program}"
+    );
+    assert_eq!(got.status.code(), Some(5), "{program}");
+}
+
+fn compare_tz(name: &str, program: &str, tz: &str) {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let args = ["-n", "-c", "--", program];
+    let got = Command::new(bin)
+        .args(args)
+        .env("TZ", tz)
+        .output()
+        .unwrap_or_else(|err| panic!("could not start tumulus: {err}"));
+    let expected = Command::new("jq")
+        .args(args)
+        .env("TZ", tz)
+        .output()
+        .unwrap_or_else(|err| panic!("could not start jq: {err}"));
+    assert_eq!(
+        got.stdout,
+        expected.stdout,
+        "{name}: stdout differs under TZ={tz}\nstderr ours:\n{}\nstderr jq:\n{}",
+        String::from_utf8_lossy(&got.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert_eq!(
+        got.stderr, expected.stderr,
+        "{name}: stderr differs under TZ={tz}"
+    );
+    assert_eq!(
+        got.status.code(),
+        expected.status.code(),
+        "{name}: exit status differs under TZ={tz}\nstderr ours:\n{}\nstderr jq:\n{}",
+        String::from_utf8_lossy(&got.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
 }
 
 struct DirGuard(std::path::PathBuf);

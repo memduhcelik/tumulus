@@ -18,7 +18,7 @@ chmod +x tumulus
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 141 come out the same on stdout, stderr, and the exit status.
+`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 167 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -50,13 +50,17 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `empty` yields no values. `length` is the number of Unicode code points in a string, the number of elements in an array, and the number of keys in an object. Null has length 0. The length of a number is its absolute value. `keys` is the indexes of an array, or the keys of an object in order. `has(expr)`, `select(expr)`, and `map(expr)` take that one filter. `select` repeats the input for each truthy result. `map` runs the filter on each array element or object value and collects the results. The wrong kind of value fails the way jq fails, and the exit status is 5.
 
+`todate` writes a number of seconds since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`. `fromdate` reads that text back into seconds. `gmtime` breaks a number of seconds into `[year, month, day, hour, minute, second, weekday, yearday]`. The month and the weekday start at 0. `mktime` turns that array back into seconds. `strftime(fmt)` formats a number of seconds or that array. The format letters are `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, and `%Z`. A value of the wrong kind fails the way jq fails, and the exit status is 5.
+
 `=` writes a value through a path. `|=` runs a filter on the value there and writes the first result back. No result removes that place, which is also what `del(path)` does. `+=`, `-=`, `*=`, `/=`, `%=`, and `//=` combine the value already there with the right-hand side. A path is a field, an index, a slice, or iteration. It can go through `|`, `,`, `select`, `//`, `if`, and `as`. `and`, `or`, and a matching `null`, `true`, or `false` stay paths when they do in jq. An update that lands on the wrong kind of value fails the way jq fails, and the exit status is 5.
 
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
 
-Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too.
+Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too, and so are `localtime` and `strflocaltime`.
+
+`strftime` rejects a format letter other than the seven above. The message names the letter and the exit status is 5.
 
 `{$name}` and `{$name: value}` are rejected. jq uses the variable's name or the variable's value as an object key. `$__loc__` as a field is rejected too.
 

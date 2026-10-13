@@ -3,6 +3,7 @@
 #[path = "update.rs"]
 mod update;
 
+use crate::date;
 use crate::number::{self, array_index, slice_bound};
 use crate::print::{self, Layout, Style};
 use crate::value::Value;
@@ -105,6 +106,16 @@ pub enum Filter {
     Select(Box<Filter>),
     /// `map(expr)`. One array, from every output on each element or value.
     Map(Box<Filter>),
+    /// `todate`
+    ToDate,
+    /// `fromdate`
+    FromDate,
+    /// `gmtime`
+    GmTime,
+    /// `mktime`
+    MkTime,
+    /// `strftime(fmt)`
+    StrfTime(Box<Filter>),
     /// `=`, `|=`, or one of `+=` `-=` `*=` `/=` `%=` `//=`.
     Update {
         op: UpdateOp,
@@ -321,6 +332,11 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),
         Filter::Map(arg) => eval_map(arg, input, env),
+        Filter::ToDate => one(date::todate(input)),
+        Filter::FromDate => one(date::fromdate(input)),
+        Filter::GmTime => one(date::gmtime(input)),
+        Filter::MkTime => one(date::mktime(input)),
+        Filter::StrfTime(arg) => eval_strftime(arg, input, env),
         Filter::Update { op, path, expr } => update::eval_update(*op, path, expr, input, env),
     }
 }
@@ -877,6 +893,31 @@ fn eval_if(
     finish(out, err)
 }
 
+fn one(result: Result<Value, String>) -> Result<Vec<Value>, Failure> {
+    result.map(|value| vec![value]).map_err(fail)
+}
+
+fn eval_strftime(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (formats, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for format in formats {
+        match date::format_time(input, &format) {
+            Ok(value) => out.push(value),
+            Err(message) => {
+                return Err(Failure {
+                    partial: out,
+                    message,
+                })
+            }
+        }
+    }
+    finish(out, err)
+}
+
 fn eval_length(input: &Value) -> Result<Vec<Value>, Failure> {
     match input {
         Value::Null => Ok(vec![Value::Number("0".to_string())]),
@@ -1362,7 +1403,11 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Not
         | Filter::Empty
         | Filter::Length
-        | Filter::Keys => Ok(()),
+        | Filter::Keys
+        | Filter::ToDate
+        | Filter::FromDate
+        | Filter::GmTime
+        | Filter::MkTime => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -1387,7 +1432,8 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Neg(inner)
         | Filter::Has(inner)
         | Filter::Select(inner)
-        | Filter::Map(inner) => check_vars(inner, scope),
+        | Filter::Map(inner)
+        | Filter::StrfTime(inner) => check_vars(inner, scope),
         Filter::Update { path, expr, .. } => {
             check_vars(path, scope)?;
             check_vars(expr, scope)
@@ -1780,6 +1826,11 @@ impl<'a> Parser<'a> {
                 "has" => Ok(Filter::Has(self.parse_one_arg()?)),
                 "select" => Ok(Filter::Select(self.parse_one_arg()?)),
                 "map" => Ok(Filter::Map(self.parse_one_arg()?)),
+                "todate" => Ok(Filter::ToDate),
+                "fromdate" => Ok(Filter::FromDate),
+                "gmtime" => Ok(Filter::GmTime),
+                "mktime" => Ok(Filter::MkTime),
+                "strftime" => Ok(Filter::StrfTime(self.parse_one_arg()?)),
                 "del" => Ok(Filter::Update {
                     op: UpdateOp::Modify,
                     path: self.parse_one_arg()?,
@@ -2929,7 +2980,12 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::Keys
         | Filter::Has(_)
         | Filter::Select(_)
-        | Filter::Map(_) => true,
+        | Filter::Map(_)
+        | Filter::ToDate
+        | Filter::FromDate
+        | Filter::GmTime
+        | Filter::MkTime
+        | Filter::StrfTime(_) => true,
         Filter::Optional(inner) => forbids_call(inner),
         _ => false,
     }
