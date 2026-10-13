@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+Released on 2026-10-14.
+
+A runtime error names the line jq names. A value spread over several lines was reported where it started. jq reports how far its reader got when the value finished.
+
+`todate` writes a number of seconds since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`. `fromdate` reads that text back into seconds. `gmtime` breaks a number of seconds into `[year, month, day, hour, minute, second, weekday, yearday]`. The month and the weekday start at 0. `mktime` turns that array back into seconds. `strftime(fmt)` formats a number of seconds or that array. `strptime(fmt)` reads text in that format back into the array. `now` is the current number of seconds since the epoch. The format letters are `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%Z`, `%j`, `%a`, `%b`, `%e`, `%y`, and `%z`. A value of the wrong kind fails the way jq fails, and the exit status is 5. Any other letter is rejected. The message names the letter and the exit status is 5.
+
+The Mac and Linux binaries answer differently where the two jq builds do. On a Mac, `strptime` replaces the weekday and yearday with its own calculation. `"" | strptime("")` and `"" | strptime("%Y")` are both `[1900,0,0,0,0,0,6,-1]`. On Linux, `strptime` keeps the fields the C library stored. `"" | strptime("")` is `[1900,0,0,0,0,0,8,367]`, and `"" | strptime("%Y")` fails with `date "" does not match format "%Y"`. A `%z` offset moves the clock into the local zone on a Mac and leaves the written time on Linux. `nan | gmtime` is `[1970,0,1,0,0,null,4,0]` on a Mac. On Linux it fails with `error converting number of seconds since epoch to datetime`.
+
+Of the 447 programs in jq 1.7.1's test file, 167 come out the same.
+
 ## 0.3.0
 
 Released on 2026-10-13.
@@ -11,8 +23,6 @@ A `?` on a bracket keeps the later indexes. `.["a",0]?` on an array prints the e
 `=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, and `//=` write through a path. `del` removes what a path reaches. `|=` writes the first result back. No result removes that place, which is also what `del` does. A path is a field, an index, a slice, or iteration. It can go through `|`, a comma, `select`, `//`, `if`, and `as`. `and`, `or`, and a matching `null`, `true`, or `false` stay paths when they do in jq. An update on the wrong kind of value fails the way jq fails.
 
 A version tag builds macOS arm64 and Linux x86_64 binaries and attaches them to the release. Publishing that release does not need a git checkout.
-
-After that tag, still at this version, a runtime error names the line jq names. A value spread over several lines was reported where it started. jq reports how far its reader got when the value finished.
 
 ## 0.2.0
 
