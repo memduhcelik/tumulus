@@ -2403,8 +2403,15 @@ fn builtin_syntax_stays_generic() {
         "now(1)",
         "now ()",
         "(now)(0)",
-        "localtime",
-        "strflocaltime(\"%Y\")",
+        "localtime()",
+        "localtime(1)",
+        "localtime ()",
+        "(localtime)(0)",
+        "strflocaltime",
+        "strflocaltime()",
+        "strflocaltime ()",
+        "strflocaltime(1;2)",
+        "(strflocaltime(\"%Y\"))(0)",
         "todateiso8601",
         "fromdateiso8601",
     ];
@@ -2687,6 +2694,89 @@ fn dates_match_jq() {
         "{now}",
         "{strptime: 1}",
         "{strptime}",
+        "0 | localtime",
+        "1 | localtime",
+        "1.9 | localtime",
+        "-0 | localtime",
+        "-0.1 | localtime",
+        "-0.9 | localtime",
+        "-1 | localtime",
+        "-1.1 | localtime",
+        "-1.9 | localtime",
+        "nan | localtime",
+        "nan | localtime | .[5] == null",
+        "nan | localtime | .[5] | length",
+        "86400 | localtime",
+        "1425599507 | localtime",
+        "1600000000.9 | localtime",
+        "1e16 | localtime",
+        "1e16 | strflocaltime(\"%Y\")",
+        "-1e16 | localtime",
+        "-1e16 | strflocaltime(\"%Y\")",
+        "9007199254740993 | localtime | .[0]",
+        "9007199254740993 | strflocaltime(\"%Y\")",
+        "0 | localtime | .[5]",
+        "0 | gmtime == localtime",
+        "1593561600 | localtime",
+        "localtime",
+        "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "0 | strflocaltime(\"%Y %m %d %H %M %S\")",
+        "0 | strflocaltime(\"%Z\")",
+        "0 | strflocaltime(\"%z\")",
+        "0 | strflocaltime(\"%j\")",
+        "0 | strflocaltime(\"%a\")",
+        "0 | strflocaltime(\"%b\")",
+        "0 | strflocaltime(\"%e\")",
+        "0 | strflocaltime(\"%y\")",
+        "0 | strflocaltime(\"%Y %m %d %H %M %S %Z %z %j %a %b %e %y\")",
+        "0 | strflocaltime(\"%Y\", \"%m\")",
+        "(0, 86400) | strflocaltime(\"%d\")",
+        "1.9 | strflocaltime(\"%S\")",
+        "1.9 | localtime | strflocaltime(\"%S\")",
+        "[1970,0,1,0,0,1.9,4,0] | strflocaltime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "[1970,0,1,0,0,1.9,4,0] | strflocaltime(\"%S\")",
+        "[1970,0,1,0,0,0,4,0] | strflocaltime(\"%Y-%m-%dT%H:%M:%S %Z %z\")",
+        "[1970,0,1,0,0,0,4,0] | strftime(\"%Z %z\") == ([1970,0,1,0,0,0,4,0] | strflocaltime(\"%Z %z\"))",
+        "0 | strflocaltime(empty)",
+        "\"x\" | localtime?",
+        "(\"x\" | localtime)?, 1",
+        "{localtime: 1}",
+        "{localtime}",
+        "{strflocaltime: 1}",
+        "{strflocaltime}",
+        "[0, 1.9, 86400] | map(localtime)",
+        "0 | strflocaltime (\"%Y\")",
+        "strflocaltime(\"%Y\")",
+        "0 | localtime | strflocaltime(\"%Y-%m-%d\")",
+        "1593561600 | strflocaltime(\"%Y-%m-%d %H:%M:%S %Z %z %a %j\")",
+        "1593561600 | localtime | strflocaltime(\"%Y-%m-%d %H:%M:%S\")",
+        "86400 | strflocaltime(\"%j %a %e\")",
+        "[1970,0,1,0,0,0,4,0] | strflocaltime(\"%a %b %d %e %y %j\")",
+        "[1970,0,5,0,0,0,4,4] | strflocaltime(\"%e\")",
+        "[1970,0,10,0,0,0,4,9] | strflocaltime(\"%e\")",
+        "infinite | localtime",
+        "-infinite | localtime",
+        "true | localtime",
+        "\"0\" | localtime",
+        "null | localtime",
+        "[0] | localtime",
+        "1e17 | localtime",
+        "1e18 | localtime",
+        "true | strflocaltime(\"%Y\")",
+        "\"x\" | strflocaltime(\"%Y\")",
+        "null | strflocaltime(\"%Y\")",
+        "[1970,0,1,0,0,0] | strflocaltime(\"%Y\")",
+        "[true,0,1,0,0,0,4,0] | strflocaltime(\"%Y\")",
+        "[1970,0,1,0,0,0,4,0] | strflocaltime(1)",
+        "[1970,0,1] | strflocaltime(1)",
+        "[true,0,1,0,0,0,4,0] | strflocaltime(1)",
+        "0 | strflocaltime(\"\")",
+        "0 | strflocaltime(\"%Y\", 1/0)",
+        "0 | strflocaltime(1/0)",
+        "0 | strflocaltime(1/0, \"%Y\")",
+        "1, (\"x\" | localtime)",
+        "(\"x\" | localtime), 1",
+        "empty | localtime",
     ];
     for program in programs {
         compare_exact(program, &["-n", "-c", "--", program], b"");
@@ -2703,11 +2793,21 @@ fn dates_match_jq() {
         ),
         ("strptime(\"%Y\")", "\"bad\"\n\"1970\"\n"),
         ("now > 0", "1\ntrue\n"),
+        ("localtime", "0\n1\n\"x\"\n"),
+        ("localtime", "0\ntrue\n1\n"),
+        ("strflocaltime(\"%Y\")", "0\n\"x\"\n1\n"),
+        ("strflocaltime(\"%Y\")", "0\ntrue\n"),
     ];
     for (program, input) in streams {
         compare_exact(program, &["-c", "--", program], input.as_bytes());
     }
-    for tz in ["UTC", "GMT", "America/Los_Angeles", "Asia/Kolkata"] {
+    for tz in [
+        "UTC",
+        "GMT",
+        "America/Los_Angeles",
+        "Asia/Kolkata",
+        "Europe/Istanbul",
+    ] {
         compare_tz("epoch zone", "0 | strftime(\"%Z\")", tz);
         compare_tz("summer zone", "1593561600 | strftime(\"%Z\")", tz);
         compare_tz(
@@ -2727,6 +2827,31 @@ fn dates_match_jq() {
             "\"1970-01-01T00:00:00-0700\" | strptime(\"%Y-%m-%dT%H:%M:%S%z\")",
             tz,
         );
+        compare_tz("local epoch", "0 | localtime", tz);
+        compare_tz("local summer", "1593561600 | localtime", tz);
+        compare_tz("local fraction", "1.9 | localtime", tz);
+        compare_tz("local before epoch", "-1.1 | localtime", tz);
+        compare_tz(
+            "local format epoch",
+            "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%S %Z %z %a %j\")",
+            tz,
+        );
+        compare_tz(
+            "local format summer",
+            "1593561600 | strflocaltime(\"%Y-%m-%d %H:%M:%S %Z %z %a %j\")",
+            tz,
+        );
+        compare_tz(
+            "local format letters",
+            "1593561600 | strflocaltime(\"%Y %m %d %H %M %S %Z %z %j %a %b %e %y\")",
+            tz,
+        );
+        compare_tz(
+            "array local zone",
+            "[1970,0,1,0,0,0,4,0] | strflocaltime(\"%Z %z\")",
+            tz,
+        );
+        compare_tz("same instant", "0 | gmtime == localtime", tz);
     }
 }
 
@@ -2783,6 +2908,118 @@ fn strftime_letters_are_limited() {
     assert_eq!(got.stdout, b"\"1970\"\n", "{program}");
     assert_eq!(
         got.stderr, b"jq: error (at <unknown>): strftime does not support %A\n",
+        "{program}"
+    );
+    assert_eq!(got.status.code(), Some(5), "{program}");
+}
+
+/// jq aborts when `strflocaltime` converts a number and the format is not a
+/// string, and when that conversion fails. The message is the one jq prints
+/// for an array, or the converting error. Letters other than the ones these
+/// filters accept are not compared with jq.
+#[test]
+fn strflocaltime_letters_are_limited() {
+    let cases = [
+        (
+            r#"0 | strflocaltime("%A")"#,
+            "strflocaltime does not support %A",
+        ),
+        (
+            r#"0 | strflocaltime("%B")"#,
+            "strflocaltime does not support %B",
+        ),
+        (
+            r#"0 | strflocaltime("%%")"#,
+            "strflocaltime does not support %%",
+        ),
+        (
+            r#"0 | strflocaltime("%")"#,
+            "strflocaltime does not support %",
+        ),
+        (
+            r#"0 | strflocaltime("%Y%")"#,
+            "strflocaltime does not support %",
+        ),
+        (
+            r#"0 | strflocaltime("%n")"#,
+            "strflocaltime does not support %n",
+        ),
+        (
+            r#"0 | strflocaltime("%t")"#,
+            "strflocaltime does not support %t",
+        ),
+        (
+            r#"0 | strflocaltime("%EY")"#,
+            "strflocaltime does not support %E",
+        ),
+        (
+            r#"0 | strflocaltime("%-Y")"#,
+            "strflocaltime does not support %-",
+        ),
+        (
+            r#"0 | strflocaltime("%10Y")"#,
+            "strflocaltime does not support %1",
+        ),
+        (
+            r#"0 | strflocaltime("%Q%Y")"#,
+            "strflocaltime does not support %Q",
+        ),
+        (
+            r#"[1970,0,1,0,0,0,4,0] | strflocaltime("%A")"#,
+            "strflocaltime does not support %A",
+        ),
+        (
+            r#"0 | strflocaltime(1)"#,
+            "strflocaltime/1 requires a string format",
+        ),
+        (
+            r#"0 | strflocaltime(null)"#,
+            "strflocaltime/1 requires a string format",
+        ),
+        (
+            r#"0 | strflocaltime(true)"#,
+            "strflocaltime/1 requires a string format",
+        ),
+        (
+            r#"0 | strflocaltime(["%Y"])"#,
+            "strflocaltime/1 requires a string format",
+        ),
+        (
+            r#"infinite | strflocaltime("%Y")"#,
+            "error converting number of seconds since epoch to datetime",
+        ),
+        (
+            r#"infinite | strflocaltime(1)"#,
+            "error converting number of seconds since epoch to datetime",
+        ),
+        (
+            r#"-infinite | strflocaltime("%Y")"#,
+            "error converting number of seconds since epoch to datetime",
+        ),
+        (
+            r#"-infinite | strflocaltime(1)"#,
+            "error converting number of seconds since epoch to datetime",
+        ),
+    ];
+    for (program, message) in cases {
+        let stderr = format!("jq: error (at <unknown>): {message}\n");
+        assert_rejects(
+            program,
+            &["-n", "-c", "--", program],
+            b"",
+            stderr.as_bytes(),
+            5,
+        );
+    }
+    // The year comes from the array, so the zone does not change it.
+    let program = r#"[1970,0,1,0,0,0,4,0] | strflocaltime("%Y", "%A")"#;
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let args = ["-n", "-c", "--", program];
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let got = run(bin, &owned, b"");
+    assert_eq!(got.stdout, b"\"1970\"\n", "{program}");
+    assert_eq!(
+        got.stderr, b"jq: error (at <unknown>): strflocaltime does not support %A\n",
         "{program}"
     );
     assert_eq!(got.status.code(), Some(5), "{program}");

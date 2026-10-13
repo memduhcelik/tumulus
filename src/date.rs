@@ -1,9 +1,10 @@
-//! `todate`, `fromdate`, `gmtime`, `mktime`, `strftime`, `strptime`, and `now`.
+//! `todate`, `fromdate`, `gmtime`, `localtime`, `mktime`, `strftime`,
+//! `strflocaltime`, `strptime`, and `now`.
 //!
 //! Broken-down times go through the C library, so each platform agrees
 //! with the jq it ships. Apple's jq then replaces the weekday and yearday
-//! `strptime` stored. `strftime` and `strptime` accept `%Y` `%m` `%d`
-//! `%H` `%M` `%S` `%Z` `%j` `%a` `%b` `%e` `%y` and `%z`.
+//! `strptime` stored. `strftime`, `strflocaltime`, and `strptime` accept
+//! `%Y` `%m` `%d` `%H` `%M` `%S` `%Z` `%j` `%a` `%b` `%e` `%y` and `%z`.
 
 use crate::number;
 use crate::value::Value;
@@ -15,9 +16,11 @@ const ISO: &str = "%Y-%m-%dT%H:%M:%SZ";
 #[cfg(target_os = "macos")]
 const BEFORE_MONTH: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
-/// `struct tm` on macOS and glibc, LP64. `gmtime_r` fills `tm_zone`.
-/// jq clears that pointer before `strftime`, so `%Z` is the local zone
-/// while the calendar fields stay UTC.
+/// `struct tm` on macOS and glibc, LP64. `gmtime_r` and `localtime_r`
+/// fill `tm_zone`. jq clears that pointer and the offset before
+/// formatting, so `%Z` is the local standard abbreviation. `%z` is what
+/// the C library prints for a cleared offset. `strftime` keeps the UTC
+/// calendar. `strflocaltime` keeps the local calendar.
 #[repr(C)]
 struct Tm {
     tm_sec: i32,
@@ -62,6 +65,7 @@ const _: () = {
 
 extern "C" {
     fn gmtime_r(clock: *const i64, out: *mut Tm) -> *mut Tm;
+    fn localtime_r(clock: *const i64, out: *mut Tm) -> *mut Tm;
     fn timegm(tm: *mut Tm) -> i64;
     fn strftime(buf: *mut c_char, max: usize, format: *const c_char, tm: *const Tm) -> usize;
     fn strptime(text: *const c_char, format: *const c_char, tm: *mut Tm) -> *mut c_char;
@@ -97,11 +101,19 @@ pub(crate) fn fromdate(input: &Value) -> Result<Value, String> {
 }
 
 pub(crate) fn gmtime(input: &Value) -> Result<Value, String> {
+    clock_array(input, false, "gmtime() requires numeric inputs")
+}
+
+pub(crate) fn localtime(input: &Value) -> Result<Value, String> {
+    clock_array(input, true, "localtime() requires numeric inputs")
+}
+
+fn clock_array(input: &Value, local: bool, bad_type: &str) -> Result<Value, String> {
     let Value::Number(text) = input else {
-        return Err("gmtime() requires numeric inputs".to_string());
+        return Err(bad_type.to_string());
     };
     let ts = as_f64(text);
-    let tm = broken_down(ts)?;
+    let tm = broken_down(ts, local)?;
     let year = tm.tm_year.wrapping_add(1900);
     Ok(Value::Array(vec![
         field(year),
@@ -132,27 +144,43 @@ pub(crate) fn mktime(input: &Value) -> Result<Value, String> {
 }
 
 pub(crate) fn format_time(input: &Value, format: &Value) -> Result<Value, String> {
+    format_clock(input, format, "strftime", false)
+}
+
+pub(crate) fn strflocaltime(input: &Value, format: &Value) -> Result<Value, String> {
+    format_clock(input, format, "strflocaltime", true)
+}
+
+fn format_clock(input: &Value, format: &Value, name: &str, local: bool) -> Result<Value, String> {
     match input {
         Value::Number(text) => {
             // A timestamp that does not convert fails before the format
             // is examined. jq aborts when the format is not a string after
             // a successful conversion. The message is the one jq uses for
             // an array.
-            let mut tm = broken_down(as_f64(text))?;
+            let mut tm = broken_down(as_f64(text), local)?;
+            // The calendar stays as `gmtime_r` or `localtime_r` filled it.
+            // jq clears the zone, so a summer stamp does not keep that
+            // date's daylight-saving abbreviation. `%z` is then whatever
+            // the C library prints for a cleared offset.
             clear_zone(&mut tm);
-            let text = require_format(format)?;
-            render(&tm, text)
+            let text = require_format(format, name)?;
+            render(&tm, text, name)
         }
         Value::Array(items) => {
-            let text = require_format(format)?;
+            let text = require_format(format, name)?;
             let tm = match fields(items) {
                 Some(tm) => tm,
-                None => return Err("strftime/1 requires parsed datetime inputs".to_string()),
+                None => return Err(parsed(name)),
             };
-            render(&tm, text)
+            render(&tm, text, name)
         }
-        _ => Err("strftime/1 requires parsed datetime inputs".to_string()),
+        _ => Err(parsed(name)),
     }
+}
+
+fn parsed(name: &str) -> String {
+    format!("{name}/1 requires parsed datetime inputs")
 }
 
 pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, String> {
@@ -198,10 +226,10 @@ pub(crate) fn now() -> Value {
     computed(clock_now())
 }
 
-fn require_format(format: &Value) -> Result<&str, String> {
+fn require_format<'a>(format: &'a Value, name: &str) -> Result<&'a str, String> {
     match format {
         Value::String(text) => Ok(text),
-        _ => Err("strftime/1 requires a string format".to_string()),
+        _ => Err(format!("{name}/1 requires a string format")),
     }
 }
 
@@ -232,10 +260,16 @@ fn fields(items: &[Value]) -> Option<Tm> {
     Some(tm)
 }
 
-fn broken_down(ts: f64) -> Result<Tm, String> {
+fn broken_down(ts: f64, local: bool) -> Result<Tm, String> {
     let clock = c_cast_i64(ts);
     let mut tm = blank();
-    let ptr = unsafe { gmtime_r(&clock, &mut tm) };
+    let ptr = unsafe {
+        if local {
+            localtime_r(&clock, &mut tm)
+        } else {
+            gmtime_r(&clock, &mut tm)
+        }
+    };
     if ptr.is_null() {
         Err("error converting number of seconds since epoch to datetime".to_string())
     } else {
@@ -256,9 +290,9 @@ fn stamp(tm: &mut Tm) -> Result<Value, String> {
     }
 }
 
-fn render(tm: &Tm, format: &str) -> Result<Value, String> {
+fn render(tm: &Tm, format: &str, name: &str) -> Result<Value, String> {
     let visible = format.split('\0').next().unwrap_or("");
-    check_letters(visible, "strftime")?;
+    check_letters(visible, name)?;
     let mut spec = Vec::with_capacity(visible.len() + 1);
     spec.extend_from_slice(visible.as_bytes());
     spec.push(0);
@@ -275,7 +309,7 @@ fn render(tm: &Tm, format: &str) -> Result<Value, String> {
         )
     };
     if wrote == 0 || wrote >= cap {
-        return Err("strftime/1: unknown system failure".to_string());
+        return Err(format!("{name}/1: unknown system failure"));
     }
     let text = String::from_utf8_lossy(&buf[..wrote]).into_owned();
     Ok(Value::String(text))
@@ -430,7 +464,7 @@ fn blank() -> Tm {
     }
 }
 
-/// The seconds field keeps the fraction `gmtime_r` dropped. The fraction
+/// The seconds field keeps the fraction the C library dropped. The fraction
 /// is `ts - floor(ts)`, so it stays in `[0, 1)` for a finite timestamp.
 /// NaN stays NaN, and the calendar fields are the epoch.
 fn seconds(tm_sec: i32, ts: f64) -> Value {
