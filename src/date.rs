@@ -1,7 +1,8 @@
 //! `todate`, `fromdate`, `gmtime`, `mktime`, `strftime`, `strptime`, and `now`.
 //!
 //! Broken-down times go through the C library, so each platform agrees
-//! with the jq it ships. `strftime` and `strptime` accept `%Y` `%m` `%d`
+//! with the jq it ships. Apple's jq then replaces the weekday and yearday
+//! `strptime` stored. `strftime` and `strptime` accept `%Y` `%m` `%d`
 //! `%H` `%M` `%S` `%Z` `%j` `%a` `%b` `%e` `%y` and `%z`.
 
 use crate::number;
@@ -11,6 +12,7 @@ use std::ffi::{c_char, c_void};
 const ISO: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 /// Days before each month, not counting a leap day.
+#[cfg(target_os = "macos")]
 const BEFORE_MONTH: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
 /// `struct tm` on macOS and glibc, LP64. `gmtime_r` fills `tm_zone`.
@@ -180,9 +182,10 @@ pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, Strin
     if end.is_null() || !trailing_space(end) {
         return Err(mismatch(text, visible));
     }
-    // jq always stores the weekday and yearday it computes. It aborts when
-    // `strptime` had stored some other yearday. The array carries the
-    // computed value either way.
+    // Apple's jq replaces the weekday and yearday with its own calculation.
+    // Other builds keep the fields `strptime` stored, including the 8 and
+    // 367 sentinels when the format wrote neither.
+    #[cfg(target_os = "macos")]
     set_calendar(&mut tm);
     let mut items = civil_fields(&tm);
     if unsafe { *end } != 0 {
@@ -300,6 +303,7 @@ fn mismatch(text: &str, format: &str) -> String {
     format!("date \"{shown}\" does not match format \"{spec}\"")
 }
 
+#[cfg(target_os = "macos")]
 fn set_calendar(tm: &mut Tm) {
     let year = tm.tm_year.wrapping_add(1900);
     tm.tm_wday = weekday(year, tm.tm_mon, tm.tm_mday);
@@ -309,6 +313,7 @@ fn set_calendar(tm: &mut Tm) {
 /// Sunday is 0. March is month 1 in the month term, and January and
 /// February belong to the previous year. The month term is
 /// `floor(2.6 * m - 0.2)`.
+#[cfg(target_os = "macos")]
 fn weekday(year: i32, mon: i32, mday: i32) -> i32 {
     let century = year / 100;
     let yy = year % 100;
@@ -333,12 +338,14 @@ fn weekday(year: i32, mon: i32, mday: i32) -> i32 {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn month_term(month_index: i32) -> i32 {
     (f64::from(month_index) * 2.6 - 0.2).floor() as i32
 }
 
 /// Days since January 1. A day of 0 is one less than the first of the
 /// month. Months before March do not add the leap day.
+#[cfg(target_os = "macos")]
 fn yearday(tm_year: i32, mon: i32, mday: i32) -> i32 {
     let adjust: i32 = if mon < 2 || !leap(tm_year.wrapping_add(1900)) {
         -1
@@ -354,6 +361,7 @@ fn yearday(tm_year: i32, mon: i32, mday: i32) -> i32 {
     adjust.wrapping_add(mday).wrapping_add(BEFORE_MONTH[index])
 }
 
+#[cfg(target_os = "macos")]
 fn leap(year: i32) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
