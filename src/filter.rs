@@ -124,6 +124,15 @@ pub enum Filter {
     StrpTime(Box<Filter>),
     /// `now`
     Now,
+    /// `error` with no argument. Raises the current input.
+    Error,
+    /// `error(expr)`. A call written after it is a syntax error.
+    Raise(Box<Filter>),
+    /// `try body` or `try body catch handler`. No handler means `catch empty`.
+    Try {
+        body: Box<Filter>,
+        handler: Option<Box<Filter>>,
+    },
     /// `=`, `|=`, or one of `+=` `-=` `*=` `/=` `%=` `//=`.
     Update {
         op: UpdateOp,
@@ -197,9 +206,13 @@ pub enum ArrayIndex {
     OutOfRange,
 }
 
+#[derive(Clone)]
 pub struct Failure {
     pub partial: Vec<Value>,
     pub message: String,
+    /// Set when `error` raised this value. Builtin failures leave it empty,
+    /// and `catch` receives the message text.
+    pub caught: Option<Value>,
 }
 
 pub fn compile(source: &str) -> Result<Filter, ProgramError> {
@@ -212,6 +225,8 @@ pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramErr
         src: source,
         index: 0,
         reject_block: false,
+        reject_try: false,
+        suffix_question: false,
     };
     parser.skip_ws();
     let filter = parser.parse_pipe()?;
@@ -256,13 +271,7 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
             for value in inputs {
                 match eval_in(right, &value, env) {
                     Ok(more) => out.extend(more),
-                    Err(failure) => {
-                        out.extend(failure.partial);
-                        return Err(Failure {
-                            partial: out,
-                            message: failure.message,
-                        });
-                    }
+                    Err(failure) => return Err(extend_err(out, failure)),
                 }
             }
             finish(out, left_err)
@@ -271,13 +280,7 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
             let mut out = eval_in(left, input, env)?;
             match eval_in(right, input, env) {
                 Ok(more) => out.extend(more),
-                Err(failure) => {
-                    out.extend(failure.partial);
-                    return Err(Failure {
-                        partial: out,
-                        message: failure.message,
-                    });
-                }
+                Err(failure) => return Err(extend_err(out, failure)),
             }
             Ok(out)
         }
@@ -285,10 +288,7 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::Interpolate(pieces) => eval_interpolate(pieces, input, env),
         Filter::Collect(inner) => match eval_in(inner, input, env) {
             Ok(items) => Ok(vec![Value::Array(items)]),
-            Err(failure) => Err(Failure {
-                partial: Vec::new(),
-                message: failure.message,
-            }),
+            Err(failure) => Err(bare_fail(failure)),
         },
         Filter::Object(fields) => eval_object(fields, input, env),
         Filter::At {
@@ -349,6 +349,9 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::StrfLocalTime(arg) => eval_strflocaltime(arg, input, env),
         Filter::StrpTime(arg) => eval_strptime(arg, input, env),
         Filter::Now => Ok(vec![date::now()]),
+        Filter::Error => Err(raise(input.clone())),
+        Filter::Raise(arg) => eval_raise(arg, input, env),
+        Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
         Filter::Update { op, path, expr } => update::eval_update(*op, path, expr, input, env),
     }
 }
@@ -527,13 +530,41 @@ fn fail(message: String) -> Failure {
     Failure {
         partial: Vec::new(),
         message,
+        caught: None,
     }
 }
 
-fn parts(result: Result<Vec<Value>, Failure>) -> (Vec<Value>, Option<String>) {
+fn fresh(partial: Vec<Value>, message: String) -> Failure {
+    Failure {
+        partial,
+        message,
+        caught: None,
+    }
+}
+
+/// `out` was produced before `failure`. The failure's own partial comes after it.
+fn extend_err(mut out: Vec<Value>, mut failure: Failure) -> Failure {
+    out.extend(std::mem::take(&mut failure.partial));
+    with_partial(out, failure)
+}
+
+fn with_partial(partial: Vec<Value>, mut failure: Failure) -> Failure {
+    failure.partial = partial;
+    failure
+}
+
+fn bare_fail(mut failure: Failure) -> Failure {
+    failure.partial.clear();
+    failure
+}
+
+fn parts(result: Result<Vec<Value>, Failure>) -> (Vec<Value>, Option<Failure>) {
     match result {
         Ok(values) => (values, None),
-        Err(failure) => (failure.partial, Some(failure.message)),
+        Err(mut failure) => {
+            let partial = std::mem::take(&mut failure.partial);
+            (partial, Some(failure))
+        }
     }
 }
 
@@ -541,13 +572,64 @@ fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Null | Value::Bool(false))
 }
 
-fn finish(out: Vec<Value>, err: Option<String>) -> Result<Vec<Value>, Failure> {
+fn finish(out: Vec<Value>, err: Option<Failure>) -> Result<Vec<Value>, Failure> {
     match err {
-        Some(message) => Err(Failure {
-            partial: out,
-            message,
-        }),
+        Some(failure) => Err(with_partial(out, failure)),
         None => Ok(out),
+    }
+}
+
+/// `error` and `error(expr)` record the value. The message is what an uncaught
+/// string prints, and what `catch` receives when no value was recorded.
+fn raise(value: Value) -> Failure {
+    let message = match &value {
+        Value::String(text) => text.clone(),
+        other => jq_text(other),
+    };
+    Failure {
+        partial: Vec::new(),
+        message,
+        caught: Some(value),
+    }
+}
+
+fn eval_raise(arg: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Value>, Failure> {
+    // The first value is raised. Later values are not. An argument that
+    // produces nothing and then fails propagates that failure.
+    let (values, err) = parts(eval_in(arg, input, env));
+    if let Some(value) = values.into_iter().next() {
+        return Err(raise(value));
+    }
+    match err {
+        Some(failure) => Err(failure),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn eval_try(
+    body: &Filter,
+    handler: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let failure = match eval_in(body, input, env) {
+        Ok(values) => return Ok(values),
+        Err(failure) => failure,
+    };
+    let Some(handler) = handler else {
+        return Ok(failure.partial);
+    };
+    let caught = match failure.caught {
+        Some(value) => value,
+        None => Value::String(failure.message),
+    };
+    match eval_in(handler, &caught, env) {
+        Ok(more) => {
+            let mut out = failure.partial;
+            out.extend(more);
+            Ok(out)
+        }
+        Err(handler_err) => Err(extend_err(failure.partial, handler_err)),
     }
 }
 
@@ -582,18 +664,14 @@ fn eval_bind(
                     out.extend(more);
                     Ok(())
                 }
-                Err(failure) => {
-                    let message = failure.message;
-                    out.extend(failure.partial);
-                    Err(fail(message))
+                Err(mut failure) => {
+                    out.extend(std::mem::take(&mut failure.partial));
+                    Err(failure)
                 }
             }
         });
         if let Err(failure) = matched {
-            return Err(Failure {
-                partial: out,
-                message: failure.message,
-            });
+            return Err(with_partial(out, failure));
         }
     }
     finish(out, err)
@@ -630,12 +708,9 @@ fn eval_fold(
                         for value in &updates {
                             match eval_in(extract, value, &child) {
                                 Ok(more) => out.extend(more),
-                                Err(failure) => {
-                                    out.extend(failure.partial);
-                                    return Err(Failure {
-                                        partial: Vec::new(),
-                                        message: failure.message,
-                                    });
+                                Err(mut failure) => {
+                                    out.extend(std::mem::take(&mut failure.partial));
+                                    return Err(failure);
                                 }
                             }
                         }
@@ -643,11 +718,8 @@ fn eval_fold(
                         out.extend(updates.iter().cloned());
                     }
                 }
-                if let Some(message) = update_err {
-                    return Err(Failure {
-                        partial: Vec::new(),
-                        message,
-                    });
+                if let Some(failure) = update_err {
+                    return Err(failure);
                 }
                 acc = match updates.last() {
                     Some(value) => value.clone(),
@@ -656,17 +728,11 @@ fn eval_fold(
                 Ok(())
             });
             if let Err(failure) = stepped {
-                return Err(Failure {
-                    partial: out,
-                    message: failure.message,
-                });
+                return Err(with_partial(out, failure));
             }
         }
-        if let Some(message) = stream_err {
-            return Err(Failure {
-                partial: out,
-                message,
-            });
+        if let Some(failure) = stream_err {
+            return Err(with_partial(out, failure));
         }
         if !emit {
             out.push(acc);
@@ -747,8 +813,8 @@ fn match_object(
             })?;
         }
     }
-    if let Some(message) = key_err {
-        return Err(fail(message));
+    if let Some(failure) = key_err {
+        return Err(failure);
     }
     Ok(())
 }
@@ -759,12 +825,7 @@ fn eval_neg(inner: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
     for value in values {
         match negate_value(&value) {
             Ok(next) => out.push(next),
-            Err(message) => {
-                return Err(Failure {
-                    partial: out,
-                    message,
-                })
-            }
+            Err(message) => return Err(fresh(out, message)),
         }
     }
     finish(out, err)
@@ -786,19 +847,11 @@ fn eval_bin(
         for left_value in lefts {
             match apply_op(op, &left_value, &right_value) {
                 Ok(value) => out.push(value),
-                Err(message) => {
-                    return Err(Failure {
-                        partial: out,
-                        message,
-                    })
-                }
+                Err(message) => return Err(fresh(out, message)),
             }
         }
-        if let Some(message) = left_err {
-            return Err(Failure {
-                partial: out,
-                message,
-            });
+        if let Some(failure) = left_err {
+            return Err(with_partial(out, failure));
         }
     }
     finish(out, right_err)
@@ -821,11 +874,8 @@ fn eval_and(
         for right_value in rights {
             out.push(Value::Bool(truthy(&right_value)));
         }
-        if let Some(message) = right_err {
-            return Err(Failure {
-                partial: out,
-                message,
-            });
+        if let Some(failure) = right_err {
+            return Err(with_partial(out, failure));
         }
     }
     finish(out, left_err)
@@ -848,11 +898,8 @@ fn eval_or(
         for right_value in rights {
             out.push(Value::Bool(truthy(&right_value)));
         }
-        if let Some(message) = right_err {
-            return Err(Failure {
-                partial: out,
-                message,
-            });
+        if let Some(failure) = right_err {
+            return Err(with_partial(out, failure));
         }
     }
     finish(out, left_err)
@@ -865,10 +912,13 @@ fn eval_alt(
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
     match eval_in(left, input, env) {
-        Err(failure) => Err(Failure {
-            partial: failure.partial.into_iter().filter(truthy).collect(),
-            message: failure.message,
-        }),
+        Err(mut failure) => {
+            let kept = std::mem::take(&mut failure.partial)
+                .into_iter()
+                .filter(truthy)
+                .collect();
+            Err(with_partial(kept, failure))
+        }
         Ok(values) => {
             let defined: Vec<Value> = values.into_iter().filter(truthy).collect();
             if defined.is_empty() {
@@ -893,13 +943,7 @@ fn eval_if(
         let branch = if truthy(&cond_value) { yes } else { no };
         match eval_in(branch, input, env) {
             Ok(values) => out.extend(values),
-            Err(failure) => {
-                out.extend(failure.partial);
-                return Err(Failure {
-                    partial: out,
-                    message: failure.message,
-                });
-            }
+            Err(failure) => return Err(extend_err(out, failure)),
         }
     }
     finish(out, err)
@@ -936,12 +980,7 @@ fn eval_format(
     for spec in formats {
         match format(input, &spec) {
             Ok(value) => out.push(value),
-            Err(message) => {
-                return Err(Failure {
-                    partial: out,
-                    message,
-                })
-            }
+            Err(message) => return Err(fresh(out, message)),
         }
     }
     finish(out, err)
@@ -957,12 +996,7 @@ fn eval_strptime(
     for format in formats {
         match date::strptime_fmt(input, &format) {
             Ok(value) => out.push(value),
-            Err(message) => {
-                return Err(Failure {
-                    partial: out,
-                    message,
-                })
-            }
+            Err(message) => return Err(fresh(out, message)),
         }
     }
     finish(out, err)
@@ -1025,12 +1059,7 @@ fn eval_has(arg: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<
     for key in keys {
         match has_key(input, &key) {
             Ok(value) => out.push(value),
-            Err(message) => {
-                return Err(Failure {
-                    partial: out,
-                    message,
-                })
-            }
+            Err(message) => return Err(fresh(out, message)),
         }
     }
     finish(out, err)
@@ -1092,7 +1121,7 @@ fn eval_map(inner: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
     for item in items {
         match eval_in(inner, &item, env) {
             Ok(more) => collected.extend(more),
-            Err(failure) => return Err(fail(failure.message)),
+            Err(failure) => return Err(bare_fail(failure)),
         }
     }
     Ok(vec![Value::Array(collected)])
@@ -1459,7 +1488,8 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::GmTime
         | Filter::LocalTime
         | Filter::MkTime
-        | Filter::Now => Ok(()),
+        | Filter::Now
+        | Filter::Error => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -1487,7 +1517,15 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Map(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
-        | Filter::StrpTime(inner) => check_vars(inner, scope),
+        | Filter::StrpTime(inner)
+        | Filter::Raise(inner) => check_vars(inner, scope),
+        Filter::Try { body, handler } => {
+            check_vars(body, scope)?;
+            if let Some(handler) = handler {
+                check_vars(handler, scope)?;
+            }
+            Ok(())
+        }
         Filter::Update { path, expr, .. } => {
             check_vars(path, scope)?;
             check_vars(expr, scope)
@@ -1611,6 +1649,10 @@ struct Parser<'a> {
     /// `if`, `reduce`, and `foreach` are not terms. A fold stream uses this
     /// so `reduce if` stays a syntax error while `(if ...)` is still a term.
     reject_block: bool,
+    /// Object values reject `try`. Parentheses and arguments clear it.
+    reject_try: bool,
+    /// The leading minus of a `try` operand. `?` there marks only the last suffix.
+    suffix_question: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -1790,7 +1832,11 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             if self.eat('?') {
-                filter = Filter::Optional(Box::new(filter));
+                filter = if self.suffix_question {
+                    optional_last(filter)
+                } else {
+                    Filter::Optional(Box::new(filter))
+                };
                 continue;
             }
             if self.peek() == Some('[') {
@@ -1828,10 +1874,13 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Filter, ProgramError> {
         self.skip_ws();
         if self.eat('(') {
-            let saved = self.reject_block;
+            let saved_block = self.reject_block;
+            let saved_try = self.reject_try;
             self.reject_block = false;
+            self.reject_try = false;
             let inner = self.parse_pipe();
-            self.reject_block = saved;
+            self.reject_block = saved_block;
+            self.reject_try = saved_try;
             let inner = inner?;
             self.skip_ws();
             if !self.eat(')') {
@@ -1889,6 +1938,8 @@ impl<'a> Parser<'a> {
                 "strflocaltime" => Ok(Filter::StrfLocalTime(self.parse_one_arg()?)),
                 "strptime" => Ok(Filter::StrpTime(self.parse_one_arg()?)),
                 "now" => Ok(Filter::Now),
+                "error" => self.parse_error(),
+                "try" if !self.reject_block && !self.reject_try => self.parse_try(),
                 "del" => Ok(Filter::Update {
                     op: UpdateOp::Modify,
                     path: self.parse_one_arg()?,
@@ -1910,10 +1961,13 @@ impl<'a> Parser<'a> {
         if !self.eat('(') {
             return Err(ProgramError::Syntax);
         }
-        let saved = self.reject_block;
+        let saved_block = self.reject_block;
+        let saved_try = self.reject_try;
         self.reject_block = false;
+        self.reject_try = false;
         let arg = self.parse_pipe();
-        self.reject_block = saved;
+        self.reject_block = saved_block;
+        self.reject_try = saved_try;
         let arg = arg?;
         self.skip_ws();
         if self.peek() == Some(';') {
@@ -2102,11 +2156,115 @@ impl<'a> Parser<'a> {
 
     /// Pipe and unary minus, without comma or the arithmetic operators.
     /// Object values use this, so `{a:1+2}` stays a syntax error.
+    /// `try` is rejected here. `(try ...)` and a call argument still accept it.
     fn parse_expd(&mut self) -> Result<Filter, ProgramError> {
+        let saved = self.reject_try;
+        self.reject_try = true;
+        let parsed = self.parse_expd_pipe();
+        self.reject_try = saved;
+        parsed
+    }
+
+    fn parse_expd_pipe(&mut self) -> Result<Filter, ProgramError> {
         let mut filter = self.parse_expd_unary()?;
         while self.eat('|') {
             let right = self.parse_expd_unary()?;
             filter = Filter::Pipe(Box::new(filter), Box::new(right));
+        }
+        Ok(filter)
+    }
+
+    fn parse_error(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            Ok(Filter::Raise(self.parse_one_arg()?))
+        } else {
+            Ok(Filter::Error)
+        }
+    }
+
+    /// `try` and `catch` stop before `+`, `*`, `|`, and `,`.
+    /// A leading `-` still takes the product that follows it.
+    fn parse_try(&mut self) -> Result<Filter, ProgramError> {
+        let body = self.parse_try_operand()?;
+        let handler = if self.eat_keyword("catch") {
+            Some(Box::new(self.parse_try_operand()?))
+        } else {
+            None
+        };
+        Ok(Filter::Try {
+            body: Box::new(body),
+            handler,
+        })
+    }
+
+    fn parse_try_operand(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() == Some('-') && self.peek_at(1) != Some('=') {
+            let saved = self.suffix_question;
+            self.suffix_question = true;
+            let operand = self.parse_signed();
+            self.suffix_question = saved;
+            return operand;
+        }
+        let primary = self.parse_primary()?;
+        let filter = self.parse_try_tail(primary)?;
+        if !self.eat_keyword("as") {
+            return Ok(filter);
+        }
+        let pattern = self.parse_pattern()?;
+        if !self.eat('|') {
+            return Err(ProgramError::Syntax);
+        }
+        let body = self.parse_pipe()?;
+        Ok(Filter::Bind {
+            expr: Box::new(filter),
+            pattern,
+            body: Box::new(body),
+        })
+    }
+
+    /// Indexing and fields after the primary. `?` applies only once a suffix
+    /// has been written, and only to that last suffix.
+    fn parse_try_tail(&mut self, mut filter: Filter) -> Result<Filter, ProgramError> {
+        let mut extended = false;
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('[') {
+                filter = self.parse_index(Some(filter))?;
+                extended = true;
+                continue;
+            }
+            if self.peek() == Some('.') {
+                let bytes = self.src.as_bytes();
+                if bytes.get(self.index + 1) == Some(&b'.') {
+                    break;
+                }
+                self.bump();
+                if self.peek() == Some('"') || self.spaced_quote() {
+                    let key = self.parse_quoted_key()?;
+                    filter = at_key(Some(filter), key);
+                    extended = true;
+                    continue;
+                }
+                if self.starts_ident() {
+                    let name = self.ident()?;
+                    filter = chain(Some(filter), Filter::Field(name));
+                    extended = true;
+                    continue;
+                }
+                if self.peek() == Some('[') {
+                    filter = self.parse_index(Some(filter))?;
+                    extended = true;
+                    continue;
+                }
+                return Err(ProgramError::Syntax);
+            }
+            if extended && self.eat('?') {
+                filter = optional_last(filter);
+                continue;
+            }
+            break;
         }
         Ok(filter)
     }
@@ -2705,7 +2863,11 @@ impl<'a> Parser<'a> {
                     }
                     self.bump();
                     self.bump();
-                    let inner = self.parse_pipe()?;
+                    let saved_try = self.reject_try;
+                    self.reject_try = false;
+                    let inner = self.parse_pipe();
+                    self.reject_try = saved_try;
+                    let inner = inner?;
                     if !self.eat(')') {
                         return Err(ProgramError::Syntax);
                     }
@@ -3047,8 +3209,22 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::StrfTime(_)
         | Filter::StrfLocalTime(_)
         | Filter::StrpTime(_)
-        | Filter::Now => true,
+        | Filter::Now
+        | Filter::Error
+        | Filter::Raise(_)
+        | Filter::Try { .. } => true,
         Filter::Optional(inner) => forbids_call(inner),
+        Filter::Pipe(_, right) => call_blocked(right),
+        _ => false,
+    }
+}
+
+/// A pipe forbids a following call only when its rightmost filter is
+/// `error`, `error(expr)`, or `try`. Other pipes stay as they are.
+fn call_blocked(filter: &Filter) -> bool {
+    match filter {
+        Filter::Error | Filter::Raise(_) | Filter::Try { .. } => true,
+        Filter::Optional(inner) | Filter::Pipe(_, inner) => call_blocked(inner),
         _ => false,
     }
 }
@@ -3112,6 +3288,8 @@ fn expand_pieces(
                 Ok(out)
             }
             Err(failure) => {
+                let caught = failure.caught.clone();
+                let message = failure.message.clone();
                 let mut partial = Vec::new();
                 for value in failure.partial {
                     let mut next = prefix.clone();
@@ -3124,16 +3302,19 @@ fn expand_pieces(
                                     partial.push(text);
                                 }
                             }
+                            // An inner piece that fails reuses this piece's error.
                             return Err(Failure {
                                 partial: partial.into_iter().map(Value::String).collect(),
-                                message: failure.message,
+                                message,
+                                caught,
                             });
                         }
                     }
                 }
                 Err(Failure {
                     partial: partial.into_iter().map(Value::String).collect(),
-                    message: failure.message,
+                    message,
+                    caught,
                 })
             }
         },
@@ -3167,7 +3348,7 @@ fn eval_object(
 
 struct Alts {
     pairs: Vec<(String, Value)>,
-    error: Option<String>,
+    error: Option<Failure>,
 }
 
 fn field_alts(field: &ObjField, input: &Value, env: &[(String, Value)]) -> Alts {
@@ -3178,16 +3359,13 @@ fn field_alts(field: &ObjField, input: &Value, env: &[(String, Value)]) -> Alts 
 }
 
 fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) -> Alts {
-    let found = match eval_in(key, input, env) {
-        Ok(values) => (values, None),
-        Err(failure) => (failure.partial, Some(failure.message)),
-    };
+    let (keys, key_err) = parts(eval_in(key, input, env));
     let mut pairs = Vec::new();
-    for value in found.0 {
+    for value in keys {
         let Value::String(name) = value else {
             return Alts {
                 pairs,
-                error: Some(key_message(&value)),
+                error: Some(fail(key_message(&value))),
             };
         };
         match index_by(input, &Value::String(name.clone())) {
@@ -3198,47 +3376,41 @@ fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) -> Alts {
             Err(failure) => {
                 return Alts {
                     pairs,
-                    error: Some(failure.message),
+                    error: Some(bare_fail(failure)),
                 };
             }
         }
     }
     Alts {
         pairs,
-        error: found.1,
+        error: key_err,
     }
 }
 
 fn pair_alts(key: &Filter, value: &Filter, input: &Value, env: &[(String, Value)]) -> Alts {
-    let keys = match eval_in(key, input, env) {
-        Ok(values) => (values, None),
-        Err(failure) => (failure.partial, Some(failure.message)),
-    };
-    let values = match eval_in(value, input, env) {
-        Ok(values) => (values, None),
-        Err(failure) => (failure.partial, Some(failure.message)),
-    };
+    let (keys, key_err) = parts(eval_in(key, input, env));
+    let (values, value_err) = parts(eval_in(value, input, env));
     let mut pairs = Vec::new();
-    for key_value in &keys.0 {
+    for key_value in &keys {
         let Value::String(name) = key_value else {
             return Alts {
                 pairs,
-                error: Some(key_message(key_value)),
+                error: Some(fail(key_message(key_value))),
             };
         };
-        for item in &values.0 {
+        for item in &values {
             pairs.push((name.clone(), item.clone()));
         }
-        if let Some(message) = &values.1 {
+        if let Some(failure) = &value_err {
             return Alts {
                 pairs,
-                error: Some(message.clone()),
+                error: Some(failure.clone()),
             };
         }
     }
     Alts {
         pairs,
-        error: keys.1.or(values.1),
+        error: key_err.or(value_err),
     }
 }
 
@@ -3256,20 +3428,11 @@ fn combine_fields(
         put(&mut next, key.clone(), value.clone());
         match combine_fields(streams, index + 1, next) {
             Ok(more) => out.extend(more),
-            Err(failure) => {
-                out.extend(failure.partial);
-                return Err(Failure {
-                    partial: out,
-                    message: failure.message,
-                });
-            }
+            Err(failure) => return Err(extend_err(out, failure)),
         }
     }
-    if let Some(message) = &stream.error {
-        return Err(Failure {
-            partial: out,
-            message: message.clone(),
-        });
+    if let Some(failure) = &stream.error {
+        return Err(with_partial(out, failure.clone()));
     }
     Ok(out)
 }
@@ -3285,6 +3448,8 @@ fn eval_at(
     let keys = match eval_in(key, input, env) {
         Ok(keys) => keys,
         Err(failure) => {
+            let caught = failure.caught.clone();
+            let message = failure.message;
             let mut partial = Vec::new();
             for key in &failure.partial {
                 for value in &values {
@@ -3292,9 +3457,11 @@ fn eval_at(
                         Ok(got) => partial.extend(got),
                         Err(inner) => {
                             partial.extend(inner.partial);
+                            // The key's error wins over an index error on a partial key.
                             return Err(Failure {
                                 partial,
-                                message: failure.message,
+                                message,
+                                caught,
                             });
                         }
                     }
@@ -3302,7 +3469,8 @@ fn eval_at(
             }
             return Err(Failure {
                 partial,
-                message: failure.message,
+                message,
+                caught,
             });
         }
     };
@@ -3311,13 +3479,10 @@ fn eval_at(
         for value in &values {
             match index_by(value, key) {
                 Ok(got) => out.extend(got),
-                Err(failure) => {
-                    out.extend(failure.partial);
+                Err(mut failure) => {
+                    out.extend(std::mem::take(&mut failure.partial));
                     if !optional {
-                        return Err(Failure {
-                            partial: out,
-                            message: failure.message,
-                        });
+                        return Err(with_partial(out, failure));
                     }
                 }
             }

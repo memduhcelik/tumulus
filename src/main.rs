@@ -4,8 +4,8 @@ use std::io::{self, Read, Write};
 use std::process;
 
 use tumulus::{
-    compile_with, eval_with, parse_stream, render, Error, Filter, Indent, Layout, ProgramError,
-    Style, Value,
+    compile_with, eval_with, parse_stream, render, Error, Failure, Filter, Indent, Layout,
+    ProgramError, Style, Value,
 };
 
 fn main() {
@@ -187,7 +187,7 @@ fn apply(
             }
             Err(failure) => {
                 write_values(&failure.partial, style, run, out)?;
-                eprintln!("jq: error (at {source}:{}): {}", item.line, failure.message);
+                report_error(&format!("{source}:{}", item.line), &failure);
                 failed = true;
             }
         }
@@ -221,7 +221,7 @@ fn apply_null(
         }
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
-            eprintln!("jq: error (at <unknown>): {}", failure.message);
+            report_error("<unknown>", &failure);
             run.status = 5;
         }
     }
@@ -465,9 +465,32 @@ fn emit(
         }
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
-            eprintln!("jq: error (at {source}:{line}): {}", failure.message);
+            report_error(&format!("{source}:{line}"), &failure);
             Ok(true)
         }
+    }
+}
+
+fn report_error(at: &str, failure: &Failure) {
+    match &failure.caught {
+        Some(Value::String(text)) => {
+            let shown = text.split('\0').next().unwrap_or("");
+            eprintln!("jq: error (at {at}): {shown}");
+        }
+        Some(value) => {
+            let style = Style {
+                layout: Layout::Compact,
+                raw: false,
+                join: false,
+                ascii: false,
+                sort_keys: false,
+            };
+            eprintln!(
+                "jq: error (at {at}) (not a string): {}",
+                render(value, style)
+            );
+        }
+        None => eprintln!("jq: error (at {at}): {}", failure.message),
     }
 }
 

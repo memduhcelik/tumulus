@@ -5,13 +5,12 @@
 use std::cell::Cell;
 
 use crate::number::array_index;
-use crate::print::{self, Layout, Style};
 use crate::value::Value;
 
 use super::{
-    add_values, child_scope, clipped, div_values, eval_in, fail, mul_values, parts, rem_values,
-    shown, slice_range, sub_values, truthy, ArrayIndex, Failure, Filter, PatField, Pattern,
-    UpdateOp,
+    add_values, bare_fail, child_scope, clipped, div_values, eval_in, fail, finish, fresh,
+    mul_values, parts, rem_values, shown, slice_range, sub_values, truthy, ArrayIndex, Failure,
+    Filter, PatField, Pattern, UpdateOp,
 };
 
 enum Found {
@@ -77,26 +76,14 @@ pub fn eval_update(
     // `=` and the arithmetic updates run the right-hand side first. An empty
     // stream yields nothing and does not look at the path. A failure while
     // producing a value is reported before a bad path is.
-    let (rhs, rhs_err) = match eval_in(expr, input, env) {
-        Ok(values) => (values, None),
-        Err(failure) => (failure.partial, Some(failure.message)),
-    };
+    let (rhs, rhs_err) = parts(eval_in(expr, input, env));
     if rhs.is_empty() {
-        return match rhs_err {
-            Some(message) => Err(fail(message)),
-            None => Ok(Vec::new()),
-        };
+        return finish(Vec::new(), rhs_err);
     }
     let paths = collect(path, input, env)?;
     if paths.is_empty() {
         let outs = vec![input.clone(); rhs.len()];
-        return match rhs_err {
-            Some(message) => Err(Failure {
-                partial: outs,
-                message,
-            }),
-            None => Ok(outs),
-        };
+        return finish(outs, rhs_err);
     }
     let mut outs = Vec::new();
     for value in rhs {
@@ -106,21 +93,10 @@ pub fn eval_update(
         };
         match produced {
             Ok(value) => outs.push(value),
-            Err(message) => {
-                return Err(Failure {
-                    partial: outs,
-                    message,
-                })
-            }
+            Err(message) => return Err(fresh(outs, message)),
         }
     }
-    match rhs_err {
-        Some(message) => Err(Failure {
-            partial: outs,
-            message,
-        }),
-        None => Ok(outs),
-    }
+    finish(outs, rhs_err)
 }
 
 fn collect(
@@ -134,7 +110,7 @@ fn collect(
             Found::Broken(value) => {
                 return Err(fail(format!(
                     "Invalid path expression with result {}",
-                    compact(&value)
+                    clipped(&value, 29)
                 )));
             }
             Found::Path(steps) => paths.push(steps),
@@ -228,10 +204,7 @@ fn eval_first(
                             return Ok(Some(hit));
                         }
                     }
-                    return Err(Failure {
-                        partial: Vec::new(),
-                        message: failure.message,
-                    });
+                    return Err(bare_fail(failure));
                 }
             };
             for value in &produced {
@@ -243,10 +216,7 @@ fn eval_first(
         }
         _ => match eval_in(filter, input, env) {
             Ok(values) => Ok(values.into_iter().next()),
-            Err(failure) => Err(Failure {
-                partial: Vec::new(),
-                message: failure.message,
-            }),
+            Err(failure) => Err(bare_fail(failure)),
         },
     }
 }
@@ -271,6 +241,7 @@ struct POut {
 struct PathErr {
     partial: Vec<POut>,
     message: String,
+    caught: Option<Value>,
 }
 
 /// A name bound while walking a path. The body loads it as that path.
@@ -346,11 +317,15 @@ fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec
                 if let Found::Broken(value) = classify_one(input, out) {
                     return Err(fail(format!(
                         "Invalid path expression with result {}",
-                        compact(&value)
+                        clipped(&value, 29)
                     )));
                 }
             }
-            Err(fail(err.message))
+            Err(Failure {
+                partial: Vec::new(),
+                message: err.message,
+                caught: err.caught,
+            })
         }
     }
 }
@@ -417,6 +392,9 @@ fn run(
             Some(bind) => Ok(vec![emit_bind(bind, ctx.root)]),
             None => run_fallback(filter, input, path, line, ctx),
         },
+        Filter::Try { body, handler } => {
+            run_try(body, handler.as_deref(), input, path, line, input_gen, ctx)
+        }
         other => run_fallback(other, input, path, line, ctx),
     }
 }
@@ -493,6 +471,7 @@ fn bare(message: String) -> PathErr {
     PathErr {
         partial: Vec::new(),
         message,
+        caught: None,
     }
 }
 
@@ -501,16 +480,61 @@ fn attach(mut done: Vec<POut>, err: PathErr) -> PathErr {
     PathErr {
         partial: done,
         message: err.message,
+        caught: err.caught,
     }
 }
 
-fn finish_outs(out: Vec<POut>, err: Option<String>) -> Result<Vec<POut>, PathErr> {
+fn split_err(mut err: PathErr) -> (Vec<POut>, Failure) {
+    (
+        std::mem::take(&mut err.partial),
+        Failure {
+            partial: Vec::new(),
+            message: err.message,
+            caught: err.caught,
+        },
+    )
+}
+
+fn finish_outs(out: Vec<POut>, err: Option<Failure>) -> Result<Vec<POut>, PathErr> {
     match err {
-        Some(message) => Err(PathErr {
+        Some(failure) => Err(PathErr {
             partial: out,
-            message,
+            message: failure.message,
+            caught: failure.caught,
         }),
         None => Ok(out),
+    }
+}
+
+fn run_try(
+    body: &Filter,
+    handler: Option<&Filter>,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let err = match run(body, input, path, line, input_gen, ctx) {
+        Ok(outs) => return Ok(outs),
+        Err(err) => err,
+    };
+    let Some(handler) = handler else {
+        return Ok(err.partial);
+    };
+    let caught = match err.caught {
+        Some(value) => value,
+        None => Value::String(err.message),
+    };
+    // The handler is not a carrier. A null or bool can still match the root.
+    let cell = Cell::new(0);
+    match run(handler, &caught, path, &cell, 0, ctx) {
+        Ok(more) => {
+            let mut partial = err.partial;
+            partial.extend(more);
+            Ok(partial)
+        }
+        Err(herr) => Err(attach(err.partial, herr)),
     }
 }
 
@@ -738,7 +762,10 @@ fn run_pipe(
     let left_cell = Cell::new(line.get());
     let (lefts, left_err) = match run(left, input, path, &left_cell, input_gen, ctx) {
         Ok(outs) => (outs, None),
-        Err(err) => (err.partial, Some(err.message)),
+        Err(err) => {
+            let (partial, failure) = split_err(err);
+            (partial, Some(failure))
+        }
     };
     let mut out = Vec::new();
     for left in lefts {
@@ -801,6 +828,7 @@ fn run_alt(
             Err(PathErr {
                 partial,
                 message: err.message,
+                caught: err.caught,
             })
         }
         Ok(lefts) => {
@@ -829,7 +857,10 @@ fn run_bool(
 ) -> Result<Vec<POut>, PathErr> {
     let (lefts, left_err) = match run(left, input, path, line, input_gen, ctx) {
         Ok(outs) => (outs, None),
-        Err(err) => (err.partial, Some(err.message)),
+        Err(err) => {
+            let (partial, failure) = split_err(err);
+            (partial, Some(failure))
+        }
     };
     let mut out = Vec::new();
     for left in lefts {
@@ -856,6 +887,7 @@ fn run_bool(
                 return Err(PathErr {
                     partial: out,
                     message: err.message,
+                    caught: err.caught,
                 });
             }
         }
@@ -995,10 +1027,14 @@ fn run_at(
                     let _ = message;
                 }
                 Err(message) => {
-                    let message = key_err.clone().unwrap_or(message);
+                    let (message, caught) = match key_err.clone() {
+                        Some(failure) => (failure.message, failure.caught),
+                        None => (message, None),
+                    };
                     return Err(PathErr {
                         partial: out,
                         message,
+                        caught,
                     });
                 }
             }
@@ -1166,6 +1202,7 @@ fn run_fallback(
             Err(PathErr {
                 partial,
                 message: failure.message,
+                caught: failure.caught,
             })
         }
     }
@@ -1827,10 +1864,3 @@ fn freeze(edit: &Edit) -> Value {
     }
 }
 
-fn compact(value: &Value) -> String {
-    let style = Style {
-        layout: Layout::Compact,
-        ..Style::default()
-    };
-    print::render(value, style)
-}
