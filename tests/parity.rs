@@ -1671,6 +1671,31 @@ fn updates_match_jq() {
 }
 
 #[test]
+fn settings_updates_match_jq() {
+    require_jq();
+    let path = fixture_path("settings.json");
+    for program in [
+        ".listen.port = 443",
+        ".regions[0].weight |= .+1",
+        ".limits.rate_per_minute += 60",
+        ".regions[0].weight -= 1",
+        ".limits.burst *= 2",
+        ".limits.max_body_bytes /= 1024",
+        ".listen.port %= 1000",
+        ".regions[].weight //= 1",
+        "del(.labels.nul)",
+        "del(.regions[] | select(.enabled == false))",
+        "(.regions[] | select(.enabled)).name = \"on\"",
+        ".nested.a.b.c.d.e[1][1][1][0] = 9",
+        ".empty.arr[0] = 1",
+        ".ids.long += 1",
+        ".labels.emoji |= . + \"!\"",
+    ] {
+        compare_exact(program, &["-c", "--", program, path.as_str()], b"");
+    }
+}
+
+#[test]
 fn variables_match_jq() {
     require_jq();
     let programs = [
