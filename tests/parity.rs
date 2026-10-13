@@ -1690,9 +1690,112 @@ fn settings_updates_match_jq() {
         ".empty.arr[0] = 1",
         ".ids.long += 1",
         ".labels.emoji |= . + \"!\"",
+        // The value is the wrong type for the operator.
+        ".listen.host += 1",
+        ".listen.host -= 1",
+        ".listen.tls *= 2",
+        ".listen.host /= 2",
+        ".listen.host %= 2",
+        ".empty.arr += 1",
+        ".empty.obj += 1",
+        ".listen.port += \"x\"",
+        ".regions[2].weight *= 2",
+        ".listen.host |= .+1",
+        ".regions[].name += 1",
+        ".empty.str -= \"\"",
+        ".labels += 1",
     ] {
         compare_exact(program, &["-c", "--", program, path.as_str()], b"");
     }
+}
+
+#[test]
+fn input_lines_match_jq() {
+    require_jq();
+    let samples: &[(&str, &[u8])] = &[
+        ("one line", b"1\n"),
+        ("no newline", b"1"),
+        ("two on one line", b"1 2\n"),
+        ("two on one line, no newline", b"1 2"),
+        ("one value per line", b"1\n2\n"),
+        ("last line has no newline", b"1\n2"),
+        ("leading newline", b"\n1\n"),
+        ("leading newline, no trailing newline", b"\n1"),
+        ("blank lines between values", b"1\n\n\n2\n"),
+        ("spaces around a value", b"  1  \n"),
+        ("multi-line object", b"{\n \"a\": 1\n}\n"),
+        ("multi-line object, no newline", b"{\n \"a\": 1\n}"),
+        (
+            "multi-line object, spaces after it",
+            b"{\n \"a\": 1\n}   \n",
+        ),
+        ("multi-line, then a value", b"{\n \"a\": 1\n}\n2\n"),
+        (
+            "multi-line, then a value, no newline",
+            b"{\n \"a\": 1\n}\n2",
+        ),
+        ("value on the closing line", b"{\n \"a\": 1\n} 2\n"),
+        (
+            "value on the closing line, no newline",
+            b"{\n \"a\": 1\n} 2",
+        ),
+        ("two multi-line objects", b"{\n\"a\":1\n}\n{\n\"b\":2\n}\n"),
+        (
+            "second multi-line object has no newline",
+            b"{\n\"a\":1\n}\n{\n\"b\":2\n}",
+        ),
+        ("multi-line array", b"[\n 1,\n 2\n]\n"),
+        ("multi-line array, no newline", b"[\n 1,\n 2\n]"),
+        ("nested object", b"{\n \"a\": {\n  \"b\": 1\n }\n}\n"),
+        ("crlf object", b"{\r\n \"a\": 1\r\n}\r\n"),
+        ("crlf object, no newline", b"{\r\n \"a\": 1\r\n}"),
+        ("carriage return between values", b"1\r2\n"),
+        ("carriage return, no newline", b"1\r2"),
+        ("leading bom", b"\xef\xbb\xbf{\n \"a\": 1\n}\n"),
+        ("leading bom, no newline", b"\xef\xbb\xbf1"),
+        ("tab indented object", b"{\n\t\"a\": 1\n}\n"),
+        ("empty object across lines", b"{\n}\n"),
+        ("string value", b"\"abc\"\n"),
+    ];
+    for (name, input) in samples {
+        compare_exact(name, &["-c", "0|.a"], input);
+    }
+
+    // A read holds 4095 bytes. Past that, the newline is a later read.
+    let mut same_line = b"1".to_vec();
+    same_line.extend(std::iter::repeat(b' ').take(4093));
+    same_line.extend(b"2\n");
+    compare_exact(
+        "two values on a line longer than one read",
+        &["-c", "0|.a"],
+        &same_line,
+    );
+
+    let mut number_at_end = vec![b' '; 4094];
+    number_at_end.extend(b"1\n");
+    compare_exact(
+        "number ends on the last byte of a read",
+        &["-c", "0|.a"],
+        &number_at_end,
+    );
+
+    let mut object_at_end = vec![b' '; 4093];
+    object_at_end.extend(b"{}\n");
+    compare_exact(
+        "object ends on the last byte of a read",
+        &["-c", "0|.a"],
+        &object_at_end,
+    );
+
+    let mut bom_long = vec![0xEF, 0xBB, 0xBF];
+    bom_long.extend(b"1");
+    bom_long.extend(std::iter::repeat(b' ').take(4092));
+    bom_long.push(b'\n');
+    compare_exact(
+        "bom on a line longer than one read",
+        &["-c", "0|.a"],
+        &bom_long,
+    );
 }
 
 #[test]

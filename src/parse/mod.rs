@@ -51,20 +51,19 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
 }
 
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
-    let bytes = strip_bom(bytes);
-    let mut parser = Parser::new(bytes);
+    let (bom, text) = split_bom(bytes);
+    let mut parser = Parser::new(text);
     let mut parsed = Vec::new();
     loop {
         parser.skip_ws();
         if parser.eof() {
             break;
         }
-        let start_line = parser.line;
         let value = match parser.parse_value() {
             Ok(value) => value,
             Err(err) => {
                 return Ok(ParsedStream {
-                    values: locate(bytes, parsed),
+                    values: locate(bytes, bom, parsed),
                     error: Some(err.text()),
                 });
             }
@@ -83,15 +82,15 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
             if let Some(phrase) = phrase {
                 parser.bump();
                 return Ok(ParsedStream {
-                    values: locate(bytes, parsed),
+                    values: locate(bytes, bom, parsed),
                     error: Some(parser.fail(phrase, false).text()),
                 });
             }
         }
-        parsed.push((value, start_line, end));
+        parsed.push((value, end));
     }
     Ok(ParsedStream {
-        values: locate(bytes, parsed),
+        values: locate(bytes, bom, parsed),
         error: None,
     })
 }
@@ -105,26 +104,60 @@ pub(crate) fn decode_string_token(text: &str) -> Result<String, String> {
     }
 }
 
-fn locate(text: &[u8], parsed: Vec<(Value, usize, usize)>) -> Vec<LocatedValue> {
-    let last = parsed.len();
-    let mut out = Vec::with_capacity(last);
-    for (index, (value, start_line, end)) in parsed.into_iter().enumerate() {
-        let newline_after = text[end..].contains(&b'\n');
-        let line = if index + 1 == last && !newline_after {
-            start_line.saturating_sub(1)
+// jq reads with `fgets` into a 4096-byte buffer, so one read is at most
+// 4095 bytes and stops at a newline. A runtime error names how many
+// newlines that reader has pulled in when the value is finished. A
+// number or literal is not finished until the next byte is in. The BOM
+// is not parsed, and its bytes still count toward that read.
+const FGETS_MAX: usize = 4095;
+
+fn locate(text: &[u8], bom: usize, parsed: Vec<(Value, usize)>) -> Vec<LocatedValue> {
+    let mut line = 0usize;
+    let mut filled = 0usize;
+    let mut out = Vec::with_capacity(parsed.len());
+    for (value, end) in parsed {
+        let end = end + bom;
+        // `end` is the next byte. Atoms have not consumed it; other
+        // values finish on the byte just before it.
+        let need = if is_atom(&value) && end < text.len() {
+            end
         } else {
-            start_line
+            end.saturating_sub(1)
         };
+        while filled <= need && filled < text.len() {
+            let next = read_chunk(text, filled);
+            line += newline_count(&text[filled..next]);
+            if next == filled {
+                break;
+            }
+            filled = next;
+        }
         out.push(LocatedValue { value, line });
     }
     out
 }
 
-fn strip_bom(bytes: &[u8]) -> &[u8] {
+fn read_chunk(text: &[u8], start: usize) -> usize {
+    let limit = start.saturating_add(FGETS_MAX).min(text.len());
+    let mut end = start;
+    while end < limit {
+        end += 1;
+        if text[end - 1] == b'\n' {
+            break;
+        }
+    }
+    end
+}
+
+fn newline_count(text: &[u8]) -> usize {
+    text.iter().filter(|byte| **byte == b'\n').count()
+}
+
+fn split_bom(bytes: &[u8]) -> (usize, &[u8]) {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
+        (3, &bytes[3..])
     } else {
-        bytes
+        (0, bytes)
     }
 }
 
