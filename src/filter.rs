@@ -112,10 +112,14 @@ pub enum Filter {
     FromDate,
     /// `gmtime`
     GmTime,
+    /// `localtime`
+    LocalTime,
     /// `mktime`
     MkTime,
     /// `strftime(fmt)`
     StrfTime(Box<Filter>),
+    /// `strflocaltime(fmt)`
+    StrfLocalTime(Box<Filter>),
     /// `strptime(fmt)`
     StrpTime(Box<Filter>),
     /// `now`
@@ -339,8 +343,10 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::ToDate => one(date::todate(input)),
         Filter::FromDate => one(date::fromdate(input)),
         Filter::GmTime => one(date::gmtime(input)),
+        Filter::LocalTime => one(date::localtime(input)),
         Filter::MkTime => one(date::mktime(input)),
         Filter::StrfTime(arg) => eval_strftime(arg, input, env),
+        Filter::StrfLocalTime(arg) => eval_strflocaltime(arg, input, env),
         Filter::StrpTime(arg) => eval_strptime(arg, input, env),
         Filter::Now => Ok(vec![date::now()]),
         Filter::Update { op, path, expr } => update::eval_update(*op, path, expr, input, env),
@@ -908,10 +914,27 @@ fn eval_strftime(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    eval_format(arg, input, env, date::format_time)
+}
+
+fn eval_strflocaltime(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    eval_format(arg, input, env, date::strflocaltime)
+}
+
+fn eval_format(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    format: fn(&Value, &Value) -> Result<Value, String>,
+) -> Result<Vec<Value>, Failure> {
     let (formats, err) = parts(eval_in(arg, input, env));
     let mut out = Vec::new();
-    for format in formats {
-        match date::format_time(input, &format) {
+    for spec in formats {
+        match format(input, &spec) {
             Ok(value) => out.push(value),
             Err(message) => {
                 return Err(Failure {
@@ -1434,6 +1457,7 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
+        | Filter::LocalTime
         | Filter::MkTime
         | Filter::Now => Ok(()),
         Filter::Var(name) => {
@@ -1462,6 +1486,7 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Select(inner)
         | Filter::Map(inner)
         | Filter::StrfTime(inner)
+        | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner) => check_vars(inner, scope),
         Filter::Update { path, expr, .. } => {
             check_vars(path, scope)?;
@@ -1858,8 +1883,10 @@ impl<'a> Parser<'a> {
                 "todate" => Ok(Filter::ToDate),
                 "fromdate" => Ok(Filter::FromDate),
                 "gmtime" => Ok(Filter::GmTime),
+                "localtime" => Ok(Filter::LocalTime),
                 "mktime" => Ok(Filter::MkTime),
                 "strftime" => Ok(Filter::StrfTime(self.parse_one_arg()?)),
+                "strflocaltime" => Ok(Filter::StrfLocalTime(self.parse_one_arg()?)),
                 "strptime" => Ok(Filter::StrpTime(self.parse_one_arg()?)),
                 "now" => Ok(Filter::Now),
                 "del" => Ok(Filter::Update {
@@ -3015,8 +3042,10 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
+        | Filter::LocalTime
         | Filter::MkTime
         | Filter::StrfTime(_)
+        | Filter::StrfLocalTime(_)
         | Filter::StrpTime(_)
         | Filter::Now => true,
         Filter::Optional(inner) => forbids_call(inner),
