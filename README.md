@@ -50,7 +50,7 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `empty` yields no values. `length` is the number of Unicode code points in a string, the number of elements in an array, and the number of keys in an object. Null has length 0. The length of a number is its absolute value. `keys` is the indexes of an array, or the keys of an object in order. `has(expr)`, `select(expr)`, and `map(expr)` take that one filter. `select` repeats the input for each truthy result. `map` runs the filter on each array element or object value and collects the results. The wrong kind of value fails the way jq fails, and the exit status is 5.
 
-`todate` writes a number of seconds since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`. `fromdate` reads that text back into seconds. `gmtime` breaks a number of seconds into `[year, month, day, hour, minute, second, weekday, yearday]`. The month and the weekday start at 0. `mktime` turns that array back into seconds. `strftime(fmt)` formats a number of seconds or that array. The format letters are `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, and `%Z`. A value of the wrong kind fails the way jq fails, and the exit status is 5.
+`todate` writes a number of seconds since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`. `fromdate` reads that text back into seconds. `gmtime` breaks a number of seconds into `[year, month, day, hour, minute, second, weekday, yearday]`. The month and the weekday start at 0. `mktime` turns that array back into seconds. `strftime(fmt)` formats a number of seconds or that array. `strptime(fmt)` reads text in that format back into the array. `now` is the current number of seconds since the epoch. The format letters are `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%Z`, `%j`, `%a`, `%b`, `%e`, `%y`, and `%z`. A value of the wrong kind fails the way jq fails, and the exit status is 5.
 
 `=` writes a value through a path. `|=` runs a filter on the value there and writes the first result back. No result removes that place, which is also what `del(path)` does. `+=`, `-=`, `*=`, `/=`, `%=`, and `//=` combine the value already there with the right-hand side. A path is a field, an index, a slice, or iteration. It can go through `|`, `,`, `select`, `//`, `if`, and `as`. `and`, `or`, and a matching `null`, `true`, or `false` stay paths when they do in jq. An update that lands on the wrong kind of value fails the way jq fails, and the exit status is 5.
 
@@ -60,7 +60,7 @@ A missing file is named and the other files are still read. The exit status is 2
 
 Filters past the list above are rejected. The message is `tumulus: syntax error` and the exit status is 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too, and so are `localtime` and `strflocaltime`.
 
-`strftime` rejects a format letter other than the seven above. The message names the letter and the exit status is 5.
+`strftime` and `strptime` reject a format letter other than the ones above. The message names the letter and the exit status is 5.
 
 `{$name}` and `{$name: value}` are rejected. jq uses the variable's name or the variable's value as an object key. `$__loc__` as a field is rejected too.
 

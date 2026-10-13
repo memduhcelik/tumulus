@@ -1,14 +1,17 @@
-//! `todate`, `fromdate`, `gmtime`, `mktime`, and `strftime`.
+//! `todate`, `fromdate`, `gmtime`, `mktime`, `strftime`, `strptime`, and `now`.
 //!
 //! Broken-down times go through the C library, so each platform agrees
-//! with the jq it ships. `strftime` accepts `%Y` `%m` `%d` `%H` `%M`
-//! `%S` and `%Z`.
+//! with the jq it ships. `strftime` and `strptime` accept `%Y` `%m` `%d`
+//! `%H` `%M` `%S` `%Z` `%j` `%a` `%b` `%e` `%y` and `%z`.
 
 use crate::number;
 use crate::value::Value;
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 
 const ISO: &str = "%Y-%m-%dT%H:%M:%SZ";
+
+/// Days before each month, not counting a leap day.
+const BEFORE_MONTH: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
 /// `struct tm` on macOS and glibc, LP64. `gmtime_r` fills `tm_zone`.
 /// jq clears that pointer before `strftime`, so `%Z` is the local zone
@@ -35,12 +38,34 @@ const _: () = {
     assert!(std::mem::offset_of!(Tm, tm_zone) == 48);
 };
 
+/// `struct timeval`. `tv_usec` is 32 bits on macOS and 64 bits on glibc.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Timeval>() == 16);
+    assert!(std::mem::align_of::<Timeval>() == 8);
+};
+
 extern "C" {
     fn gmtime_r(clock: *const i64, out: *mut Tm) -> *mut Tm;
     fn timegm(tm: *mut Tm) -> i64;
     fn strftime(buf: *mut c_char, max: usize, format: *const c_char, tm: *const Tm) -> usize;
     fn strptime(text: *const c_char, format: *const c_char, tm: *mut Tm) -> *mut c_char;
     fn isspace(c: i32) -> i32;
+    fn gettimeofday(tv: *mut Timeval, tz: *mut c_void) -> i32;
+    fn time(tloc: *mut i64) -> i64;
 }
 
 pub(crate) fn todate(input: &Value) -> Result<Value, String> {
@@ -63,9 +88,7 @@ pub(crate) fn fromdate(input: &Value) -> Result<Value, String> {
         )
     };
     if end.is_null() || !trailing_space(end) {
-        // jq prints the text with `%s`, which stops at the first NUL.
-        let shown = text.split('\0').next().unwrap_or("");
-        return Err(format!("date \"{shown}\" does not match format \"{ISO}\""));
+        return Err(mismatch(text, ISO));
     }
     // `timegm` ignores the weekday and yearday `strptime` stored.
     stamp(&mut tm)
@@ -130,6 +153,48 @@ pub(crate) fn format_time(input: &Value, format: &Value) -> Result<Value, String
     }
 }
 
+pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, String> {
+    let (text, fmt) = match (input, format) {
+        (Value::String(text), Value::String(fmt)) => (text.as_str(), fmt.as_str()),
+        _ => return Err("strptime/1 requires string inputs and arguments".to_string()),
+    };
+    let visible = fmt.split('\0').next().unwrap_or("");
+    check_letters(visible, "strptime")?;
+    let mut raw = text.as_bytes().to_vec();
+    raw.push(0);
+    let mut spec = Vec::with_capacity(visible.len() + 1);
+    spec.extend_from_slice(visible.as_bytes());
+    spec.push(0);
+    // 8 and 367 are jq's unset weekday and yearday. `strptime` leaves
+    // whichever fields the format does not write.
+    let mut tm = blank();
+    tm.tm_wday = 8;
+    tm.tm_yday = 367;
+    let end = unsafe {
+        strptime(
+            raw.as_ptr() as *const c_char,
+            spec.as_ptr() as *const c_char,
+            &mut tm,
+        )
+    };
+    if end.is_null() || !trailing_space(end) {
+        return Err(mismatch(text, visible));
+    }
+    // jq always stores the weekday and yearday it computes. It aborts when
+    // `strptime` had stored some other yearday. The array carries the
+    // computed value either way.
+    set_calendar(&mut tm);
+    let mut items = civil_fields(&tm);
+    if unsafe { *end } != 0 {
+        items.push(Value::String(c_str(end)));
+    }
+    Ok(Value::Array(items))
+}
+
+pub(crate) fn now() -> Value {
+    computed(clock_now())
+}
+
 fn require_format(format: &Value) -> Result<&str, String> {
     match format {
         Value::String(text) => Ok(text),
@@ -190,7 +255,7 @@ fn stamp(tm: &mut Tm) -> Result<Value, String> {
 
 fn render(tm: &Tm, format: &str) -> Result<Value, String> {
     let visible = format.split('\0').next().unwrap_or("");
-    check_letters(visible)?;
+    check_letters(visible, "strftime")?;
     let mut spec = Vec::with_capacity(visible.len() + 1);
     spec.extend_from_slice(visible.as_bytes());
     spec.push(0);
@@ -213,19 +278,121 @@ fn render(tm: &Tm, format: &str) -> Result<Value, String> {
     Ok(Value::String(text))
 }
 
-fn check_letters(format: &str) -> Result<(), String> {
+fn check_letters(format: &str, filter: &str) -> Result<(), String> {
     let mut chars = format.chars();
     while let Some(ch) = chars.next() {
         if ch != '%' {
             continue;
         }
         match chars.next() {
-            Some('Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z') => {}
-            Some(other) => return Err(format!("strftime does not support %{other}")),
-            None => return Err("strftime does not support %".to_string()),
+            Some('Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z' | 'j' | 'a' | 'b' | 'e' | 'y' | 'z') => {}
+            Some(other) => return Err(format!("{filter} does not support %{other}")),
+            None => return Err(format!("{filter} does not support %")),
         }
     }
     Ok(())
+}
+
+fn mismatch(text: &str, format: &str) -> String {
+    // jq prints both with `%s`, which stops at the first NUL.
+    let shown = text.split('\0').next().unwrap_or("");
+    let spec = format.split('\0').next().unwrap_or("");
+    format!("date \"{shown}\" does not match format \"{spec}\"")
+}
+
+fn set_calendar(tm: &mut Tm) {
+    let year = tm.tm_year.wrapping_add(1900);
+    tm.tm_wday = weekday(year, tm.tm_mon, tm.tm_mday);
+    tm.tm_yday = yearday(tm.tm_year, tm.tm_mon, tm.tm_mday);
+}
+
+/// Sunday is 0. March is month 1 in the month term, and January and
+/// February belong to the previous year. The month term is
+/// `floor(2.6 * m - 0.2)`.
+fn weekday(year: i32, mon: i32, mday: i32) -> i32 {
+    let century = year / 100;
+    let yy = year % 100;
+    let early = mon < 2;
+    let month_index = if early {
+        mon.wrapping_add(11)
+    } else {
+        mon.wrapping_sub(1)
+    };
+    let yy_adj = if early { yy.wrapping_sub(1) } else { yy };
+    let total = mday
+        .wrapping_sub(century.wrapping_mul(2))
+        .wrapping_add(yy_adj)
+        .wrapping_add(yy_adj.div_euclid(4))
+        .wrapping_add(century.div_euclid(4))
+        .wrapping_add(month_term(month_index));
+    let rem = total % 7;
+    if rem < 0 {
+        rem + 7
+    } else {
+        rem
+    }
+}
+
+fn month_term(month_index: i32) -> i32 {
+    (f64::from(month_index) * 2.6 - 0.2).floor() as i32
+}
+
+/// Days since January 1. A day of 0 is one less than the first of the
+/// month. Months before March do not add the leap day.
+fn yearday(tm_year: i32, mon: i32, mday: i32) -> i32 {
+    let adjust: i32 = if mon < 2 || !leap(tm_year.wrapping_add(1900)) {
+        -1
+    } else {
+        0
+    };
+    let abs_m = if mon < 0 { mon.wrapping_neg() } else { mon };
+    let index = if (0..12).contains(&abs_m) {
+        abs_m as usize
+    } else {
+        (abs_m as u32 % 12) as usize
+    };
+    adjust.wrapping_add(mday).wrapping_add(BEFORE_MONTH[index])
+}
+
+fn leap(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn civil_fields(tm: &Tm) -> Vec<Value> {
+    let year = tm.tm_year.wrapping_add(1900);
+    vec![
+        field(year),
+        field(tm.tm_mon),
+        field(tm.tm_mday),
+        field(tm.tm_hour),
+        field(tm.tm_min),
+        field(tm.tm_sec),
+        field(tm.tm_wday),
+        field(tm.tm_yday),
+    ]
+}
+
+fn c_str(start: *const c_char) -> String {
+    let mut len = 0usize;
+    unsafe {
+        while *start.add(len) != 0 {
+            len += 1;
+        }
+        let bytes = std::slice::from_raw_parts(start as *const u8, len);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+fn clock_now() -> f64 {
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let rc = unsafe { gettimeofday(&mut tv, std::ptr::null_mut()) };
+    if rc == -1 {
+        return unsafe { time(std::ptr::null_mut()) } as f64;
+    }
+    tv.tv_sec as f64 + (tv.tv_usec as f64) / 1_000_000.0
 }
 
 fn trailing_space(end: *const c_char) -> bool {
