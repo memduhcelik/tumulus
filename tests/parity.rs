@@ -1799,6 +1799,23 @@ fn input_lines_match_jq() {
 }
 
 #[test]
+fn requests_match_jq() {
+    require_jq();
+    let path = fixture_path("requests.ndjson");
+    for program in [
+        ".method",
+        ".user.plan // \"none\"",
+        "select(.status >= 400) | .path",
+        "{method, status, ms}",
+        ".user.plan + 1",
+        ".tags[0] + 1",
+        ".method += 1",
+    ] {
+        compare_exact(program, &["-c", "--", program, path.as_str()], b"");
+    }
+}
+
+#[test]
 fn variables_match_jq() {
     require_jq();
     let programs = [
