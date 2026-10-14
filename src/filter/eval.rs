@@ -1,0 +1,980 @@
+//! Running a filter: indexes, pipes, bindings, objects, and strings.
+
+use crate::date;
+use crate::math;
+use crate::number::{array_index, slice_bound};
+use crate::print::{self, Layout, Style};
+use crate::value::Value;
+
+use super::ast::*;
+use super::builtin::*;
+use super::parse::key_message;
+use super::value::*;
+
+pub fn eval(filter: &Filter, input: &Value) -> Result<Vec<Value>, Failure> {
+    eval_with(filter, input, &[])
+}
+
+/// `env` is the outer binding list. The first binding of a name wins.
+pub fn eval_with(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    eval_in(filter, input, env)
+}
+
+pub(super) fn eval_in(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    match filter {
+        Filter::Identity => Ok(vec![input.clone()]),
+        Filter::Field(key) => index_string(input, key),
+        Filter::Index { at, .. } => index_number(input, at),
+        Filter::Slice { start, end } => slice(input, start.as_deref(), end.as_deref()),
+        Filter::Iterate => iterate(input),
+        Filter::Recurse => Ok(recurse(input)),
+        Filter::Optional(inner) => match eval_in(inner, input, env) {
+            Ok(values) => Ok(values),
+            Err(failure) => Ok(failure.partial),
+        },
+        Filter::Pipe(left, right) => {
+            // Values already produced on the left are still fed to the right.
+            // A right-hand error stops before the left-hand error is reported.
+            let (inputs, left_err) = parts(eval_in(left, input, env));
+            let mut out = Vec::new();
+            for value in inputs {
+                match eval_in(right, &value, env) {
+                    Ok(more) => out.extend(more),
+                    Err(failure) => return Err(extend_err(out, failure)),
+                }
+            }
+            finish(out, left_err)
+        }
+        Filter::Comma(left, right) => {
+            let mut out = eval_in(left, input, env)?;
+            match eval_in(right, input, env) {
+                Ok(more) => out.extend(more),
+                Err(failure) => return Err(extend_err(out, failure)),
+            }
+            Ok(out)
+        }
+        Filter::Literal(value) => Ok(vec![value.clone()]),
+        Filter::Interpolate(pieces) => eval_interpolate(pieces, input, env),
+        Filter::Collect(inner) => match eval_in(inner, input, env) {
+            Ok(items) => Ok(vec![Value::Array(items)]),
+            Err(failure) => Err(bare_fail(failure)),
+        },
+        Filter::Object(fields) => eval_object(fields, input, env),
+        Filter::At {
+            base,
+            key,
+            optional,
+        } => eval_at(base, key, *optional, input, env),
+        Filter::Bin { op, left, right } => eval_bin(*op, left, right, input, env),
+        Filter::Neg(inner) => eval_neg(inner, input, env),
+        Filter::Not => Ok(vec![Value::Bool(!truthy(input))]),
+        Filter::And(left, right) => eval_and(left, right, input, env),
+        Filter::Or(left, right) => eval_or(left, right, input, env),
+        Filter::Alt(left, right) => eval_alt(left, right, input, env),
+        Filter::If { cond, yes, no } => eval_if(cond, yes, no, input, env),
+        Filter::Var(name) => match lookup(env, name) {
+            Some(value) => Ok(vec![value.clone()]),
+            None => Err(fail(format!("unbound {name}"))),
+        },
+        Filter::Bind {
+            expr,
+            pattern,
+            body,
+        } => eval_bind(expr, pattern, body, input, env),
+        Filter::Reduce {
+            stream,
+            pattern,
+            init,
+            update,
+        } => eval_fold(stream, pattern, init, update, None, false, input, env),
+        Filter::Foreach {
+            stream,
+            pattern,
+            init,
+            update,
+            extract,
+        } => eval_fold(
+            stream,
+            pattern,
+            init,
+            update,
+            extract.as_deref(),
+            true,
+            input,
+            env,
+        ),
+        Filter::Empty => Ok(Vec::new()),
+        Filter::Length => eval_length(input),
+        Filter::Keys => eval_keys(input),
+        Filter::Has(arg) => eval_has(arg, input, env),
+        Filter::Select(arg) => eval_select(arg, input, env),
+        Filter::Map(arg) => eval_map(arg, input, env),
+        Filter::Type => Ok(vec![Value::String(input.type_name().to_string())]),
+        Filter::ToNumber => eval_tonumber(input),
+        Filter::ToString => Ok(vec![Value::String(jq_text(input))]),
+        Filter::Join(arg) => eval_join(arg, input, env),
+        Filter::LTrim(arg) => eval_trim(arg, input, env, true),
+        Filter::RTrim(arg) => eval_trim(arg, input, env, false),
+        Filter::ToDate => one(date::todate(input)),
+        Filter::FromDate => one(date::fromdate(input)),
+        Filter::GmTime => one(date::gmtime(input)),
+        Filter::LocalTime => one(date::localtime(input)),
+        Filter::MkTime => one(date::mktime(input)),
+        Filter::StrfTime(arg) => eval_strftime(arg, input, env),
+        Filter::StrfLocalTime(arg) => eval_strflocaltime(arg, input, env),
+        Filter::StrpTime(arg) => eval_strptime(arg, input, env),
+        Filter::Now => Ok(vec![date::now()]),
+        Filter::Math1(op) => one(apply_unary(*op, input)),
+        Filter::Math2(op, left, right) => eval_math(&[left, right], input, env, |args| {
+            let x = number_required(&args[0])?;
+            let y = number_required(&args[1])?;
+            Ok(from_f64(math::binary(*op, x, y)))
+        }),
+        Filter::Math3(x, y, z) => eval_math(&[x, y, z], input, env, |args| {
+            let x = number_required(&args[0])?;
+            let y = number_required(&args[1])?;
+            let z = number_required(&args[2])?;
+            Ok(from_f64(math::fma(x, y, z)))
+        }),
+        Filter::Abs => eval_abs(input),
+        Filter::Pow10 => Err(raise(Value::String(
+            "Error: pow10/0 not found at build time".to_string(),
+        ))),
+        Filter::Error => Err(raise(input.clone())),
+        Filter::Raise(arg) => eval_raise(arg, input, env),
+        Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
+        Filter::Update { op, path, expr } => {
+            super::update::eval_update(*op, path, expr, input, env)
+        }
+        Filter::PathOf(inner) => super::update::eval_path_of(inner, input, env),
+        Filter::Paths(pred) => super::update::eval_paths(pred.as_deref(), input, env),
+        Filter::GetPath(arg) => super::update::eval_getpath(arg, input, env),
+        Filter::SetPath(path, value) => super::update::eval_setpath(path, value, input, env),
+        Filter::DelPaths(arg) => super::update::eval_delpaths(arg, input, env),
+    }
+}
+
+pub(super) fn index_string(input: &Value, key: &str) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Null => Ok(vec![Value::Null]),
+        Value::Object(items) => {
+            let found = items
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Null);
+            Ok(vec![found])
+        }
+        other => Err(fail(format!(
+            "Cannot index {} with string \"{key}\"",
+            other.type_name()
+        ))),
+    }
+}
+
+pub(super) fn index_number(input: &Value, index: &ArrayIndex) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Null => Ok(vec![Value::Null]),
+        Value::Array(items) => {
+            let value = match index {
+                ArrayIndex::OutOfRange => Value::Null,
+                ArrayIndex::At(index) => nth(items, *index),
+            };
+            Ok(vec![value])
+        }
+        other => Err(fail(format!(
+            "Cannot index {} with number",
+            other.type_name()
+        ))),
+    }
+}
+
+pub(super) fn nth(items: &[Value], index: i64) -> Value {
+    let len = items.len() as i128;
+    let position = if index < 0 {
+        len + i128::from(index)
+    } else {
+        i128::from(index)
+    };
+    if position < 0 || position >= len {
+        Value::Null
+    } else {
+        items[position as usize].clone()
+    }
+}
+
+pub(super) fn slice(
+    input: &Value,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Null => Ok(vec![Value::Null]),
+        Value::Array(items) => {
+            let (from, to) = slice_range(start, end, items.len());
+            Ok(vec![Value::Array(items[from..to].to_vec())])
+        }
+        Value::String(text) => {
+            let chars: Vec<char> = text.chars().collect();
+            let (from, to) = slice_range(start, end, chars.len());
+            Ok(vec![Value::String(chars[from..to].iter().collect())])
+        }
+        other => Err(fail(format!(
+            "Cannot index {} with object",
+            other.type_name()
+        ))),
+    }
+}
+
+pub(super) fn slice_range(start: Option<&str>, end: Option<&str>, len: usize) -> (usize, usize) {
+    let len_i = i64::try_from(len).unwrap_or(i64::MAX);
+    let from = match start {
+        Some(literal) => slice_bound(literal, len_i, false),
+        None => 0,
+    };
+    let to = match end {
+        Some(literal) => slice_bound(literal, len_i, true),
+        None => len_i,
+    };
+    let from = from.max(0) as usize;
+    let to = to.max(0) as usize;
+    let from = from.min(len);
+    let to = to.min(len);
+    if from >= to {
+        (from, from)
+    } else {
+        (from, to)
+    }
+}
+
+pub(super) fn recurse(input: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![input.clone()];
+    while let Some(value) = stack.pop() {
+        if let Ok(mut children) = iterate(&value) {
+            children.reverse();
+            stack.extend(children);
+        }
+        out.push(value);
+    }
+    out
+}
+
+pub(super) fn iterate(input: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Array(items) => Ok(items.clone()),
+        Value::Object(items) => Ok(items.iter().map(|(_, value)| value.clone()).collect()),
+        other => Err(fail(format!(
+            "Cannot iterate over {} ({})",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+pub(super) fn shown(value: &Value) -> String {
+    clipped(value, 14)
+}
+
+/// Compact JSON, cut to `max` bytes. The last three bytes become `...`.
+/// A cut through a UTF-8 sequence keeps U+FFFD in their place.
+pub(super) fn clipped(value: &Value, max: usize) -> String {
+    let style = Style {
+        layout: Layout::Compact,
+        ..Style::default()
+    };
+    let rendered = print::render(value, style);
+    let bytes = rendered.as_bytes();
+    if bytes.len() <= max {
+        return rendered;
+    }
+    let keep = max.saturating_sub(3);
+    let head = &bytes[..keep];
+    let mut valid = 0;
+    let mut index = 0;
+    while index < head.len() {
+        let width = utf8_width(head[index]);
+        if width == 0 || index + width > head.len() {
+            break;
+        }
+        if head[index + 1..index + width]
+            .iter()
+            .any(|byte| byte & 0xC0 != 0x80)
+        {
+            break;
+        }
+        index += width;
+        valid = index;
+    }
+    let mut out = String::from_utf8_lossy(&head[..valid]).into_owned();
+    if valid < head.len() {
+        out.push('\u{FFFD}');
+    }
+    out.push_str("...");
+    out
+}
+
+pub(super) fn utf8_width(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else if lead & 0xF8 == 0xF0 {
+        4
+    } else {
+        0
+    }
+}
+
+pub(super) fn fail(message: String) -> Failure {
+    Failure {
+        partial: Vec::new(),
+        message,
+        caught: None,
+    }
+}
+
+pub(super) fn fresh(partial: Vec<Value>, message: String) -> Failure {
+    Failure {
+        partial,
+        message,
+        caught: None,
+    }
+}
+
+/// `out` was produced before `failure`. The failure's own partial comes after it.
+pub(super) fn extend_err(mut out: Vec<Value>, mut failure: Failure) -> Failure {
+    out.extend(std::mem::take(&mut failure.partial));
+    with_partial(out, failure)
+}
+
+pub(super) fn with_partial(partial: Vec<Value>, mut failure: Failure) -> Failure {
+    failure.partial = partial;
+    failure
+}
+
+pub(super) fn bare_fail(mut failure: Failure) -> Failure {
+    failure.partial.clear();
+    failure
+}
+
+pub(super) fn parts(result: Result<Vec<Value>, Failure>) -> (Vec<Value>, Option<Failure>) {
+    match result {
+        Ok(values) => (values, None),
+        Err(mut failure) => {
+            let partial = std::mem::take(&mut failure.partial);
+            (partial, Some(failure))
+        }
+    }
+}
+
+pub(super) fn truthy(value: &Value) -> bool {
+    !matches!(value, Value::Null | Value::Bool(false))
+}
+
+pub(super) fn finish(out: Vec<Value>, err: Option<Failure>) -> Result<Vec<Value>, Failure> {
+    match err {
+        Some(failure) => Err(with_partial(out, failure)),
+        None => Ok(out),
+    }
+}
+
+pub(super) fn lookup<'a>(env: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+    env.iter()
+        .find(|(bound, _)| bound == name)
+        .map(|(_, value)| value)
+}
+
+/// New bindings are stored first, so the earliest one in the frame wins.
+pub(super) fn child_scope(
+    frame: &[(String, Value)],
+    env: &[(String, Value)],
+) -> Vec<(String, Value)> {
+    let mut child = Vec::with_capacity(frame.len() + env.len());
+    child.extend_from_slice(frame);
+    child.extend_from_slice(env);
+    child
+}
+
+pub(super) fn eval_bind(
+    expr: &Filter,
+    pattern: &Pattern,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval_in(expr, input, env));
+    let mut out = Vec::new();
+    for value in values {
+        let matched = match_pat(pattern, &value, env, &[], &mut |frame| {
+            let child = child_scope(frame, env);
+            match eval_in(body, input, &child) {
+                Ok(more) => {
+                    out.extend(more);
+                    Ok(())
+                }
+                Err(mut failure) => {
+                    out.extend(std::mem::take(&mut failure.partial));
+                    Err(failure)
+                }
+            }
+        });
+        if let Err(failure) = matched {
+            return Err(with_partial(out, failure));
+        }
+    }
+    finish(out, err)
+}
+
+/// `reduce` keeps only a finished accumulator. `foreach` emits each step.
+/// The stream of every init after the first is run on null.
+pub(super) fn eval_fold(
+    stream: &Filter,
+    pattern: &Pattern,
+    init: &Filter,
+    update: &Filter,
+    extract: Option<&Filter>,
+    emit: bool,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (inits, init_err) = parts(eval_in(init, input, env));
+    if inits.is_empty() {
+        return finish(Vec::new(), init_err);
+    }
+    let mut out = Vec::new();
+    for (index, init_value) in inits.iter().enumerate() {
+        let null_input = Value::Null;
+        let stream_input = if index == 0 { input } else { &null_input };
+        let (items, stream_err) = parts(eval_in(stream, stream_input, env));
+        let mut acc = init_value.clone();
+        for item in &items {
+            let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
+                let child = child_scope(frame, env);
+                let (updates, update_err) = parts(eval_in(update, &acc, &child));
+                if emit {
+                    if let Some(extract) = extract {
+                        for value in &updates {
+                            match eval_in(extract, value, &child) {
+                                Ok(more) => out.extend(more),
+                                Err(mut failure) => {
+                                    out.extend(std::mem::take(&mut failure.partial));
+                                    return Err(failure);
+                                }
+                            }
+                        }
+                    } else {
+                        out.extend(updates.iter().cloned());
+                    }
+                }
+                if let Some(failure) = update_err {
+                    return Err(failure);
+                }
+                acc = match updates.last() {
+                    Some(value) => value.clone(),
+                    None => Value::Null,
+                };
+                Ok(())
+            });
+            if let Err(failure) = stepped {
+                return Err(with_partial(out, failure));
+            }
+        }
+        if let Some(failure) = stream_err {
+            return Err(with_partial(out, failure));
+        }
+        if !emit {
+            out.push(acc);
+        }
+    }
+    finish(out, init_err)
+}
+
+/// A pattern is indexing. Array elements are stored right to left, object
+/// fields left to right, and an `also` name before its subpattern. The first
+/// stored binding of a name wins. The body runs inside the cross product.
+pub(super) fn match_pat(
+    pattern: &Pattern,
+    value: &Value,
+    env: &[(String, Value)],
+    binds: &[(String, Value)],
+    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    match pattern {
+        Pattern::Var(name) => {
+            let mut next = Vec::with_capacity(binds.len() + 1);
+            next.extend_from_slice(binds);
+            next.push((name.clone(), value.clone()));
+            cont(&next)
+        }
+        Pattern::Array(pats) => match_array(pats, value, env, binds, pats.len(), cont),
+        Pattern::Object(fields) => match_object(fields, value, env, binds, 0, cont),
+    }
+}
+
+pub(super) fn match_array(
+    pats: &[Pattern],
+    value: &Value,
+    env: &[(String, Value)],
+    binds: &[(String, Value)],
+    index: usize,
+    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    if index == 0 {
+        return cont(binds);
+    }
+    let element = match index_number(value, &ArrayIndex::At((index - 1) as i64)) {
+        Ok(got) => got.into_iter().next().unwrap_or(Value::Null),
+        Err(failure) => return Err(failure),
+    };
+    let sub = pats[index - 1].clone();
+    match_pat(&sub, &element, env, binds, &mut |inner| {
+        match_array(pats, value, env, inner, index - 1, cont)
+    })
+}
+
+pub(super) fn match_object(
+    fields: &[PatField],
+    value: &Value,
+    env: &[(String, Value)],
+    binds: &[(String, Value)],
+    index: usize,
+    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let Some(field) = fields.get(index) else {
+        return cont(binds);
+    };
+    let field = field.clone();
+    let (keys, key_err) = parts(eval_in(&field.key, value, env));
+    for key in keys {
+        let elements = match index_by(value, &key) {
+            Ok(got) => got,
+            Err(failure) => return Err(failure),
+        };
+        for element in elements {
+            let mut next = Vec::with_capacity(binds.len() + 1);
+            next.extend_from_slice(binds);
+            if let Some(name) = &field.also {
+                next.push((name.clone(), element.clone()));
+            }
+            match_pat(&field.pattern, &element, env, &next, &mut |inner| {
+                match_object(fields, value, env, inner, index + 1, cont)
+            })?;
+        }
+    }
+    if let Some(failure) = key_err {
+        return Err(failure);
+    }
+    Ok(())
+}
+
+pub(super) fn eval_neg(
+    inner: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval_in(inner, input, env));
+    let mut out = Vec::new();
+    for value in values {
+        match negate_value(&value) {
+            Ok(next) => out.push(next),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+pub(super) fn eval_bin(
+    op: Op,
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    // The right stream is the outer loop. A left error drops the remaining
+    // rights; a right error is reported after the successful rights.
+    let (rights, right_err) = parts(eval_in(right, input, env));
+    let mut out = Vec::new();
+    for right_value in rights {
+        let (lefts, left_err) = parts(eval_in(left, input, env));
+        for left_value in lefts {
+            match apply_op(op, &left_value, &right_value) {
+                Ok(value) => out.push(value),
+                Err(message) => return Err(fresh(out, message)),
+            }
+        }
+        if let Some(failure) = left_err {
+            return Err(with_partial(out, failure));
+        }
+    }
+    finish(out, right_err)
+}
+
+pub(super) fn eval_and(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (lefts, left_err) = parts(eval_in(left, input, env));
+    let mut out = Vec::new();
+    for left_value in lefts {
+        if !truthy(&left_value) {
+            out.push(Value::Bool(false));
+            continue;
+        }
+        let (rights, right_err) = parts(eval_in(right, input, env));
+        for right_value in rights {
+            out.push(Value::Bool(truthy(&right_value)));
+        }
+        if let Some(failure) = right_err {
+            return Err(with_partial(out, failure));
+        }
+    }
+    finish(out, left_err)
+}
+
+pub(super) fn eval_or(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (lefts, left_err) = parts(eval_in(left, input, env));
+    let mut out = Vec::new();
+    for left_value in lefts {
+        if truthy(&left_value) {
+            out.push(Value::Bool(true));
+            continue;
+        }
+        let (rights, right_err) = parts(eval_in(right, input, env));
+        for right_value in rights {
+            out.push(Value::Bool(truthy(&right_value)));
+        }
+        if let Some(failure) = right_err {
+            return Err(with_partial(out, failure));
+        }
+    }
+    finish(out, left_err)
+}
+
+pub(super) fn eval_alt(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    match eval_in(left, input, env) {
+        Err(mut failure) => {
+            let kept = std::mem::take(&mut failure.partial)
+                .into_iter()
+                .filter(truthy)
+                .collect();
+            Err(with_partial(kept, failure))
+        }
+        Ok(values) => {
+            let defined: Vec<Value> = values.into_iter().filter(truthy).collect();
+            if defined.is_empty() {
+                eval_in(right, input, env)
+            } else {
+                Ok(defined)
+            }
+        }
+    }
+}
+
+pub(super) fn eval_if(
+    cond: &Filter,
+    yes: &Filter,
+    no: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (conds, err) = parts(eval_in(cond, input, env));
+    let mut out = Vec::new();
+    for cond_value in conds {
+        let branch = if truthy(&cond_value) { yes } else { no };
+        match eval_in(branch, input, env) {
+            Ok(values) => out.extend(values),
+            Err(failure) => return Err(extend_err(out, failure)),
+        }
+    }
+    finish(out, err)
+}
+
+pub(super) fn eval_interpolate(
+    pieces: &[Piece],
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let strings = expand_pieces(pieces, 0, String::new(), input, env)?;
+    Ok(strings.into_iter().map(Value::String).collect())
+}
+
+pub(super) fn expand_pieces(
+    pieces: &[Piece],
+    index: usize,
+    prefix: String,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<String>, Failure> {
+    let Some(piece) = pieces.get(index) else {
+        return Ok(vec![prefix]);
+    };
+    match piece {
+        Piece::Text(text) => {
+            let mut next = prefix;
+            next.push_str(text);
+            expand_pieces(pieces, index + 1, next, input, env)
+        }
+        Piece::Interp(filter) => match eval_in(filter, input, env) {
+            Ok(values) => {
+                let mut out = Vec::new();
+                for value in values {
+                    let mut next = prefix.clone();
+                    next.push_str(&jq_text(&value));
+                    out.extend(expand_pieces(pieces, index + 1, next, input, env)?);
+                }
+                Ok(out)
+            }
+            Err(failure) => {
+                let caught = failure.caught.clone();
+                let message = failure.message.clone();
+                let mut partial = Vec::new();
+                for value in failure.partial {
+                    let mut next = prefix.clone();
+                    next.push_str(&jq_text(&value));
+                    match expand_pieces(pieces, index + 1, next, input, env) {
+                        Ok(more) => partial.extend(more),
+                        Err(inner) => {
+                            for value in inner.partial {
+                                if let Value::String(text) = value {
+                                    partial.push(text);
+                                }
+                            }
+                            // An inner piece that fails reuses this piece's error.
+                            return Err(Failure {
+                                partial: partial.into_iter().map(Value::String).collect(),
+                                message,
+                                caught,
+                            });
+                        }
+                    }
+                }
+                Err(Failure {
+                    partial: partial.into_iter().map(Value::String).collect(),
+                    message,
+                    caught,
+                })
+            }
+        },
+    }
+}
+
+pub(super) fn jq_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => {
+            let style = Style {
+                layout: Layout::Compact,
+                ..Style::default()
+            };
+            print::render(other, style)
+        }
+    }
+}
+
+pub(super) fn eval_object(
+    fields: &[ObjField],
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let mut streams = Vec::with_capacity(fields.len());
+    for field in fields {
+        streams.push(field_alts(field, input, env));
+    }
+    combine_fields(&streams, 0, Vec::new())
+}
+
+pub(super) struct Alts {
+    pairs: Vec<(String, Value)>,
+    error: Option<Failure>,
+}
+
+pub(super) fn field_alts(field: &ObjField, input: &Value, env: &[(String, Value)]) -> Alts {
+    match field {
+        ObjField::Lookup(key) => lookup_alts(key, input, env),
+        ObjField::Pair { key, value } => pair_alts(key, value, input, env),
+    }
+}
+
+pub(super) fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) -> Alts {
+    let (keys, key_err) = parts(eval_in(key, input, env));
+    let mut pairs = Vec::new();
+    for value in keys {
+        let Value::String(name) = value else {
+            return Alts {
+                pairs,
+                error: Some(fail(key_message(&value))),
+            };
+        };
+        match index_by(input, &Value::String(name.clone())) {
+            Ok(got) => {
+                let one = got.into_iter().next().unwrap_or(Value::Null);
+                pairs.push((name, one));
+            }
+            Err(failure) => {
+                return Alts {
+                    pairs,
+                    error: Some(bare_fail(failure)),
+                };
+            }
+        }
+    }
+    Alts {
+        pairs,
+        error: key_err,
+    }
+}
+
+pub(super) fn pair_alts(
+    key: &Filter,
+    value: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Alts {
+    let (keys, key_err) = parts(eval_in(key, input, env));
+    let (values, value_err) = parts(eval_in(value, input, env));
+    let mut pairs = Vec::new();
+    for key_value in &keys {
+        let Value::String(name) = key_value else {
+            return Alts {
+                pairs,
+                error: Some(fail(key_message(key_value))),
+            };
+        };
+        for item in &values {
+            pairs.push((name.clone(), item.clone()));
+        }
+        if let Some(failure) = &value_err {
+            return Alts {
+                pairs,
+                error: Some(failure.clone()),
+            };
+        }
+    }
+    Alts {
+        pairs,
+        error: key_err.or(value_err),
+    }
+}
+
+pub(super) fn combine_fields(
+    streams: &[Alts],
+    index: usize,
+    base: Vec<(String, Value)>,
+) -> Result<Vec<Value>, Failure> {
+    let Some(stream) = streams.get(index) else {
+        return Ok(vec![Value::Object(base)]);
+    };
+    let mut out = Vec::new();
+    for (key, value) in &stream.pairs {
+        let mut next = base.clone();
+        put(&mut next, key.clone(), value.clone());
+        match combine_fields(streams, index + 1, next) {
+            Ok(more) => out.extend(more),
+            Err(failure) => return Err(extend_err(out, failure)),
+        }
+    }
+    if let Some(failure) = &stream.error {
+        return Err(with_partial(out, failure.clone()));
+    }
+    Ok(out)
+}
+
+pub(super) fn eval_at(
+    base: &Filter,
+    key: &Filter,
+    optional: bool,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let values = eval_in(base, input, env)?;
+    let keys = match eval_in(key, input, env) {
+        Ok(keys) => keys,
+        Err(failure) => {
+            let caught = failure.caught.clone();
+            let message = failure.message;
+            let mut partial = Vec::new();
+            for key in &failure.partial {
+                for value in &values {
+                    match index_by(value, key) {
+                        Ok(got) => partial.extend(got),
+                        Err(inner) => {
+                            partial.extend(inner.partial);
+                            // The key's error wins over an index error on a partial key.
+                            return Err(Failure {
+                                partial,
+                                message,
+                                caught,
+                            });
+                        }
+                    }
+                }
+            }
+            return Err(Failure {
+                partial,
+                message,
+                caught,
+            });
+        }
+    };
+    let mut out = Vec::new();
+    for key in &keys {
+        for value in &values {
+            match index_by(value, key) {
+                Ok(got) => out.extend(got),
+                Err(mut failure) => {
+                    out.extend(std::mem::take(&mut failure.partial));
+                    if !optional {
+                        return Err(with_partial(out, failure));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(super) fn index_by(base: &Value, key: &Value) -> Result<Vec<Value>, Failure> {
+    match key {
+        Value::String(name) => index_string(base, name),
+        Value::Number(text) => {
+            let index = match array_index(text) {
+                Some(index) => ArrayIndex::At(index),
+                None => ArrayIndex::OutOfRange,
+            };
+            index_number(base, &index)
+        }
+        Value::Object(_) if matches!(base, Value::Null) => Ok(vec![Value::Null]),
+        Value::Object(_) if matches!(base, Value::Array(_) | Value::String(_)) => Err(fail(
+            "Array/string slice indices must be integers".to_string(),
+        )),
+        Value::Array(_) if matches!(base, Value::Array(_)) => Ok(vec![Value::Array(Vec::new())]),
+        other => Err(fail(format!(
+            "Cannot index {} with {}",
+            base.type_name(),
+            other.type_name()
+        ))),
+    }
+}
