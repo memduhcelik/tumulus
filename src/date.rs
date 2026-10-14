@@ -4,7 +4,8 @@
 //! Broken-down times go through the C library, so each platform agrees
 //! with the jq it ships. Apple's jq then replaces the weekday and yearday
 //! `strptime` stored. `strftime`, `strflocaltime`, and `strptime` accept
-//! `%Y` `%m` `%d` `%H` `%M` `%S` `%Z` `%j` `%a` `%b` `%e` `%y` and `%z`.
+//! `%Y` `%m` `%d` `%H` `%M` `%S` `%Z` `%j` `%a` `%A` `%b` `%B` `%e` `%y`
+//! `%z` `%I` `%p` `%u` `%w` `%s` `%D` `%F` `%T` `%R` `%c` and `%%`.
 
 use crate::number;
 use crate::value::Value;
@@ -322,7 +323,10 @@ fn check_letters(format: &str, filter: &str) -> Result<(), String> {
             continue;
         }
         match chars.next() {
-            Some('Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z' | 'j' | 'a' | 'b' | 'e' | 'y' | 'z') => {}
+            Some(
+                'Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z' | 'j' | 'a' | 'A' | 'b' | 'B' | 'e' | 'y'
+                | 'z' | 'I' | 'p' | 'u' | 'w' | 's' | 'D' | 'F' | 'T' | 'R' | 'c' | '%',
+            ) => {}
             Some(other) => return Err(format!("{filter} does not support %{other}")),
             None => return Err(format!("{filter} does not support %")),
         }

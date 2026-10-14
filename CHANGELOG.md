@@ -6,7 +6,9 @@
 
 `getpath(path)` reads the value at one path. `setpath(path; value)` writes it, and builds the missing objects and arrays along the way. The value runs outermost, and each path is tried again for every value. `delpaths(paths)` removes every path in one array. Indexes are the ones from before any path was removed. A path jq refuses, or a value of the wrong kind, fails the way jq fails, and the exit status is 5. `getpath` works on the left of an update.
 
-Of the 447 programs in jq 1.7.1's test file, 234 come out the same.
+`strftime`, `strflocaltime`, and `strptime` also accept `%A`, `%B`, `%I`, `%p`, `%u`, `%w`, `%s`, `%D`, `%F`, `%T`, `%R`, `%c`, and `%%`. `%A` and `%B` are the full weekday and month. `%I` is the hour from 01 to 12 and `%p` is the morning or afternoon mark. `%u` counts Monday as 1 and `%w` counts Sunday as 0. `%s` is seconds since the epoch. `%D`, `%F`, `%T`, and `%R` are the short date, the calendar date, the time, and the hour and minute. `%c` is the locale's date and time. `%%` is a percent sign. A letter still outside that set is rejected. The message names it and the exit status is 5.
+
+Of the 447 programs in jq 1.7.1's test file, 235 come out the same.
 
 ## 0.5.0
 

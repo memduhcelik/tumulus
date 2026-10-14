@@ -3497,6 +3497,108 @@ fn dates_match_jq() {
             tz,
         );
         compare_tz("same instant", "0 | gmtime == localtime", tz);
+        compare_tz(
+            "epoch names",
+            "0 | strftime(\"%A %B %I %p %u %w %s %D %F %T %R %c %%\")",
+            tz,
+        );
+        compare_tz(
+            "local names",
+            "0 | strflocaltime(\"%A %B %I %p %u %w %s %D %F %T %R %c %%\")",
+            tz,
+        );
+        compare_tz(
+            "summer names",
+            "1593561600 | strftime(\"%A %B %I %p %u %w %s %c\")",
+            tz,
+        );
+        compare_tz(
+            "local summer names",
+            "1593561600 | strflocaltime(\"%A %B %I %p %u %w %s %c\")",
+            tz,
+        );
+        compare_tz("parsed seconds", "\"0\" | strptime(\"%s\")", tz);
+        compare_tz("parsed afternoon", "\"1 PM\" | strptime(\"%I %p\")", tz);
+    }
+}
+
+#[test]
+fn date_letters_match_jq() {
+    require_jq();
+    let programs = [
+        "0 | strftime(\"%A\")",
+        "0 | strftime(\"%B\")",
+        "0 | strftime(\"%I\")",
+        "0 | strftime(\"%p\")",
+        "0 | strftime(\"%u\")",
+        "0 | strftime(\"%w\")",
+        "0 | strftime(\"%s\")",
+        "0 | strftime(\"%D\")",
+        "0 | strftime(\"%F\")",
+        "0 | strftime(\"%T\")",
+        "0 | strftime(\"%R\")",
+        "0 | strftime(\"%c\")",
+        "0 | strftime(\"%%\")",
+        "0 | strflocaltime(\"%A %B %I %p %u %w %s %D %F %T %R %c %%\")",
+        "3600 | strftime(\"%I %p %R %T\")",
+        "43200 | strftime(\"%I %p\")",
+        "46800 | strftime(\"%I %p\")",
+        "86399 | strftime(\"%I %p %H\")",
+        "1.9 | strftime(\"%s %S\")",
+        "1600000000 | strftime(\"%A %B %I %p %u %w %s %D %F\")",
+        "1600000000 | strflocaltime(\"%A %B %I %p %u %w %s %c\")",
+        "[1970,0,1,0,0,0,4,0] | strftime(\"%A %a %B %b %u %w %j %s\")",
+        "[1970,0,1,0,0,0,0,0] | strftime(\"%A %u %w\")",
+        "[1970,0,4,0,0,0,0,3] | strftime(\"%A %u %w\")",
+        "[1970,0,1,0,30,0,4,0] | strftime(\"%I %p %R %T\")",
+        "[1970,0,1,12,0,0,4,0] | strftime(\"%I %p\")",
+        "[1970,0,1,15,0,0,4,0] | strftime(\"%I %p %H\")",
+        "[1970,6,1,0,0,0,3,181] | strftime(\"%A %B %u %w\")",
+        "[1970,0,1,0,0,1.9,4,0] | strftime(\"%s %S %c\")",
+        "[2015,2,5,23,51,47,4,63] | strftime(\"%s\")",
+        "[2015,2,5,23,51,47,4,63] | strflocaltime(\"%s\")",
+        "0 | strftime(\"100%%\")",
+        "0 | strftime(\"%Y%%\")",
+        "0 | strftime(\"%%Y\")",
+        "0 | strftime(\"%A%B%I%p%u%w%s%D%F%T%R%c%%\")",
+        "0 | strftime(\"%Y\", \"%A\")",
+        "[1970,0,1,0,0,0,4,0] | strflocaltime(\"%Y\", \"%A\")",
+        "0 | gmtime | strftime(\"%c\")",
+        "0 | localtime | strflocaltime(\"%c\")",
+        "0 | strftime(\"%c\") | strptime(\"%c\")",
+        "0 | strflocaltime(\"%c\") | strptime(\"%c\")",
+        "\"Thursday\" | strptime(\"%A\")",
+        "\"January\" | strptime(\"%B\")",
+        "\"Thu\" | strptime(\"%A\")",
+        "\"Jan\" | strptime(\"%B\")",
+        "\"12 AM\" | strptime(\"%I %p\")",
+        "\"12 PM\" | strptime(\"%I %p\")",
+        "\"01\" | strptime(\"%I\")",
+        "\"4\" | strptime(\"%u\")",
+        "\"4\" | strptime(\"%w\")",
+        "\"0\" | strptime(\"%s\")",
+        "\"1600000000\" | strptime(\"%s\")",
+        "\"01/02/70\" | strptime(\"%D\")",
+        "\"1/2/70\" | strptime(\"%D\")",
+        "\"1970-01-02\" | strptime(\"%F\")",
+        "\"1970-01-02 junk\" | strptime(\"%F\")",
+        "\"13:05:09\" | strptime(\"%T\")",
+        "\"13:05\" | strptime(\"%R\")",
+        "\"%\" | strptime(\"%%\")",
+        "\"1970%\" | strptime(\"%Y%%\")",
+        "\"x%\" | strptime(\"x%%\")",
+        "\"Thursday, January 1, 1970\" | strptime(\"%A, %B %d, %Y\")",
+        "\"nope\" | strptime(\"%A\")",
+        "\"\" | strptime(\"%A\")",
+        "\"1970\" | strptime(\"%A\")",
+        "\"x\" | strptime(\"%%\")",
+        "\"1970\" | strptime(\"%Y\", \"%A\")",
+        "true | strftime(\"%A\")",
+        "null | strftime(\"%s\")",
+        "0 | strptime(\"%F\")",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
 
@@ -3506,9 +3608,6 @@ fn dates_match_jq() {
 #[test]
 fn strftime_letters_are_limited() {
     let cases = [
-        (r#"0 | strftime("%A")"#, "strftime does not support %A"),
-        (r#"0 | strftime("%B")"#, "strftime does not support %B"),
-        (r#"0 | strftime("%%")"#, "strftime does not support %%"),
         (r#"0 | strftime("%")"#, "strftime does not support %"),
         (r#"0 | strftime("%Y%")"#, "strftime does not support %"),
         (r#"0 | strftime("%n")"#, "strftime does not support %n"),
@@ -3517,10 +3616,6 @@ fn strftime_letters_are_limited() {
         (r#"0 | strftime("%-Y")"#, "strftime does not support %-"),
         (r#"0 | strftime("%10Y")"#, "strftime does not support %1"),
         (r#"0 | strftime("%Q%Y")"#, "strftime does not support %Q"),
-        (
-            r#"[1970,0,1,0,0,0,4,0] | strftime("%A")"#,
-            "strftime does not support %A",
-        ),
         (r#"0 | strftime(1)"#, "strftime/1 requires a string format"),
         (
             r#"0 | strftime(null)"#,
@@ -3545,17 +3640,6 @@ fn strftime_letters_are_limited() {
             5,
         );
     }
-    let program = r#"0 | strftime("%Y", "%A")"#;
-    let bin = env!("CARGO_BIN_EXE_tumulus");
-    let args = ["-n", "-c", "--", program];
-    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let got = run(bin, &owned, b"");
-    assert_eq!(got.stdout, b"\"1970\"\n", "{program}");
-    assert_eq!(
-        got.stderr, b"jq: error (at <unknown>): strftime does not support %A\n",
-        "{program}"
-    );
-    assert_eq!(got.status.code(), Some(5), "{program}");
 }
 
 /// jq aborts when `strflocaltime` converts a number and the format is not a
@@ -3565,18 +3649,6 @@ fn strftime_letters_are_limited() {
 #[test]
 fn strflocaltime_letters_are_limited() {
     let cases = [
-        (
-            r#"0 | strflocaltime("%A")"#,
-            "strflocaltime does not support %A",
-        ),
-        (
-            r#"0 | strflocaltime("%B")"#,
-            "strflocaltime does not support %B",
-        ),
-        (
-            r#"0 | strflocaltime("%%")"#,
-            "strflocaltime does not support %%",
-        ),
         (
             r#"0 | strflocaltime("%")"#,
             "strflocaltime does not support %",
@@ -3608,10 +3680,6 @@ fn strflocaltime_letters_are_limited() {
         (
             r#"0 | strflocaltime("%Q%Y")"#,
             "strflocaltime does not support %Q",
-        ),
-        (
-            r#"[1970,0,1,0,0,0,4,0] | strflocaltime("%A")"#,
-            "strflocaltime does not support %A",
         ),
         (
             r#"0 | strflocaltime(1)"#,
@@ -3656,18 +3724,6 @@ fn strflocaltime_letters_are_limited() {
             5,
         );
     }
-    // The year comes from the array, so the zone does not change it.
-    let program = r#"[1970,0,1,0,0,0,4,0] | strflocaltime("%Y", "%A")"#;
-    let bin = env!("CARGO_BIN_EXE_tumulus");
-    let args = ["-n", "-c", "--", program];
-    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let got = run(bin, &owned, b"");
-    assert_eq!(got.stdout, b"\"1970\"\n", "{program}");
-    assert_eq!(
-        got.stderr, b"jq: error (at <unknown>): strflocaltime does not support %A\n",
-        "{program}"
-    );
-    assert_eq!(got.status.code(), Some(5), "{program}");
 }
 
 /// `strptime` rejects the same letters `strftime` rejects. jq would hand
@@ -3675,9 +3731,6 @@ fn strflocaltime_letters_are_limited() {
 #[test]
 fn strptime_letters_are_limited() {
     let cases = [
-        (r#""1970" | strptime("%A")"#, "strptime does not support %A"),
-        (r#""1970" | strptime("%B")"#, "strptime does not support %B"),
-        (r#""1970" | strptime("%%")"#, "strptime does not support %%"),
         (r#""1970" | strptime("%")"#, "strptime does not support %"),
         (r#""1970" | strptime("%Y%")"#, "strptime does not support %"),
         (r#""1970" | strptime("%n")"#, "strptime does not support %n"),
@@ -3706,17 +3759,6 @@ fn strptime_letters_are_limited() {
             5,
         );
     }
-    let program = r#""1970" | strptime("%Y", "%A")"#;
-    let bin = env!("CARGO_BIN_EXE_tumulus");
-    let args = ["-n", "-c", "--", program];
-    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let got = run(bin, &owned, b"");
-    assert_eq!(got.stdout, b"[1970,0,0,0,0,0,3,-1]\n", "{program}");
-    assert_eq!(
-        got.stderr, b"jq: error (at <unknown>): strptime does not support %A\n",
-        "{program}"
-    );
-    assert_eq!(got.status.code(), Some(5), "{program}");
 }
 
 /// The two processes read the clock a moment apart. The number itself is
