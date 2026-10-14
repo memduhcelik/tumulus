@@ -106,6 +106,18 @@ pub enum Filter {
     Select(Box<Filter>),
     /// `map(expr)`. One array, from every output on each element or value.
     Map(Box<Filter>),
+    /// `type`
+    Type,
+    /// `tonumber`
+    ToNumber,
+    /// `tostring`
+    ToString,
+    /// `join(expr)`
+    Join(Box<Filter>),
+    /// `ltrimstr(expr)`
+    LTrim(Box<Filter>),
+    /// `rtrimstr(expr)`
+    RTrim(Box<Filter>),
     /// `todate`
     ToDate,
     /// `fromdate`
@@ -340,6 +352,12 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),
         Filter::Map(arg) => eval_map(arg, input, env),
+        Filter::Type => Ok(vec![Value::String(input.type_name().to_string())]),
+        Filter::ToNumber => eval_tonumber(input),
+        Filter::ToString => Ok(vec![Value::String(jq_text(input))]),
+        Filter::Join(arg) => eval_join(arg, input, env),
+        Filter::LTrim(arg) => eval_trim(arg, input, env, true),
+        Filter::RTrim(arg) => eval_trim(arg, input, env, false),
         Filter::ToDate => one(date::todate(input)),
         Filter::FromDate => one(date::fromdate(input)),
         Filter::GmTime => one(date::gmtime(input)),
@@ -1127,6 +1145,109 @@ fn eval_map(inner: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
     Ok(vec![Value::Array(collected)])
 }
 
+/// A number is unchanged. A string must be one JSON number. The parse error
+/// keeps the string's own text, quotes and newlines included.
+fn eval_tonumber(input: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Number(_) => Ok(vec![input.clone()]),
+        Value::String(text) => one(parse_number_text(text)),
+        other => Err(fail(format!(
+            "{} ({}) cannot be parsed as a number",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+fn parse_number_text(text: &str) -> Result<Value, String> {
+    let parsed = match crate::parse::parse_stream(text.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(err) => return Err(format!("{err} (while parsing '{text}')")),
+    };
+    let suffix = format!(" (while parsing '{text}')");
+    if let Some(message) = parsed.error {
+        return Err(format!("{message}{suffix}"));
+    }
+    match parsed.values.as_slice() {
+        [] => Err(format!("Expected JSON value{suffix}")),
+        [only] => match &only.value {
+            Value::Number(raw) => Ok(Value::Number(raw.clone())),
+            _ => Err(format!(
+                "string ({}) cannot be parsed as a number",
+                shown(&Value::String(text.to_string()))
+            )),
+        },
+        _ => Err(format!("Unexpected extra JSON values{suffix}")),
+    }
+}
+
+/// One separator. An empty walk is `""` and does not use the separator.
+/// Null becomes `""`. A number or boolean is compact JSON. An array or
+/// object is added as itself, so `+` reports that those cannot be added.
+fn eval_join(arg: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Value>, Failure> {
+    let (seps, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for sep in seps {
+        match join_with(input, &sep) {
+            Ok(value) => out.push(value),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+fn join_with(input: &Value, sep: &Value) -> Result<Value, String> {
+    let items = match iterate(input) {
+        Ok(items) => items,
+        Err(failure) => return Err(failure.message),
+    };
+    if items.is_empty() {
+        return Ok(Value::String(String::new()));
+    }
+    let mut acc = add_values(&Value::String(String::new()), &join_piece(&items[0]))?;
+    for item in &items[1..] {
+        let with_sep = add_values(&acc, sep)?;
+        acc = add_values(&with_sep, &join_piece(item))?;
+    }
+    Ok(acc)
+}
+
+fn join_piece(item: &Value) -> Value {
+    match item {
+        Value::Null => Value::String(String::new()),
+        Value::Bool(_) | Value::Number(_) => Value::String(jq_text(item)),
+        other => other.clone(),
+    }
+}
+
+/// Both sides must be strings. One matching copy is dropped. Any other
+/// value is returned unchanged, and a later argument still sees the input.
+fn eval_trim(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    left: bool,
+) -> Result<Vec<Value>, Failure> {
+    let (affixes, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for affix in affixes {
+        out.push(trim_once(input, &affix, left));
+    }
+    finish(out, err)
+}
+
+fn trim_once(input: &Value, affix: &Value, left: bool) -> Value {
+    let (Value::String(text), Value::String(edge)) = (input, affix) else {
+        return input.clone();
+    };
+    let trimmed = if left {
+        text.strip_prefix(edge.as_str())
+    } else {
+        text.strip_suffix(edge.as_str())
+    };
+    Value::String(trimmed.unwrap_or(text).to_string())
+}
+
 fn apply_op(op: Op, left: &Value, right: &Value) -> Result<Value, String> {
     match op {
         Op::Add => add_values(left, right),
@@ -1483,6 +1604,9 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Empty
         | Filter::Length
         | Filter::Keys
+        | Filter::Type
+        | Filter::ToNumber
+        | Filter::ToString
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
@@ -1515,6 +1639,9 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner)
+        | Filter::Join(inner)
+        | Filter::LTrim(inner)
+        | Filter::RTrim(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
@@ -1929,6 +2056,12 @@ impl<'a> Parser<'a> {
                 "has" => Ok(Filter::Has(self.parse_one_arg()?)),
                 "select" => Ok(Filter::Select(self.parse_one_arg()?)),
                 "map" => Ok(Filter::Map(self.parse_one_arg()?)),
+                "type" => Ok(Filter::Type),
+                "tonumber" => Ok(Filter::ToNumber),
+                "tostring" => Ok(Filter::ToString),
+                "join" => Ok(Filter::Join(self.parse_one_arg()?)),
+                "ltrimstr" => Ok(Filter::LTrim(self.parse_one_arg()?)),
+                "rtrimstr" => Ok(Filter::RTrim(self.parse_one_arg()?)),
                 "todate" => Ok(Filter::ToDate),
                 "fromdate" => Ok(Filter::FromDate),
                 "gmtime" => Ok(Filter::GmTime),
@@ -3201,6 +3334,12 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::Has(_)
         | Filter::Select(_)
         | Filter::Map(_)
+        | Filter::Type
+        | Filter::ToNumber
+        | Filter::ToString
+        | Filter::Join(_)
+        | Filter::LTrim(_)
+        | Filter::RTrim(_)
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
