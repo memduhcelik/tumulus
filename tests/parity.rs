@@ -1799,6 +1799,25 @@ fn input_lines_match_jq() {
 }
 
 #[test]
+fn citylots_paths_match_jq() {
+    require_jq();
+    let path = fixture_path("citylots.json");
+    for program in [
+        "path(.features[0].properties.BLKLOT)",
+        "path(.features[].properties.STREET)",
+        "[paths | select(.[-1] == \"BLKLOT\")]",
+        "getpath([\"features\", 1, \"properties\", \"MAPBLKLOT\"])",
+        "getpath([\"features\", 0, \"geometry\", \"coordinates\", 0, 0, 0])",
+        "setpath([\"features\", 0, \"properties\", \"ODD_EVEN\"]; \"O\")",
+        "delpaths([[\"features\", 2, \"geometry\", \"coordinates\"]])",
+        // The mapped coordinates were computed, so this path is refused.
+        "path(.features[0].geometry.coordinates | map(.[0][0]))",
+    ] {
+        compare_exact(program, &["-c", "--", program, path.as_str()], b"");
+    }
+}
+
+#[test]
 fn requests_match_jq() {
     require_jq();
     let path = fixture_path("requests.ndjson");
