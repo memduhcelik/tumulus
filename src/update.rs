@@ -8,9 +8,9 @@ use crate::number::array_index;
 use crate::value::Value;
 
 use super::{
-    add_values, bare_fail, child_scope, clipped, div_values, eval_in, fail, finish, fresh,
-    mul_values, parts, rem_values, shown, slice_range, sub_values, truthy, ArrayIndex, Failure,
-    Filter, PatField, Pattern, UpdateOp,
+    add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
+    finish, fresh, mul_values, parts, rem_values, shown, slice as slice_value, slice_range,
+    sub_values, truthy, with_partial, ArrayIndex, Failure, Filter, PatField, Pattern, UpdateOp,
 };
 
 enum Found {
@@ -22,7 +22,17 @@ enum Found {
 #[derive(Clone)]
 enum Step {
     Key(String),
-    Index(i64),
+    /// `at` is the slot updates write. `text` is what `path` prints, so
+    /// `1.5`, `1.0`, and `-0` keep the spelling jq prints.
+    Index {
+        at: i64,
+        text: String,
+    },
+    /// A number that does not fit in `at`. `path` prints `text`. Updates
+    /// still see a broken path, and this step is not written.
+    Huge(String),
+    /// A `getpath` component printed as itself. An array or a slice object.
+    Raw(Value),
     Slice {
         start: Option<String>,
         end: Option<String>,
@@ -228,6 +238,7 @@ fn eval_first(
 /// moves it, a constant does not. `and` and `or` read `line`; `|` reads
 /// `carrier`. A matching `null`, `true`, or `false` is marked a carrier so
 /// the next index is a real one.
+#[derive(Clone)]
 struct POut {
     value: Value,
     path: Vec<Step>,
@@ -295,7 +306,8 @@ struct Hit {
 enum Real {
     Done(Step, Value),
     /// A number too large to store. On `null` or an array this is not an error.
-    Huge,
+    /// The string is the spelling `path` prints.
+    Huge(String),
 }
 
 fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Found>, Failure> {
@@ -366,7 +378,8 @@ fn run(
     match filter {
         Filter::Identity => Ok(vec![pass(input, path, line, input_gen, ctx.root)]),
         Filter::Field(key) => run_field(key, input, path, line, input_gen, ctx),
-        Filter::Index(index) => run_fixed_index(index, input, path, line, input_gen, ctx),
+        Filter::Index { at, text } => run_fixed_index(at, text, input, path, line, input_gen, ctx),
+        Filter::GetPath(arg) => run_getpath(arg, input, path, line, input_gen, ctx),
         Filter::Slice { start, end } => run_slice(start, end, input, path, line, input_gen, ctx),
         Filter::Iterate => run_iterate(input, path, line, input_gen, ctx),
         Filter::Recurse => run_recurse(input, path, line, input_gen, ctx),
@@ -595,6 +608,7 @@ fn run_field(
 
 fn run_fixed_index(
     index: &ArrayIndex,
+    text: &str,
     input: &Value,
     path: &[Step],
     line: &Cell<u64>,
@@ -602,8 +616,8 @@ fn run_fixed_index(
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
     match index {
-        ArrayIndex::At(index) => {
-            let key = Value::Number(index.to_string());
+        ArrayIndex::At(_) => {
+            let key = Value::Number(text.to_string());
             index_here(&key, input, path, line, input_gen, ctx)
         }
         ArrayIndex::OutOfRange => {
@@ -611,7 +625,7 @@ fn run_fixed_index(
                 return Err(bare(near_access(&Value::Null, input)));
             }
             if matches!(input, Value::Null | Value::Array(_)) {
-                Ok(vec![huge_out(path, line)])
+                Ok(vec![huge_out(path, text, line)])
             } else {
                 Err(bare(format!(
                     "Cannot index {} with number",
@@ -668,7 +682,7 @@ fn run_iterate(
             let mut out = Vec::new();
             for (index, item) in items.iter().enumerate() {
                 let mut full = path.to_vec();
-                full.push(Step::Index(index as i64));
+                full.push(index_step(index as i64, &index.to_string()));
                 out.push(taken(item.clone(), full, line, ctx.next));
             }
             Ok(out)
@@ -707,7 +721,7 @@ fn run_recurse(
                 let gen = alloc(ctx.next);
                 let cell = Cell::new(gen);
                 let mut child_path = path.to_vec();
-                child_path.push(Step::Index(index as i64));
+                child_path.push(index_step(index as i64, &index.to_string()));
                 match run(&Filter::Recurse, item, &child_path, &cell, gen, ctx) {
                     Ok(more) => out.extend(more),
                     Err(err) => return Err(attach(out, err)),
@@ -1055,7 +1069,7 @@ fn index_here(
         return Err(bare(near_access(key, input)));
     }
     match real_step(input, key).map_err(bare)? {
-        Real::Huge => Ok(vec![huge_out(path, line)]),
+        Real::Huge(text) => Ok(vec![huge_out(path, &text, line)]),
         Real::Done(step, child) => {
             let mut full = path.to_vec();
             full.push(step);
@@ -1069,7 +1083,7 @@ fn index_out(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
         return Err(near_access(key, &base.value));
     }
     match real_step(&base.value, key)? {
-        Real::Huge => Ok(huge_out(&base.path, &Cell::new(base.line))),
+        Real::Huge(text) => Ok(huge_out(&base.path, &text, &Cell::new(base.line))),
         Real::Done(step, child) => {
             let gen = alloc(ctx.next);
             let mut path = base.path.clone();
@@ -1086,14 +1100,23 @@ fn index_out(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
     }
 }
 
-fn huge_out(path: &[Step], line: &Cell<u64>) -> POut {
+fn huge_out(path: &[Step], text: &str, line: &Cell<u64>) -> POut {
+    let mut full = path.to_vec();
+    full.push(Step::Huge(text.to_string()));
     POut {
         value: Value::Null,
-        path: path.to_vec(),
+        path: full,
         value_gen: 0,
         line: line.get(),
         carrier: false,
         force_broken: true,
+    }
+}
+
+fn index_step(at: i64, text: &str) -> Step {
+    Step::Index {
+        at,
+        text: canonical_number(text),
     }
 }
 
@@ -1110,9 +1133,10 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
             )),
         },
         Value::Number(text) => {
-            let Some(index) = array_index(text) else {
+            let shown = canonical_number(text);
+            let Some(index) = array_index(&shown) else {
                 return if matches!(container, Value::Null | Value::Array(_)) {
-                    Ok(Real::Huge)
+                    Ok(Real::Huge(shown))
                 } else {
                     Err(format!(
                         "Cannot index {} with number",
@@ -1120,9 +1144,10 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
                     ))
                 };
             };
+            let step = index_step(index, &shown);
             match container {
-                Value::Null => Ok(Real::Done(Step::Index(index), Value::Null)),
-                Value::Array(items) => Ok(Real::Done(Step::Index(index), nth_value(items, index))),
+                Value::Null => Ok(Real::Done(step, Value::Null)),
+                Value::Array(items) => Ok(Real::Done(step, nth_value(items, index))),
                 other => Err(format!("Cannot index {} with number", other.type_name())),
             }
         }
@@ -1403,7 +1428,7 @@ fn pat_index(
         return Err(bare(near_access(key, value)));
     }
     match real_step(value, key).map_err(bare)? {
-        Real::Huge => Err(bare(format!(
+        Real::Huge(_) => Err(bare(format!(
             "Cannot index {} with number",
             value.type_name()
         ))),
@@ -1491,6 +1516,14 @@ fn value_at(value: &Value, path: &[Step]) -> Result<Value, String> {
         return Ok(value.clone());
     }
     let child = match (&path[0], value) {
+        (Step::Raw(key), _) => {
+            let got = get_one(value, key)?;
+            return if path.len() == 1 {
+                Ok(got)
+            } else {
+                value_at(&got, &path[1..])
+            };
+        }
         (Step::Key(_), Value::Null) => Value::Null,
         (Step::Key(key), Value::Object(items)) => items
             .iter()
@@ -1503,9 +1536,10 @@ fn value_at(value: &Value, path: &[Step]) -> Result<Value, String> {
                 other.type_name()
             ));
         }
-        (Step::Index(_), Value::Null) => Value::Null,
-        (Step::Index(index), Value::Array(items)) => nth_value(items, *index),
-        (Step::Index(_), other) => {
+        (Step::Index { .. } | Step::Huge(_), Value::Null) => Value::Null,
+        (Step::Index { at: index, .. }, Value::Array(items)) => nth_value(items, *index),
+        (Step::Huge(_), Value::Array(_)) => Value::Null,
+        (Step::Index { .. } | Step::Huge(_), other) => {
             return Err(format!("Cannot index {} with number", other.type_name()));
         }
         (Step::Slice { start, end }, _) => {
@@ -1554,8 +1588,42 @@ fn write_path(edit: &mut Edit, path: &[Step], write: &Write) -> Result<(), Strin
     }
     match &path[0] {
         Step::Key(key) => write_key(edit, key, &path[1..], write),
-        Step::Index(index) => write_index(edit, *index, &path[1..], write),
+        Step::Index { at, .. } => write_index(edit, *at, &path[1..], write),
+        Step::Huge(_) => Err("Array index too large".to_string()),
+        Step::Raw(key) => write_raw(edit, key, &path[1..], write),
         Step::Slice { start, end } => write_slice(edit, start, end, &path[1..], write),
+    }
+}
+
+fn write_raw(edit: &mut Edit, key: &Value, rest: &[Step], write: &Write) -> Result<(), String> {
+    match key {
+        Value::Array(_) => {
+            let current = freeze(edit);
+            if matches!(current, Value::Array(_)) {
+                Err("Cannot update field at array index of array".to_string())
+            } else {
+                Err(format!("Cannot index {} with array", current.type_name()))
+            }
+        }
+        Value::Object(fields) => {
+            let current = freeze(edit);
+            if !matches!(current, Value::Null | Value::Array(_) | Value::String(_)) {
+                return Err(format!("Cannot index {} with object", current.type_name()));
+            }
+            let (start, end) = slice_from_object(fields)?;
+            write_slice(edit, &start, &end, rest, write)
+        }
+        _ => {
+            let current = freeze(edit);
+            match real_step(&current, key)? {
+                Real::Huge(_) => Err("Array index too large".to_string()),
+                Real::Done(step, _) => {
+                    let mut steps = vec![step];
+                    steps.extend_from_slice(rest);
+                    write_path(edit, &steps, write)
+                }
+            }
+        }
     }
 }
 
@@ -1787,14 +1855,26 @@ fn read_edit(edit: &Edit, path: &[Step]) -> Result<Value, String> {
         return Ok(freeze(edit));
     }
     match (edit, &path[0]) {
+        (_, Step::Raw(key)) => {
+            let current = freeze(edit);
+            let got = get_one(&current, key)?;
+            return if path.len() == 1 {
+                Ok(got)
+            } else {
+                value_at(&got, &path[1..])
+            };
+        }
         (Edit::Pure(value), _) => value_at(value, path),
         (Edit::Obj(fields), Step::Key(key)) => match fields.iter().find(|(name, _)| name == key) {
             Some((_, child)) => read_edit(child, &path[1..]),
             None => read_edit(&Edit::Pure(Value::Null), &path[1..]),
         },
-        (Edit::Obj(_), Step::Index(_)) => Err("Cannot index object with number".to_string()),
+        (Edit::Obj(_), Step::Index { .. } | Step::Huge(_)) => {
+            Err("Cannot index object with number".to_string())
+        }
         (Edit::Obj(_), Step::Slice { .. }) => Err("Cannot index object with object".to_string()),
-        (Edit::Arr(arr), Step::Index(index)) => {
+        (Edit::Arr(_), Step::Huge(_)) => Err("Array index too large".to_string()),
+        (Edit::Arr(arr), Step::Index { at: index, .. }) => {
             let Some(position) = resolve_index(*index, arr.slots.len()) else {
                 return Err("Out of bounds negative array index".to_string());
             };
@@ -1864,3 +1944,529 @@ fn freeze(edit: &Edit) -> Value {
     }
 }
 
+pub(super) fn eval_path_of(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let walked = walk_paths(filter, input, env);
+    let values = walked
+        .steps
+        .into_iter()
+        .map(|steps| render_steps(&steps))
+        .collect();
+    match walked.failure {
+        Some(failure) => Err(with_partial(values, failure)),
+        None => Ok(values),
+    }
+}
+
+/// `paths` is `path(..)` without the empty path. `paths(f)` keeps each path
+/// once for every truthy output of `f` on the value there. `f` sees the root
+/// first, so a failure on the root yields nothing else.
+pub(super) fn eval_paths(
+    pred: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let walked = walk_paths(&Filter::Recurse, input, env);
+    let mut out = Vec::new();
+    for steps in walked.steps {
+        if let Some(pred) = pred {
+            let at = value_at(input, &steps).map_err(|message| fresh(out.clone(), message))?;
+            let (flags, err) = parts(eval_in(pred, &at, env));
+            for flag in flags {
+                if truthy(&flag) && !steps.is_empty() {
+                    out.push(render_steps(&steps));
+                }
+            }
+            if let Some(failure) = err {
+                return Err(with_partial(out, failure));
+            }
+        } else if !steps.is_empty() {
+            out.push(render_steps(&steps));
+        }
+    }
+    match walked.failure {
+        Some(failure) => Err(with_partial(out, failure)),
+        None => Ok(out),
+    }
+}
+
+pub(super) fn eval_getpath(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    map_arg(arg, input, env, |path| get_value(input, path))
+}
+
+pub(super) fn eval_setpath(
+    path_f: &Filter,
+    value_f: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (values, value_err) = parts(eval_in(value_f, input, env));
+    let mut out = Vec::new();
+    for value in values {
+        let (paths, path_err) = parts(eval_in(path_f, input, env));
+        for path in paths {
+            match set_value(input, &path, &value) {
+                Ok(produced) => out.push(produced),
+                Err(message) => return Err(fresh(out, message)),
+            }
+        }
+        if let Some(failure) = path_err {
+            return Err(with_partial(out, failure));
+        }
+    }
+    finish(out, value_err)
+}
+
+pub(super) fn eval_delpaths(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    map_arg(arg, input, env, |paths| delete_paths(input, paths))
+}
+
+fn map_arg(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    apply: impl Fn(&Value) -> Result<Value, String>,
+) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for value in values {
+        match apply(&value) {
+            Ok(produced) => out.push(produced),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+struct Walk {
+    steps: Vec<Vec<Step>>,
+    failure: Option<Failure>,
+}
+
+fn walk_paths(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Walk {
+    let next = Cell::new(2);
+    let line = Cell::new(1);
+    let ctx = Ctx {
+        root: input,
+        next: &next,
+        env,
+        pbinds: &[],
+    };
+    let (outs, err) = match run(filter, input, &[], &line, 1, &ctx) {
+        Ok(outs) => (outs, None),
+        Err(err) => {
+            let (partial, failure) = split_err(err);
+            (partial, Some(failure))
+        }
+    };
+    let mut steps = Vec::new();
+    for out in outs {
+        match path_steps(input, out) {
+            Ok(one) => steps.push(one),
+            Err(value) => {
+                return Walk {
+                    steps,
+                    failure: Some(fail(format!(
+                        "Invalid path expression with result {}",
+                        clipped(&value, 29)
+                    ))),
+                };
+            }
+        }
+    }
+    Walk {
+        steps,
+        failure: err,
+    }
+}
+
+/// A path jq will print. A broken value is the `Err` payload.
+fn path_steps(root: &Value, out: POut) -> Result<Vec<Step>, Value> {
+    if out.force_broken {
+        if out.path.iter().any(|step| matches!(step, Step::Huge(_))) {
+            return Ok(out.path);
+        }
+        return Err(out.value);
+    }
+    if out.carrier {
+        return Ok(out.path);
+    }
+    if matches!(out.value, Value::Null | Value::Bool(_)) {
+        if let Ok(at) = value_at(root, &out.path) {
+            if same_boolish(&out.value, &at) {
+                return Ok(out.path);
+            }
+        }
+    }
+    Err(out.value)
+}
+
+fn render_steps(steps: &[Step]) -> Value {
+    Value::Array(steps.iter().map(render_step).collect())
+}
+
+fn render_step(step: &Step) -> Value {
+    match step {
+        Step::Key(key) => Value::String(key.clone()),
+        Step::Index { text, .. } | Step::Huge(text) => Value::Number(text.clone()),
+        Step::Raw(value) => value.clone(),
+        Step::Slice { start, end } => Value::Object(vec![
+            ("start".to_string(), render_bound(start)),
+            ("end".to_string(), render_bound(end)),
+        ]),
+    }
+}
+
+fn render_bound(bound: &Option<String>) -> Value {
+    match bound {
+        None => Value::Null,
+        Some(text) => Value::Number(canonical_number(text)),
+    }
+}
+
+fn run_getpath(
+    arg: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let saved = line.get();
+    let (paths, err) = parts(eval_in(arg, input, ctx.env));
+    line.set(saved);
+    let mut out = Vec::new();
+    for path_value in paths {
+        line.set(saved);
+        let base = pass(input, path, line, input_gen, ctx.root);
+        match extend_get(&base, &path_value, ctx) {
+            Ok(hit) => out.push(hit),
+            Err(message) => {
+                return Err(PathErr {
+                    partial: out,
+                    message,
+                    caught: None,
+                })
+            }
+        }
+    }
+    finish_outs(out, err)
+}
+
+/// A carrier grows by each component. Anything else is an ordinary value,
+/// and `path` then rejects it when it was not reached from the input.
+fn extend_get(base: &POut, path_value: &Value, ctx: &Ctx) -> Result<POut, String> {
+    let Value::Array(keys) = path_value else {
+        return Err("Path must be specified as an array".to_string());
+    };
+    if !base.carrier {
+        let value = get_along(&base.value, keys)?;
+        return Ok(constant(value, &base.path, base.line, ctx.root));
+    }
+    let mut cur = base.clone();
+    for key in keys {
+        cur = push_get(&cur, key, ctx)?;
+    }
+    Ok(cur)
+}
+
+/// `getpath` keeps the key it was given. A slice object is stored whole so
+/// `path` prints its keys in the order they were written.
+fn push_get(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
+    if !base.carrier {
+        return Err(near_access(key, &base.value));
+    }
+    match key {
+        Value::Array(_) if matches!(base.value, Value::Array(_)) => Ok(adopt(
+            base,
+            Step::Raw(key.clone()),
+            Value::Array(Vec::new()),
+            ctx,
+        )),
+        Value::Object(_) if matches!(base.value, Value::Null) => {
+            Ok(adopt(base, Step::Raw(key.clone()), Value::Null, ctx))
+        }
+        Value::Object(_) if matches!(base.value, Value::Array(_) | Value::String(_)) => {
+            let child = get_one(&base.value, key)?;
+            Ok(adopt(base, Step::Raw(key.clone()), child, ctx))
+        }
+        _ => index_out(base, key, ctx),
+    }
+}
+
+fn adopt(base: &POut, step: Step, child: Value, ctx: &Ctx) -> POut {
+    let gen = alloc(ctx.next);
+    let mut path = base.path.clone();
+    path.push(step);
+    POut {
+        value: child,
+        path,
+        value_gen: gen,
+        line: gen,
+        carrier: true,
+        force_broken: false,
+    }
+}
+
+fn get_value(value: &Value, path: &Value) -> Result<Value, String> {
+    let Value::Array(keys) = path else {
+        return Err("Path must be specified as an array".to_string());
+    };
+    get_along(value, keys)
+}
+
+fn get_along(value: &Value, keys: &[Value]) -> Result<Value, String> {
+    let mut cur = value.clone();
+    for key in keys {
+        cur = get_one(&cur, key)?;
+    }
+    Ok(cur)
+}
+
+fn get_one(value: &Value, key: &Value) -> Result<Value, String> {
+    match key {
+        Value::String(name) => match value {
+            Value::Null => Ok(Value::Null),
+            Value::Object(items) => Ok(items
+                .iter()
+                .find(|(item, _)| item == name)
+                .map(|(_, item)| item.clone())
+                .unwrap_or(Value::Null)),
+            other => Err(format!(
+                "Cannot index {} with string \"{name}\"",
+                other.type_name()
+            )),
+        },
+        Value::Number(text) => {
+            let shown = canonical_number(text);
+            let index = array_index(&shown);
+            match value {
+                Value::Null => Ok(Value::Null),
+                Value::Array(items) => match index {
+                    Some(index) => Ok(nth_value(items, index)),
+                    None => Ok(Value::Null),
+                },
+                other => Err(format!("Cannot index {} with number", other.type_name())),
+            }
+        }
+        Value::Object(fields) => {
+            if matches!(value, Value::Null) {
+                return Ok(Value::Null);
+            }
+            if matches!(value, Value::Array(_) | Value::String(_)) {
+                let (start, end) = slice_from_object(fields)?;
+                let sliced = slice_value(value, start.as_deref(), end.as_deref())
+                    .map_err(|failure| failure.message)?;
+                return Ok(sliced.into_iter().next().unwrap_or(Value::Null));
+            }
+            Err(format!("Cannot index {} with object", value.type_name()))
+        }
+        Value::Array(_) if matches!(value, Value::Array(_)) => Ok(Value::Array(Vec::new())),
+        other => Err(format!(
+            "Cannot index {} with {}",
+            value.type_name(),
+            other.type_name()
+        )),
+    }
+}
+
+fn set_value(value: &Value, path: &Value, new_value: &Value) -> Result<Value, String> {
+    let Value::Array(keys) = path else {
+        return Err("Path must be specified as an array".to_string());
+    };
+    if keys.is_empty() {
+        return Ok(new_value.clone());
+    }
+    let mut steps = Vec::new();
+    let mut cur = value.clone();
+    for key in keys {
+        match real_step(&cur, key)? {
+            Real::Huge(_) => return Err("Array index too large".to_string()),
+            Real::Done(step, child) => {
+                steps.push(step);
+                cur = child;
+            }
+        }
+    }
+    let mut edit = Edit::Pure(value.clone());
+    write_path(&mut edit, &steps, &Write::Put(new_value.clone()))?;
+    Ok(freeze(&edit))
+}
+
+fn delete_paths(value: &Value, spec: &Value) -> Result<Value, String> {
+    let Value::Array(paths) = spec else {
+        return Err("Paths must be specified as an array".to_string());
+    };
+    let mut all = Vec::new();
+    for path in paths {
+        let Value::Array(keys) = path else {
+            return Err(format!(
+                "Path must be specified as array, not {}",
+                path.type_name()
+            ));
+        };
+        if let Some(steps) = delete_steps(value, keys)? {
+            all.push(steps);
+        }
+    }
+    let mut edit = Edit::Pure(value.clone());
+    write_all(&mut edit, &all, &Write::Remove)?;
+    Ok(freeze(&edit))
+}
+
+/// `None` deletes nothing. The last component uses jq's delete wording.
+/// Earlier components use the same errors as `getpath`.
+fn delete_steps(value: &Value, keys: &[Value]) -> Result<Option<Vec<Step>>, String> {
+    if keys.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut cur = value.clone();
+    let mut steps = Vec::new();
+    let mut detached = false;
+    for (index, key) in keys.iter().enumerate() {
+        let last = index + 1 == keys.len();
+        if last {
+            return match delete_leaf(&cur, key)? {
+                Leaf::Skip => Ok(None),
+                Leaf::Step(step) => {
+                    if detached {
+                        Ok(None)
+                    } else {
+                        steps.push(step);
+                        Ok(Some(steps))
+                    }
+                }
+            };
+        }
+        if let Value::Array(_) = key {
+            return match &cur {
+                Value::Array(_) => Err("Cannot update field at array index of array".to_string()),
+                other => Err(format!("Cannot index {} with array", other.type_name())),
+            };
+        }
+        let (step, child) = read_step(&cur, key)?;
+        if matches!(step, Step::Huge(_)) {
+            detached = true;
+            cur = Value::Null;
+            continue;
+        }
+        if !detached {
+            steps.push(step);
+        }
+        cur = child;
+    }
+    Ok(Some(steps))
+}
+
+enum Leaf {
+    Skip,
+    Step(Step),
+}
+
+fn delete_leaf(value: &Value, key: &Value) -> Result<Leaf, String> {
+    match value {
+        Value::Null => Ok(Leaf::Skip),
+        Value::Array(_) => match key {
+            Value::Number(text) => {
+                let shown = canonical_number(text);
+                match array_index(&shown) {
+                    Some(index) => Ok(Leaf::Step(index_step(index, &shown))),
+                    None => Ok(Leaf::Skip),
+                }
+            }
+            Value::Object(fields) => {
+                let (start, end) = slice_from_object(fields)?;
+                Ok(Leaf::Step(Step::Slice { start, end }))
+            }
+            other => Err(format!(
+                "Cannot delete {} element of array",
+                other.type_name()
+            )),
+        },
+        Value::Object(_) => match key {
+            Value::String(name) => Ok(Leaf::Step(Step::Key(name.clone()))),
+            other => Err(format!(
+                "Cannot delete {} field of object",
+                other.type_name()
+            )),
+        },
+        other => Err(format!("Cannot delete fields from {}", other.type_name())),
+    }
+}
+
+/// One `getpath` step. A number that does not fit yields `Huge` and `null`.
+fn read_step(value: &Value, key: &Value) -> Result<(Step, Value), String> {
+    match key {
+        Value::String(name) => {
+            let child = match value {
+                Value::Null | Value::Object(_) => object_field(value, name),
+                other => {
+                    return Err(format!(
+                        "Cannot index {} with string \"{name}\"",
+                        other.type_name()
+                    ))
+                }
+            };
+            Ok((Step::Key(name.clone()), child))
+        }
+        Value::Number(text) => {
+            let shown = canonical_number(text);
+            match array_index(&shown) {
+                Some(index) => {
+                    let child = match value {
+                        Value::Null => Value::Null,
+                        Value::Array(items) => nth_value(items, index),
+                        other => {
+                            return Err(format!("Cannot index {} with number", other.type_name()))
+                        }
+                    };
+                    Ok((index_step(index, &shown), child))
+                }
+                None => {
+                    if matches!(value, Value::Null | Value::Array(_)) {
+                        Ok((Step::Huge(shown), Value::Null))
+                    } else {
+                        Err(format!("Cannot index {} with number", value.type_name()))
+                    }
+                }
+            }
+        }
+        Value::Object(fields) => {
+            if !matches!(value, Value::Null | Value::Array(_) | Value::String(_)) {
+                return Err(format!("Cannot index {} with object", value.type_name()));
+            }
+            let (start, end) = slice_from_object(fields)?;
+            let step = Step::Slice {
+                start: start.clone(),
+                end: end.clone(),
+            };
+            let child = if matches!(value, Value::Null) {
+                Value::Null
+            } else {
+                let sliced = slice_value(value, start.as_deref(), end.as_deref())
+                    .map_err(|failure| failure.message)?;
+                sliced.into_iter().next().unwrap_or(Value::Null)
+            };
+            Ok((step, child))
+        }
+        Value::Array(_) if matches!(value, Value::Array(_)) => {
+            Err("Cannot update field at array index of array".to_string())
+        }
+        other => Err(format!(
+            "Cannot index {} with {}",
+            value.type_name(),
+            other.type_name()
+        )),
+    }
+}

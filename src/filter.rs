@@ -28,7 +28,11 @@ pub enum Op {
 pub enum Filter {
     Identity,
     Field(String),
-    Index(ArrayIndex),
+    /// A fixed bracket index, as in `.[1, 2]`. `text` is the spelling `path` prints.
+    Index {
+        at: ArrayIndex,
+        text: String,
+    },
     /// `.[start:end]`. `None` means that side was left off.
     Slice {
         start: Option<String>,
@@ -164,6 +168,16 @@ pub enum Filter {
         path: Box<Filter>,
         expr: Box<Filter>,
     },
+    /// `path(expr)`.
+    PathOf(Box<Filter>),
+    /// `paths`, or `paths(expr)` when the filter is present.
+    Paths(Option<Box<Filter>>),
+    /// `getpath(expr)`.
+    GetPath(Box<Filter>),
+    /// `setpath(path; value)`. The value filter is the rightmost.
+    SetPath(Box<Filter>, Box<Filter>),
+    /// `delpaths(expr)`.
+    DelPaths(Box<Filter>),
 }
 
 /// How an update writes. `Modify` is `|=`. `Alt` is `//=`.
@@ -280,7 +294,7 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
     match filter {
         Filter::Identity => Ok(vec![input.clone()]),
         Filter::Field(key) => index_string(input, key),
-        Filter::Index(index) => index_number(input, index),
+        Filter::Index { at, .. } => index_number(input, at),
         Filter::Slice { start, end } => slice(input, start.as_deref(), end.as_deref()),
         Filter::Iterate => iterate(input),
         Filter::Recurse => Ok(recurse(input)),
@@ -400,6 +414,11 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::Raise(arg) => eval_raise(arg, input, env),
         Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
         Filter::Update { op, path, expr } => update::eval_update(*op, path, expr, input, env),
+        Filter::PathOf(inner) => update::eval_path_of(inner, input, env),
+        Filter::Paths(pred) => update::eval_paths(pred.as_deref(), input, env),
+        Filter::GetPath(arg) => update::eval_getpath(arg, input, env),
+        Filter::SetPath(path, value) => update::eval_setpath(path, value, input, env),
+        Filter::DelPaths(arg) => update::eval_delpaths(arg, input, env),
     }
 }
 
@@ -1699,7 +1718,8 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
     match filter {
         Filter::Identity
         | Filter::Field(_)
-        | Filter::Index(_)
+        | Filter::Index { .. }
+        | Filter::Paths(None)
         | Filter::Slice { .. }
         | Filter::Iterate
         | Filter::Recurse
@@ -1763,6 +1783,14 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         Filter::Update { path, expr, .. } => {
             check_vars(path, scope)?;
             check_vars(expr, scope)
+        }
+        Filter::PathOf(inner) | Filter::GetPath(inner) | Filter::DelPaths(inner) => {
+            check_vars(inner, scope)
+        }
+        Filter::Paths(Some(inner)) => check_vars(inner, scope),
+        Filter::SetPath(path, value) => {
+            check_vars(path, scope)?;
+            check_vars(value, scope)
         }
         Filter::Interpolate(pieces) => {
             for piece in pieces {
@@ -2198,6 +2226,20 @@ impl<'a> Parser<'a> {
                     path: self.parse_one_arg()?,
                     expr: Box::new(Filter::Empty),
                 }),
+                "path" => self.parse_fixed_call(at, "path", 1, |args| {
+                    Filter::PathOf(args.into_iter().next().expect("one arg"))
+                }),
+                "paths" => self.parse_paths(at),
+                "getpath" => self.parse_fixed_call(at, "getpath", 1, |args| {
+                    Filter::GetPath(args.into_iter().next().expect("one arg"))
+                }),
+                "setpath" => self.parse_fixed_call(at, "setpath", 2, |args| {
+                    let mut args = args.into_iter();
+                    Filter::SetPath(args.next().expect("path"), args.next().expect("value"))
+                }),
+                "delpaths" => self.parse_fixed_call(at, "delpaths", 1, |args| {
+                    Filter::DelPaths(args.into_iter().next().expect("one arg"))
+                }),
                 "if" if !self.reject_block => self.parse_if(),
                 "reduce" if !self.reject_block => self.parse_fold(false),
                 "foreach" if !self.reject_block => self.parse_fold(true),
@@ -2250,6 +2292,40 @@ impl<'a> Parser<'a> {
 
     fn undefined(&self, at: usize, name: &str, arity: usize) -> ProgramError {
         report_at(self.src, at, &format!("{name}/{arity} is not defined"))
+    }
+
+    /// A call of exactly `arity` filters. No parentheses is `name/0`.
+    fn parse_fixed_call(
+        &mut self,
+        at: usize,
+        name: &str,
+        arity: usize,
+        build: impl FnOnce(Vec<Box<Filter>>) -> Filter,
+    ) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return Err(self.undefined(at, name, 0));
+        }
+        let args = self.parse_call_args()?;
+        if args.len() != arity {
+            return Err(self.undefined(at, name, args.len()));
+        }
+        Ok(build(args))
+    }
+
+    /// `paths` takes no parentheses. `paths(expr)` takes one filter.
+    fn parse_paths(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return Ok(Filter::Paths(None));
+        }
+        let args = self.parse_call_args()?;
+        if args.len() != 1 {
+            return Err(self.undefined(at, "paths", args.len()));
+        }
+        Ok(Filter::Paths(Some(
+            args.into_iter().next().expect("one arg"),
+        )))
     }
 
     /// Arguments of one call, separated by `;`. The count is how many
@@ -3322,11 +3398,12 @@ fn filter_from_brackets(toks: Vec<BracketTok>) -> Result<Filter, ProgramError> {
         match tok {
             BracketTok::Comma if !expect_value => expect_value = true,
             BracketTok::Num(literal) if expect_value => {
-                let index = match array_index(&literal) {
+                let text = canonical_number(&literal);
+                let at = match array_index(&text) {
                     Some(index) => ArrayIndex::At(index),
                     None => ArrayIndex::OutOfRange,
                 };
-                items.push(Filter::Index(index));
+                items.push(Filter::Index { at, text });
                 expect_value = false;
             }
             _ => return Err(ProgramError::Syntax),
@@ -3417,6 +3494,23 @@ fn at_key(base: Option<Filter>, key: Filter) -> Filter {
         key: Box::new(key),
         optional: false,
     }
+}
+
+/// The number text jq prints for a literal. Slice bounds stay raw in the
+/// step so the slice math is unchanged, and `path` asks for this spelling.
+fn canonical_number(literal: &str) -> String {
+    let literal = literal.strip_prefix('\u{1}').unwrap_or(literal);
+    match crate::parse_stream(literal.as_bytes()) {
+        Ok(parsed) if parsed.error.is_none() => match parsed.values.as_slice() {
+            [one] => match &one.value {
+                Value::Number(text) => return text.clone(),
+                _ => {}
+            },
+            _ => {}
+        },
+        _ => {}
+    }
+    literal.to_string()
 }
 
 fn number_value(token: &str) -> Result<Value, ProgramError> {
@@ -3548,7 +3642,12 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::Pow10
         | Filter::Error
         | Filter::Raise(_)
-        | Filter::Try { .. } => true,
+        | Filter::Try { .. }
+        | Filter::PathOf(_)
+        | Filter::Paths(_)
+        | Filter::GetPath(_)
+        | Filter::SetPath(_, _)
+        | Filter::DelPaths(_) => true,
         Filter::Optional(inner) => forbids_call(inner),
         Filter::Pipe(_, right) => call_blocked(right),
         _ => false,

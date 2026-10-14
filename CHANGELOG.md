@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+`path(expr)` is the path from the input to each value `expr` reaches, as an array. A string is a field, a number is an index, and an object is a slice. `paths` lists every path inside the input except the empty path to the input itself. `paths(expr)` keeps a path once for each truthy value `expr` produces. `expr` is tried on the input first, so a failure there yields nothing else.
+
+`getpath(path)` reads the value at one path. `setpath(path; value)` writes it, and builds the missing objects and arrays along the way. The value runs outermost, and each path is tried again for every value. `delpaths(paths)` removes every path in one array. Indexes are the ones from before any path was removed. A path jq refuses, or a value of the wrong kind, fails the way jq fails, and the exit status is 5. `getpath` works on the left of an update.
+
+Of the 447 programs in jq 1.7.1's test file, 234 come out the same.
+
 ## 0.5.0
 
 Released on 2026-10-14.
