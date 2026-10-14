@@ -245,7 +245,7 @@ fn fields(items: &[Value]) -> Option<Tm> {
         let Value::Number(text) = &items[index] else {
             return None;
         };
-        let raw = c_cast_i32(as_f64(text));
+        let raw = number::c_cast_i32(as_f64(text));
         match index {
             0 => tm.tm_year = raw.wrapping_sub(1900),
             1 => tm.tm_mon = raw,
@@ -261,7 +261,7 @@ fn fields(items: &[Value]) -> Option<Tm> {
 }
 
 fn broken_down(ts: f64, local: bool) -> Result<Tm, String> {
-    let clock = c_cast_i64(ts);
+    let clock = number::c_cast_i64(ts);
     let mut tm = blank();
     let ptr = unsafe {
         if local {
@@ -481,34 +481,5 @@ fn computed(n: f64) -> Value {
 }
 
 fn as_f64(text: &str) -> f64 {
-    match number::real(text) {
-        number::Real::Nan => f64::NAN,
-        number::Real::Num(n) => n,
-    }
-}
-
-/// x86 `cvttsd2si` yields the indefinite integer for NaN and for a value
-/// that does not fit. The other architectures saturate, and NaN becomes 0.
-fn c_cast_i64(n: f64) -> i64 {
-    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && out_of_i64(n) {
-        i64::MIN
-    } else {
-        n as i64
-    }
-}
-
-fn c_cast_i32(n: f64) -> i32 {
-    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && out_of_i32(n) {
-        i32::MIN
-    } else {
-        n as i32
-    }
-}
-
-fn out_of_i64(n: f64) -> bool {
-    !n.is_finite() || n >= i64::MAX as f64 || n < i64::MIN as f64
-}
-
-fn out_of_i32(n: f64) -> bool {
-    !n.is_finite() || n >= i32::MAX as f64 + 1.0 || n < i32::MIN as f64
+    number::f64_of(text)
 }

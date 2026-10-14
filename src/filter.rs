@@ -4,6 +4,7 @@
 mod update;
 
 use crate::date;
+use crate::math::{self, Kind};
 use crate::number::{self, array_index, slice_bound};
 use crate::print::{self, Layout, Style};
 use crate::value::Value;
@@ -136,6 +137,14 @@ pub enum Filter {
     StrpTime(Box<Filter>),
     /// `now`
     Now,
+    /// `floor`, `sqrt`, and the other one-number libm functions.
+    Math1(math::Unary),
+    /// `pow`, `atan2`, `ldexp`, and the other two-argument libm functions.
+    /// The second filter runs outermost and is not run again for each value
+    /// of the first. The first runs again for every value of the second.
+    Math2(math::Binary, Box<Filter>, Box<Filter>),
+    /// `fma(x; y; z)`. The third filter runs outermost.
+    Math3(Box<Filter>, Box<Filter>, Box<Filter>),
     /// `error` with no argument. Raises the current input.
     Error,
     /// `error(expr)`. A call written after it is a syntax error.
@@ -367,6 +376,18 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
         Filter::StrfLocalTime(arg) => eval_strflocaltime(arg, input, env),
         Filter::StrpTime(arg) => eval_strptime(arg, input, env),
         Filter::Now => Ok(vec![date::now()]),
+        Filter::Math1(op) => one(apply_unary(*op, input)),
+        Filter::Math2(op, left, right) => eval_math(&[left, right], input, env, |args| {
+            let x = number_required(&args[0])?;
+            let y = number_required(&args[1])?;
+            Ok(from_f64(math::binary(*op, x, y)))
+        }),
+        Filter::Math3(x, y, z) => eval_math(&[x, y, z], input, env, |args| {
+            let x = number_required(&args[0])?;
+            let y = number_required(&args[1])?;
+            let z = number_required(&args[2])?;
+            Ok(from_f64(math::fma(x, y, z)))
+        }),
         Filter::Error => Err(raise(input.clone())),
         Filter::Raise(arg) => eval_raise(arg, input, env),
         Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
@@ -971,6 +992,74 @@ fn one(result: Result<Value, String>) -> Result<Vec<Value>, Failure> {
     result.map(|value| vec![value]).map_err(fail)
 }
 
+fn number_required(value: &Value) -> Result<f64, String> {
+    match value {
+        Value::Number(text) => Ok(number::f64_of(text)),
+        other => Err(format!(
+            "{} ({}) number required",
+            other.type_name(),
+            shown(other)
+        )),
+    }
+}
+
+fn from_f64(n: f64) -> Value {
+    Value::Number(number::mark_f64(number::format_jq_f64(n)))
+}
+
+fn apply_unary(op: math::Unary, input: &Value) -> Result<Value, String> {
+    let n = number_required(input)?;
+    Ok(match math::unary(op, n) {
+        math::Out::Num(n) => from_f64(n),
+        math::Out::Pair(first, second) => Value::Array(vec![from_f64(first), from_f64(second)]),
+    })
+}
+
+/// The rightmost argument is the outer loop. An argument is run again for
+/// every value of the arguments to its right. The first failure stops the
+/// rest, and values already produced stay.
+fn eval_math(
+    args: &[&Filter],
+    input: &Value,
+    env: &[(String, Value)],
+    apply: impl Fn(&[Value]) -> Result<Value, String>,
+) -> Result<Vec<Value>, Failure> {
+    let mut out = Vec::new();
+    let mut acc = vec![Value::Null; args.len()];
+    fill_math(args, args.len(), &mut acc, input, env, &apply, &mut out)?;
+    Ok(out)
+}
+
+fn fill_math(
+    args: &[&Filter],
+    index: usize,
+    acc: &mut [Value],
+    input: &Value,
+    env: &[(String, Value)],
+    apply: &impl Fn(&[Value]) -> Result<Value, String>,
+    out: &mut Vec<Value>,
+) -> Result<(), Failure> {
+    if index == 0 {
+        return match apply(acc) {
+            Ok(value) => {
+                out.push(value);
+                Ok(())
+            }
+            Err(message) => Err(fresh(std::mem::take(out), message)),
+        };
+    }
+    let slot = index - 1;
+    let (values, err) = parts(eval_in(args[slot], input, env));
+    for value in values {
+        acc[slot] = value;
+        fill_math(args, slot, acc, input, env, apply, out)?;
+    }
+    match err {
+        Some(failure) => Err(with_partial(std::mem::take(out), failure)),
+        None => Ok(()),
+    }
+}
+
 fn eval_strftime(
     arg: &Filter,
     input: &Value,
@@ -1394,10 +1483,8 @@ fn negate_value(value: &Value) -> Result<Value, String> {
             shown(value)
         ));
     };
-    let negated = match number::real(text) {
-        number::Real::Nan => return Ok(Value::Number(number::mark_f64(number::nan_text()))),
-        number::Real::Num(n) => -n,
-    };
+    // The sign bit flips, including NaN and zero. `-(nan)` is a negative NaN.
+    let negated = -number::f64_of(text);
     Ok(Value::Number(number::mark_f64(number::format_jq_f64(
         negated,
     ))))
@@ -1613,6 +1700,7 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::LocalTime
         | Filter::MkTime
         | Filter::Now
+        | Filter::Math1(_)
         | Filter::Error => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
@@ -1680,6 +1768,15 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         Filter::At { base, key, .. } => {
             check_vars(base, scope)?;
             check_vars(key, scope)
+        }
+        Filter::Math2(_, left, right) => {
+            check_vars(left, scope)?;
+            check_vars(right, scope)
+        }
+        Filter::Math3(x, y, z) => {
+            check_vars(x, scope)?;
+            check_vars(y, scope)?;
+            check_vars(z, scope)
         }
         Filter::If { cond, yes, no } => {
             check_vars(cond, scope)?;
@@ -2042,7 +2139,11 @@ impl<'a> Parser<'a> {
             return self.parse_number();
         }
         if self.starts_ident() {
+            let at = self.index;
             let name = self.ident()?;
+            if let Some(filter) = self.parse_math(at, &name)? {
+                return Ok(filter);
+            }
             return match name.as_str() {
                 "true" => Ok(Filter::Literal(Value::Bool(true))),
                 "false" => Ok(Filter::Literal(Value::Bool(false))),
@@ -2085,6 +2186,76 @@ impl<'a> Parser<'a> {
             };
         }
         Err(ProgramError::Syntax)
+    }
+
+    /// A math name, when `name` is one. `pow` with no call is `pow/0`.
+    /// A call whose arguments parse, but not to the arity jq defined, is
+    /// `name/n is not defined`. A call that does not parse is a syntax error.
+    fn parse_math(&mut self, at: usize, name: &str) -> Result<Option<Filter>, ProgramError> {
+        let Some(kind) = math::kind(name) else {
+            return Ok(None);
+        };
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return match kind {
+                Kind::Unary(op) => Ok(Some(Filter::Math1(op))),
+                Kind::Binary(_) | Kind::Fma => Err(self.undefined(at, name, 0)),
+            };
+        }
+        let args = self.parse_call_args()?;
+        let arity = args.len();
+        match kind {
+            Kind::Unary(_) => Err(self.undefined(at, name, arity)),
+            Kind::Binary(op) if arity == 2 => {
+                let mut args = args.into_iter();
+                Ok(Some(Filter::Math2(
+                    op,
+                    args.next().expect("two args"),
+                    args.next().expect("two args"),
+                )))
+            }
+            Kind::Binary(_) => Err(self.undefined(at, name, arity)),
+            Kind::Fma if arity == 3 => {
+                let mut args = args.into_iter();
+                Ok(Some(Filter::Math3(
+                    args.next().expect("three args"),
+                    args.next().expect("three args"),
+                    args.next().expect("three args"),
+                )))
+            }
+            Kind::Fma => Err(self.undefined(at, name, arity)),
+        }
+    }
+
+    fn undefined(&self, at: usize, name: &str, arity: usize) -> ProgramError {
+        report_at(self.src, at, &format!("{name}/{arity} is not defined"))
+    }
+
+    /// Arguments of one call, separated by `;`. The count is how many
+    /// expressions parsed, which is the arity jq reports.
+    fn parse_call_args(&mut self) -> Result<Vec<Box<Filter>>, ProgramError> {
+        if !self.eat('(') {
+            return Err(ProgramError::Syntax);
+        }
+        let saved_block = self.reject_block;
+        let saved_try = self.reject_try;
+        self.reject_block = false;
+        self.reject_try = false;
+        let parsed = self.parse_separated_args();
+        self.reject_block = saved_block;
+        self.reject_try = saved_try;
+        parsed
+    }
+
+    fn parse_separated_args(&mut self) -> Result<Vec<Box<Filter>>, ProgramError> {
+        let mut args = vec![Box::new(self.parse_pipe()?)];
+        while self.eat(';') {
+            args.push(Box::new(self.parse_pipe()?));
+        }
+        if !self.eat(')') {
+            return Err(ProgramError::Syntax);
+        }
+        Ok(args)
     }
 
     /// One filter argument, as in `has(expr)`. A second argument, separated
@@ -3349,6 +3520,9 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::StrfLocalTime(_)
         | Filter::StrpTime(_)
         | Filter::Now
+        | Filter::Math1(_)
+        | Filter::Math2(_, _, _)
+        | Filter::Math3(_, _, _)
         | Filter::Error
         | Filter::Raise(_)
         | Filter::Try { .. } => true,

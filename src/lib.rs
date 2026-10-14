@@ -3,6 +3,7 @@
 mod date;
 mod error;
 mod filter;
+pub mod math;
 mod number;
 mod parse;
 mod print;

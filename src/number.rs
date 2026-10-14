@@ -15,6 +15,7 @@ const DBL_MAX: &str = "1.7976931348623157e+308";
 const POS_INF: &str = "\u{0}+";
 const NEG_INF: &str = "\u{0}-";
 const NAN_TEXT: &str = "\u{0}n";
+const NEG_NAN_TEXT: &str = "\u{0}N";
 
 pub fn pos_inf() -> String {
     POS_INF.to_string()
@@ -28,6 +29,14 @@ pub fn nan_text() -> String {
     NAN_TEXT.to_string()
 }
 
+pub fn neg_nan_text() -> String {
+    NEG_NAN_TEXT.to_string()
+}
+
+fn is_nan_body(text: &str) -> bool {
+    text == NAN_TEXT || text == NEG_NAN_TEXT
+}
+
 pub fn write_number(out: &mut String, text: &str) {
     let text = body(text);
     if text == POS_INF {
@@ -35,7 +44,7 @@ pub fn write_number(out: &mut String, text: &str) {
     } else if text == NEG_INF {
         out.push('-');
         out.push_str(DBL_MAX);
-    } else if text == NAN_TEXT {
+    } else if is_nan_body(text) {
         out.push_str("null");
     } else {
         out.push_str(text);
@@ -71,7 +80,7 @@ pub fn jq_dtoi(n: f64) -> i64 {
 
 pub fn real(text: &str) -> Real {
     let text = body(text);
-    if text == NAN_TEXT {
+    if is_nan_body(text) {
         return Real::Nan;
     }
     if text == POS_INF {
@@ -85,6 +94,51 @@ pub fn real(text: &str) -> Real {
         Ok(n) => Real::Num(n),
         Err(_) => Real::Nan,
     }
+}
+
+/// The binary64 value, including the sign of a NaN or a zero.
+/// `real` folds both NaN signs together because they compare the same.
+pub fn f64_of(text: &str) -> f64 {
+    let text = body(text);
+    if text == NEG_NAN_TEXT {
+        return -f64::NAN;
+    }
+    if text == NAN_TEXT {
+        return f64::NAN;
+    }
+    if text == POS_INF {
+        return f64::INFINITY;
+    }
+    if text == NEG_INF {
+        return f64::NEG_INFINITY;
+    }
+    text.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// x86 `cvttsd2si` yields the indefinite integer for NaN and for a value
+/// that does not fit. The other architectures saturate, and NaN becomes 0.
+pub(crate) fn c_cast_i64(n: f64) -> i64 {
+    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && out_of_i64(n) {
+        i64::MIN
+    } else {
+        n as i64
+    }
+}
+
+pub(crate) fn c_cast_i32(n: f64) -> i32 {
+    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && out_of_i32(n) {
+        i32::MIN
+    } else {
+        n as i32
+    }
+}
+
+fn out_of_i64(n: f64) -> bool {
+    !n.is_finite() || n >= i64::MAX as f64 || n < i64::MIN as f64
+}
+
+fn out_of_i32(n: f64) -> bool {
+    !n.is_finite() || n >= i32::MAX as f64 + 1.0 || n < i32::MIN as f64
 }
 
 /// An arithmetic result. Its printed text is not the preserved literal.
@@ -117,7 +171,7 @@ pub fn cmp_number_text(left: &str, right: &str) -> i8 {
 }
 
 fn is_finite_decimal(text: &str) -> bool {
-    !matches!(text, POS_INF | NEG_INF | NAN_TEXT)
+    !matches!(text, POS_INF | NEG_INF | NAN_TEXT | NEG_NAN_TEXT)
 }
 
 fn cmp_real(left: Real, right: Real) -> i8 {
@@ -215,7 +269,11 @@ fn cmp_mag(left: &str, left_scale: i64, right: &str, right_scale: i64) -> i8 {
 /// Literals keep `normalize`; this is only for results of operators.
 pub fn format_jq_f64(n: f64) -> String {
     if n.is_nan() {
-        return nan_text();
+        return if n.is_sign_negative() {
+            neg_nan_text()
+        } else {
+            nan_text()
+        };
     }
     if n.is_infinite() {
         return if n.is_sign_negative() {
@@ -325,7 +383,7 @@ fn format_digits(digits: &str, decpt: i32) -> String {
 /// `None` means the magnitude does not fit in an array index.
 pub fn array_index(literal: &str) -> Option<i64> {
     let literal = body(literal);
-    if matches!(literal, POS_INF | NEG_INF | NAN_TEXT) {
+    if matches!(literal, POS_INF | NEG_INF | NAN_TEXT | NEG_NAN_TEXT) {
         return None;
     }
     let bytes = literal.as_bytes();
