@@ -29,6 +29,16 @@ pub(super) fn eval_in(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    super::stream::collect(filter, input, env)
+}
+
+/// One filter, run to the end. `stream` stops a `pipe` or a `comma` early.
+/// Calling this on those two goes through `stream` as well.
+pub(super) fn produce(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
     match filter {
         Filter::Identity => Ok(vec![input.clone()]),
         Filter::Field(key) => index_string(input, key),
@@ -40,27 +50,8 @@ pub(super) fn eval_in(
             Ok(values) => Ok(values),
             Err(failure) => Ok(failure.partial),
         },
-        Filter::Pipe(left, right) => {
-            // Values already produced on the left are still fed to the right.
-            // A right-hand error stops before the left-hand error is reported.
-            let (inputs, left_err) = parts(eval_in(left, input, env));
-            let mut out = Vec::new();
-            for value in inputs {
-                match eval_in(right, &value, env) {
-                    Ok(more) => out.extend(more),
-                    Err(failure) => return Err(extend_err(out, failure)),
-                }
-            }
-            finish(out, left_err)
-        }
-        Filter::Comma(left, right) => {
-            let mut out = eval_in(left, input, env)?;
-            match eval_in(right, input, env) {
-                Ok(more) => out.extend(more),
-                Err(failure) => return Err(extend_err(out, failure)),
-            }
-            Ok(out)
-        }
+        Filter::Pipe(left, right) => super::stream::pipe_values(left, right, input, env),
+        Filter::Comma(left, right) => super::stream::comma_values(left, right, input, env),
         Filter::Literal(value) => Ok(vec![value.clone()]),
         Filter::Interpolate(pieces) => eval_interpolate(pieces, input, env),
         Filter::Collect(inner) => match eval_in(inner, input, env) {
@@ -159,6 +150,18 @@ pub(super) fn eval_in(
         Filter::GetPath(arg) => super::update::eval_getpath(arg, input, env),
         Filter::SetPath(path, value) => super::update::eval_setpath(path, value, input, env),
         Filter::DelPaths(arg) => super::update::eval_delpaths(arg, input, env),
+        Filter::Limit(count, expr) => super::stream::limit_values(count, expr, input, env),
+        Filter::First(expr) => super::stream::first_values(expr.as_deref(), input, env),
+        Filter::Last(expr) => super::stream::last_values(expr.as_deref(), input, env),
+        Filter::Nth { index, expr } => {
+            super::stream::nth_values(index, expr.as_deref(), input, env)
+        }
+        Filter::Range { from, to, step } => {
+            super::stream::range_values(from.as_deref(), to, step.as_deref(), input, env)
+        }
+        Filter::Until(cond, next) => super::stream::until_values(cond, next, input, env),
+        Filter::While(cond, update) => super::stream::while_values(cond, update, input, env),
+        Filter::Repeat(expr) => super::stream::repeat_values(expr, input, env),
     }
 }
 

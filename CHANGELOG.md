@@ -8,7 +8,15 @@
 
 `strftime`, `strflocaltime`, and `strptime` also accept `%A`, `%B`, `%I`, `%p`, `%u`, `%w`, `%s`, `%D`, `%F`, `%T`, `%R`, `%c`, and `%%`. `%A` and `%B` are the full weekday and month. `%I` is the hour from 01 to 12 and `%p` is the morning or afternoon mark. `%u` counts Monday as 1 and `%w` counts Sunday as 0. `%s` is seconds since the epoch. `%D`, `%F`, `%T`, and `%R` are the short date, the calendar date, the time, and the hour and minute. `%c` is the locale's date and time. `%%` is a percent sign. A letter still outside that set is rejected. The message names it and the exit status is 5.
 
-Of the 447 programs in jq 1.7.1's test file, 235 come out the same.
+`limit(n; expr)` keeps values from `expr` and does not run the rest. A count of 0 keeps nothing and does not run `expr`. A negative count, `nan`, `null`, or a boolean keeps every value. A positive finite count keeps the ceiling of that many. A count that is not a number fails when subtracted from, after the stream has produced a value, unless the stream fails first.
+
+`first` is `.[0]` and `last` is `.[-1]`. `nth(n)` is `.[n]`. `first(expr)` is the first value `expr` produces and does not run a later one. `last(expr)` is the last value, or `null` when `expr` yields nothing. `nth(n; expr)` counts from 0. A negative index, `nan`, `null`, or a boolean fails with `nth doesn't support negative indices`, and the exit status is 5. An index past the end produces nothing.
+
+`range(to)` counts from 0 up to but not including `to`. `range(from; to)` steps by 1. `range(from; to; step)` uses `step`. A step of 0 produces nothing. A bound that is not a number fails with `Range bounds must be numeric`, and the exit status is 5. With one or two arguments, an end of `nan` does not stop the count. With three, it does.
+
+`until(cond; next)` yields the first value for which `cond` is truthy. `while(cond; update)` yields a value while `cond` is truthy and then applies `update`. Each result of `cond`, `next`, and `update` is its own branch. `repeat(expr)` runs `expr` on the original input and then repeats. `first`, `last`, and `nth(n)` can be updated, and so can `first(expr)`, `nth(n; expr)`, and `limit(n; expr)` when the value was reached through the input. Setting a `nan` index fails with `Cannot set array element at NaN index`.
+
+Of the 447 programs in jq 1.7.1's test file, 270 come out the same.
 
 ## 0.5.0
 

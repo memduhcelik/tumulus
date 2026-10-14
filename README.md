@@ -18,7 +18,7 @@ chmod +x tumulus
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 235 come out the same on stdout, stderr, and the exit status.
+`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 270 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -62,6 +62,8 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `path(expr)` is the path from the input to each value `expr` reaches, as an array. A string is a field, a number is an index, and an object is a slice. `paths` lists every path inside the input except the empty path to the input itself. `paths(expr)` keeps a path once for each truthy value `expr` produces. `getpath(path)` reads the value at one path. `setpath(path; value)` writes it, and builds the missing objects and arrays along the way. `delpaths(paths)` removes every path in one array. A path jq refuses, or a value of the wrong kind, fails the way jq fails, and the exit status is 5. `getpath` works on the left of an update.
 
+`limit(n; expr)` keeps values from `expr`. A count of 0 keeps nothing and does not run `expr`. A negative count, `nan`, `null`, or a boolean keeps the whole stream. A positive finite count keeps the ceiling of that many and stops before a later value is run. A count that is not a number fails when it is subtracted from, unless the stream fails first. `first` is `.[0]` and `last` is `.[-1]`. `nth(n)` is `.[n]`. `first(expr)` is the first value of `expr` and does not run the rest. `last(expr)` is the last value, or `null` when there is none. `nth(n; expr)` picks one value. A negative `n`, `nan`, `null`, or a boolean fails with `nth doesn't support negative indices`. Past the end of the stream there is no value. `range(to)` counts from 0 up to but not including `to`. `range(from; to)` steps by 1. `range(from; to; step)` uses that step. A step of 0 yields nothing. A bound that is not a number fails with `Range bounds must be numeric`. With one or two arguments, an end of `nan` does not stop the count. `until(cond; next)` yields the value once `cond` is truthy. `while(cond; update)` yields the value while `cond` is truthy, then applies `update`. Each result of a condition or an update is its own branch. `repeat(expr)` runs `expr` on the original input, then repeats. `first`, `last`, `nth(n)`, `first(expr)`, `nth(n; expr)`, and `limit(n; expr)` are paths when the value they select was reached through the input. Setting a `nan` index fails with `Cannot set array element at NaN index`. The exit status is 5.
+
 `try expr` keeps every value `expr` produced before it failed, then stops. That is the same as `try expr catch empty`. `try expr catch handler` runs `handler` on the error value instead. A builtin failure is caught as its message. `error` raises the current input, and `error(expr)` raises the first value `expr` produces. When nothing catches the error, a string is printed as `jq: error (at ...): ` and that text. Any other value is printed as `jq: error (at ...) (not a string): ` and the compact JSON. The exit status is 5 when that input is the last one.
 
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
@@ -99,6 +101,14 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 | 1 | 3.67 | 2.36 | 7.29 | 2.45 |
 | 2 | 3.66 | 2.33 | 7.35 | 2.44 |
 | 3 | 3.67 | 2.33 | 7.32 | 2.46 |
+
+`[.features[] | select(.properties.STREET == "UNKNOWN")] | length` reads that same file and prints `2843`. Compact and pretty printing of that number are the same text, so these runs used `-c`.
+
+| run | `jq -c` | `tumulus -c` |
+| --- | ---: | ---: |
+| 1 | 2.77 | 4.47 |
+| 2 | 2.74 | 4.19 |
+| 3 | 2.73 | 4.11 |
 
 Times are seconds.
 

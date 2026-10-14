@@ -57,7 +57,9 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Math1(_)
         | Filter::Abs
         | Filter::Pow10
-        | Filter::Error => Ok(()),
+        | Filter::Error
+        | Filter::First(None)
+        | Filter::Last(None) => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -141,6 +143,30 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             check_vars(x, scope)?;
             check_vars(y, scope)?;
             check_vars(z, scope)
+        }
+        Filter::Limit(count, expr) | Filter::Until(count, expr) | Filter::While(count, expr) => {
+            check_vars(count, scope)?;
+            check_vars(expr, scope)
+        }
+        Filter::First(Some(inner)) | Filter::Last(Some(inner)) | Filter::Repeat(inner) => {
+            check_vars(inner, scope)
+        }
+        Filter::Nth { index, expr } => {
+            check_vars(index, scope)?;
+            if let Some(expr) = expr {
+                check_vars(expr, scope)?;
+            }
+            Ok(())
+        }
+        Filter::Range { from, to, step } => {
+            if let Some(from) = from {
+                check_vars(from, scope)?;
+            }
+            check_vars(to, scope)?;
+            if let Some(step) = step {
+                check_vars(step, scope)?;
+            }
+            Ok(())
         }
         Filter::If { cond, yes, no } => {
             check_vars(cond, scope)?;
@@ -557,6 +583,14 @@ impl<'a> Parser<'a> {
                 "delpaths" => self.parse_fixed_call(at, "delpaths", 1, |args| {
                     Filter::DelPaths(args.into_iter().next().expect("one arg"))
                 }),
+                "limit" => self.parse_limit(at),
+                "first" => self.parse_optional_call(at, "first", Filter::First),
+                "last" => self.parse_optional_call(at, "last", Filter::Last),
+                "nth" => self.parse_nth(at),
+                "range" => self.parse_range(at),
+                "until" => self.parse_pair(at, "until", Filter::Until),
+                "while" => self.parse_pair(at, "while", Filter::While),
+                "repeat" => self.parse_repeat(at),
                 "if" if !self.reject_block => self.parse_if(),
                 "reduce" if !self.reject_block => self.parse_fold(false),
                 "foreach" if !self.reject_block => self.parse_fold(true),
@@ -628,6 +662,100 @@ impl<'a> Parser<'a> {
             return Err(self.undefined(at, name, args.len()));
         }
         Ok(build(args))
+    }
+
+    /// `limit(count; expr)`.
+    fn parse_limit(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, "limit", &[2])?;
+        let mut args = args.into_iter();
+        Ok(Filter::Limit(
+            args.next().expect("count"),
+            args.next().expect("expr"),
+        ))
+    }
+
+    /// `first` and `last` take no filter, or one.
+    fn parse_optional_call(
+        &mut self,
+        at: usize,
+        name: &str,
+        build: fn(Option<Box<Filter>>) -> Filter,
+    ) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, name, &[0, 1])?;
+        Ok(build(args.into_iter().next()))
+    }
+
+    fn parse_nth(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, "nth", &[1, 2])?;
+        let mut args = args.into_iter();
+        Ok(Filter::Nth {
+            index: args.next().expect("index"),
+            expr: args.next(),
+        })
+    }
+
+    fn parse_range(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, "range", &[1, 2, 3])?;
+        let mut args = args.into_iter();
+        Ok(match args.len() {
+            1 => Filter::Range {
+                from: None,
+                to: args.next().expect("to"),
+                step: None,
+            },
+            2 => Filter::Range {
+                from: Some(args.next().expect("from")),
+                to: args.next().expect("to"),
+                step: None,
+            },
+            _ => Filter::Range {
+                from: Some(args.next().expect("from")),
+                to: args.next().expect("to"),
+                step: Some(args.next().expect("step")),
+            },
+        })
+    }
+
+    fn parse_pair(
+        &mut self,
+        at: usize,
+        name: &str,
+        build: fn(Box<Filter>, Box<Filter>) -> Filter,
+    ) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, name, &[2])?;
+        let mut args = args.into_iter();
+        Ok(build(
+            args.next().expect("left"),
+            args.next().expect("right"),
+        ))
+    }
+
+    fn parse_repeat(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        let args = self.parse_some_call(at, "repeat", &[1])?;
+        Ok(Filter::Repeat(args.into_iter().next().expect("expr")))
+    }
+
+    /// No parentheses is arity 0 when that arity exists. Otherwise it is
+    /// `name/0 is not defined`. A call whose filters parse, but not to an
+    /// arity jq defined, is `name/n is not defined`.
+    fn parse_some_call(
+        &mut self,
+        at: usize,
+        name: &str,
+        allowed: &[usize],
+    ) -> Result<Vec<Box<Filter>>, ProgramError> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            if allowed.contains(&0) {
+                return Ok(Vec::new());
+            }
+            return Err(self.undefined(at, name, 0));
+        }
+        let args = self.parse_call_args()?;
+        if !allowed.contains(&args.len()) {
+            return Err(self.undefined(at, name, args.len()));
+        }
+        Ok(args)
     }
 
     /// `paths` takes no parentheses. `paths(expr)` takes one filter.
@@ -1964,7 +2092,15 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Paths(_)
         | Filter::GetPath(_)
         | Filter::SetPath(_, _)
-        | Filter::DelPaths(_) => true,
+        | Filter::DelPaths(_)
+        | Filter::Limit(_, _)
+        | Filter::First(_)
+        | Filter::Last(_)
+        | Filter::Nth { .. }
+        | Filter::Range { .. }
+        | Filter::Until(_, _)
+        | Filter::While(_, _)
+        | Filter::Repeat(_) => true,
         Filter::Optional(inner) => forbids_call(inner),
         Filter::Pipe(_, right) => call_blocked(right),
         _ => false,

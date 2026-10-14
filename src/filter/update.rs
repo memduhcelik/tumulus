@@ -7,6 +7,7 @@ use std::cell::Cell;
 use crate::number::array_index;
 use crate::value::Value;
 
+use super::stream::{self, LimitHow, NthSpan};
 use super::{
     add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
     finish, fresh, mul_values, parts, rem_values, shown, slice as slice_value, slice_range,
@@ -17,6 +18,8 @@ enum Found {
     Path(Vec<Step>),
     /// A value that was computed instead of reached through the input.
     Broken(Value),
+    /// `.[nan]` is a path jq will print, and setting it has its own message.
+    NanIndex,
 }
 
 #[derive(Clone)]
@@ -122,6 +125,9 @@ fn collect(
                     "Invalid path expression with result {}",
                     clipped(&value, 29)
                 )));
+            }
+            Found::NanIndex => {
+                return Err(fail("Cannot set array element at NaN index".to_string()));
             }
             Found::Path(steps) => paths.push(steps),
         }
@@ -326,11 +332,17 @@ fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec
             .collect()),
         Err(err) => {
             for out in err.partial {
-                if let Found::Broken(value) = classify_one(input, out) {
-                    return Err(fail(format!(
-                        "Invalid path expression with result {}",
-                        clipped(&value, 29)
-                    )));
+                match classify_one(input, out) {
+                    Found::Broken(value) => {
+                        return Err(fail(format!(
+                            "Invalid path expression with result {}",
+                            clipped(&value, 29)
+                        )));
+                    }
+                    Found::NanIndex => {
+                        return Err(fail("Cannot set array element at NaN index".to_string()));
+                    }
+                    Found::Path(_) => {}
                 }
             }
             Err(Failure {
@@ -344,6 +356,12 @@ fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec
 
 fn classify_one(root: &Value, out: POut) -> Found {
     if out.force_broken {
+        if out.path.iter().any(|step| match step {
+            Step::Huge(text) => matches!(crate::number::real(text), crate::number::Real::Nan),
+            _ => false,
+        }) {
+            return Found::NanIndex;
+        }
         return Found::Broken(out.value);
     }
     if out.carrier {
@@ -408,7 +426,275 @@ fn run(
         Filter::Try { body, handler } => {
             run_try(body, handler.as_deref(), input, path, line, input_gen, ctx)
         }
+        // `first` and `nth` keep the path of the value they select. `last(expr)`
+        // is the value itself, so it falls through and is not a path.
+        Filter::First(None) => index_here(
+            &Value::Number("0".to_string()),
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+        ),
+        Filter::Last(None) => index_here(
+            &Value::Number("-1".to_string()),
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+        ),
+        Filter::First(Some(inner)) => run_take(inner, input, path, line, input_gen, ctx, 1),
+        Filter::Nth { index, expr: None } => {
+            run_nth_index(index, input, path, line, input_gen, ctx)
+        }
+        Filter::Nth {
+            index,
+            expr: Some(expr),
+        } => run_nth_gen(index, expr, input, path, line, input_gen, ctx),
+        Filter::Limit(count, expr) => run_limit(count, expr, input, path, line, input_gen, ctx),
         other => run_fallback(other, input, path, line, ctx),
+    }
+}
+
+/// The first `want` path outputs. A `comma` does not run its right side once
+/// `want` outputs are in hand, so `first(.[], error("z"))` does not raise.
+fn run_take(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    want: usize,
+) -> Result<Vec<POut>, PathErr> {
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    match filter {
+        Filter::Comma(left, right) => {
+            let saved = line.get();
+            let left_cell = Cell::new(saved);
+            let mut out = run_take(left, input, path, &left_cell, input_gen, ctx, want)?;
+            if out.len() >= want {
+                out.truncate(want);
+                return Ok(out);
+            }
+            let right_cell = Cell::new(saved);
+            let more = run_take(
+                right,
+                input,
+                path,
+                &right_cell,
+                input_gen,
+                ctx,
+                want - out.len(),
+            )?;
+            out.extend(more);
+            Ok(out)
+        }
+        Filter::Pipe(left, right) => {
+            run_take_pipe(left, right, input, path, line, input_gen, ctx, want)
+        }
+        Filter::Empty => Ok(Vec::new()),
+        Filter::First(Some(inner)) => {
+            run_take(inner, input, path, line, input_gen, ctx, 1.min(want))
+        }
+        other => match run(other, input, path, line, input_gen, ctx) {
+            Ok(mut outs) => {
+                if outs.len() > want {
+                    outs.truncate(want);
+                }
+                Ok(outs)
+            }
+            Err(err) if err.partial.len() >= want => {
+                let mut outs = err.partial;
+                outs.truncate(want);
+                Ok(outs)
+            }
+            Err(err) => Err(err),
+        },
+    }
+}
+
+fn run_take_pipe(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    want: usize,
+) -> Result<Vec<POut>, PathErr> {
+    if let Filter::Comma(a, b) = left {
+        let saved = line.get();
+        let left_cell = Cell::new(saved);
+        let mut out = run_take_pipe(a, right, input, path, &left_cell, input_gen, ctx, want)?;
+        if out.len() >= want {
+            out.truncate(want);
+            return Ok(out);
+        }
+        let right_cell = Cell::new(saved);
+        let more = run_take_pipe(
+            b,
+            right,
+            input,
+            path,
+            &right_cell,
+            input_gen,
+            ctx,
+            want - out.len(),
+        )?;
+        out.extend(more);
+        return Ok(out);
+    }
+    let lefts = run(left, input, path, line, input_gen, ctx)?;
+    let mut out = Vec::new();
+    for left_out in lefts {
+        if out.len() >= want {
+            break;
+        }
+        let (gen, next_gen) = if left_out.carrier {
+            (left_out.value_gen, left_out.value_gen)
+        } else {
+            (left_out.line, 0)
+        };
+        let cell = Cell::new(gen);
+        let more = run_take(
+            right,
+            &left_out.value,
+            &left_out.path,
+            &cell,
+            next_gen,
+            ctx,
+            want - out.len(),
+        )?;
+        out.extend(more);
+    }
+    if out.len() > want {
+        out.truncate(want);
+    }
+    Ok(out)
+}
+
+fn run_nth_index(
+    index: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let saved = line.get();
+    let (keys, key_err) = parts(eval_in(index, input, ctx.env));
+    line.set(saved);
+    let mut out = Vec::new();
+    for key in &keys {
+        line.set(saved);
+        match index_here(key, input, path, line, input_gen, ctx) {
+            Ok(hits) => out.extend(hits),
+            Err(err) => return Err(attach(out, err)),
+        }
+    }
+    finish_outs(out, key_err)
+}
+
+fn run_nth_gen(
+    index: &Filter,
+    expr: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let saved = line.get();
+    let (indexes, index_err) = parts(eval_in(index, input, ctx.env));
+    line.set(saved);
+    let mut out = Vec::new();
+    for index in &indexes {
+        line.set(saved);
+        match take_nth_path(index, expr, input, path, line, input_gen, ctx) {
+            Ok(more) => out.extend(more),
+            Err(err) => return Err(attach(out, err)),
+        }
+    }
+    finish_outs(out, index_err)
+}
+
+fn take_nth_path(
+    index: &Value,
+    expr: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    match stream::nth_span(index) {
+        NthSpan::Negative => Err(bare("nth doesn't support negative indices".to_string())),
+        NthSpan::Add(message) => Err(bare(message)),
+        NthSpan::Take(0) => Ok(Vec::new()),
+        NthSpan::Never => {
+            run(expr, input, path, line, input_gen, ctx)?;
+            Ok(Vec::new())
+        }
+        NthSpan::Take(need) => {
+            let outs = run_take(expr, input, path, line, input_gen, ctx, need)?;
+            if outs.len() < need {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![outs.into_iter().next_back().expect("need outputs")])
+            }
+        }
+    }
+}
+
+fn run_limit(
+    count: &Filter,
+    expr: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let saved = line.get();
+    let (counts, count_err) = parts(eval_in(count, input, ctx.env));
+    line.set(saved);
+    let mut out = Vec::new();
+    for count in &counts {
+        line.set(saved);
+        match take_limit_path(count, expr, input, path, line, input_gen, ctx) {
+            Ok(more) => out.extend(more),
+            Err(err) => return Err(attach(out, err)),
+        }
+    }
+    finish_outs(out, count_err)
+}
+
+fn take_limit_path(
+    count: &Value,
+    expr: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    match stream::limit_how(count) {
+        LimitHow::None => Ok(Vec::new()),
+        LimitHow::All => run(expr, input, path, line, input_gen, ctx),
+        LimitHow::Count(need) => run_take(expr, input, path, line, input_gen, ctx, need),
+        LimitHow::Subtract => match run_take(expr, input, path, line, input_gen, ctx, 1) {
+            Err(err) => Err(err),
+            Ok(vals) if vals.is_empty() => Ok(Vec::new()),
+            Ok(_) => match sub_values(count, &Value::Number("1".to_string())) {
+                Err(message) => Err(bare(message)),
+                Ok(_) => Ok(Vec::new()),
+            },
+        },
     }
 }
 

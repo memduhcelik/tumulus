@@ -172,6 +172,33 @@ pub enum Filter {
     SetPath(Box<Filter>, Box<Filter>),
     /// `delpaths(expr)`.
     DelPaths(Box<Filter>),
+    /// `limit(count; expr)`. `count` runs outermost. A later value of `expr`
+    /// is not run once `count` values have been kept.
+    Limit(Box<Filter>, Box<Filter>),
+    /// `first`, or `first(expr)`. No filter means `.[0]`.
+    First(Option<Box<Filter>>),
+    /// `last`, or `last(expr)`. No filter means `.[-1]`.
+    /// `last(expr)` is the last value, or `null` when `expr` yields nothing.
+    Last(Option<Box<Filter>>),
+    /// `nth(index)`, or `nth(index; expr)`. No `expr` means `.[index]`.
+    Nth {
+        index: Box<Filter>,
+        expr: Option<Box<Filter>>,
+    },
+    /// `range(to)`, `range(from; to)`, or `range(from; to; step)`.
+    /// One argument starts at 0. One or two arguments step by 1, and keep
+    /// going when the end is `nan`.
+    Range {
+        from: Option<Box<Filter>>,
+        to: Box<Filter>,
+        step: Option<Box<Filter>>,
+    },
+    /// `until(cond; next)`.
+    Until(Box<Filter>, Box<Filter>),
+    /// `while(cond; update)`.
+    While(Box<Filter>, Box<Filter>),
+    /// `repeat(expr)`. `expr` is run on the original input each time.
+    Repeat(Box<Filter>),
 }
 
 /// How an update writes. `Modify` is `|=`. `Alt` is `//=`.

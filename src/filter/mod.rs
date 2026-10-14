@@ -4,6 +4,7 @@ mod ast;
 mod builtin;
 mod eval;
 mod parse;
+mod stream;
 mod update;
 mod value;
 
