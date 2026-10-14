@@ -4569,7 +4569,7 @@ fn math_matches_jq() {
       copysign(1;-2), copysign(-1;0), copysign(1;-0), copysign(-0;1), copysign(nan;-1), copysign(1;nan),
       copysign(1; copysign(nan; -1)),
       fmax(1;2), fmax(nan;1), fmax(1;nan), fmax(nan;nan), fmax(-0;0), fmax(0;-0),
-      fmin(nan;1), fmin(1;nan), fmin(-0;0),
+      fmin(nan;1), fmin(1;nan), fmin(-0;0), fmin(0;-0), fmin(-0;-0), fmax(-0;-0),
       fdim(3;1), fdim(1;3), fdim(nan;1), fdim(1;nan),
       nextafter(1;2), nextafter(0;-1), nextafter(1;1), nextafter(nan;1), nextafter(1;nan), nextafter(-0;1),
       scalb(1;10), scalb(1;-1), scalb(1;1.9), scalb(1;nan), scalb(1;infinite), scalb(1;-infinite), scalb(-2;3),

@@ -212,8 +212,8 @@ pub fn binary(op: Binary, a: f64, b: f64) -> f64 {
             Binary::Copysign => copysign(a, b),
             Binary::Drem => drem_value(a, b),
             Binary::Fdim => fdim(a, b),
-            Binary::Fmax => fmax(a, b),
-            Binary::Fmin => fmin(a, b),
+            Binary::Fmax => fmax_value(a, b),
+            Binary::Fmin => fmin_value(a, b),
             Binary::Fmod => fmod(a, b),
             Binary::Hypot => hypot(a, b),
             Binary::Jn => jn(number::c_cast_i32(a), b),
@@ -230,6 +230,30 @@ pub fn binary(op: Binary, a: f64, b: f64) -> f64 {
 
 pub fn fma(x: f64, y: f64, z: f64) -> f64 {
     unsafe { fma_c(x, y, z) }
+}
+
+fn fmin_value(x: f64, y: f64) -> f64 {
+    if x == 0.0 && y == 0.0 {
+        // The x86 min instruction returns the second zero. jq returns a
+        // negative zero when either argument is negative.
+        return if x.is_sign_negative() || y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    unsafe { fmin(x, y) }
+}
+
+fn fmax_value(x: f64, y: f64) -> f64 {
+    if x == 0.0 && y == 0.0 {
+        return if x.is_sign_negative() && y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    unsafe { fmax(x, y) }
 }
 
 fn exp10_value(x: f64) -> f64 {
