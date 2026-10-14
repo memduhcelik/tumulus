@@ -233,27 +233,40 @@ pub fn fma(x: f64, y: f64, z: f64) -> f64 {
 }
 
 fn fmin_value(x: f64, y: f64) -> f64 {
-    if x == 0.0 && y == 0.0 {
-        // The x86 min instruction returns the second zero. jq returns a
-        // negative zero when either argument is negative.
-        return if x.is_sign_negative() || y.is_sign_negative() {
-            -0.0
-        } else {
-            0.0
-        };
+    if let Some(zero) = zero_sign(x, y, true) {
+        return zero;
     }
     unsafe { fmin(x, y) }
 }
 
 fn fmax_value(x: f64, y: f64) -> f64 {
-    if x == 0.0 && y == 0.0 {
-        return if x.is_sign_negative() && y.is_sign_negative() {
-            -0.0
-        } else {
-            0.0
-        };
+    if let Some(zero) = zero_sign(x, y, false) {
+        return zero;
     }
     unsafe { fmax(x, y) }
+}
+
+/// Both arguments are zero, so the numeric value does not decide the sign.
+/// Apple's libm picks a negative `fmin` when either zero is negative, and a
+/// negative `fmax` only when both are. glibc returns the first zero.
+fn zero_sign(x: f64, y: f64, min: bool) -> Option<f64> {
+    if x != 0.0 || y != 0.0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let negative = if min {
+            x.is_sign_negative() || y.is_sign_negative()
+        } else {
+            x.is_sign_negative() && y.is_sign_negative()
+        };
+        return Some(if negative { -0.0 } else { 0.0 });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = min;
+        Some(x)
+    }
 }
 
 fn exp10_value(x: f64) -> f64 {
