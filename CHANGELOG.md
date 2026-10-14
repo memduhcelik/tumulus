@@ -8,7 +8,9 @@
 
 The Mac and Linux binaries answer differently where the two C libraries do. On a Mac, `gamma` matches `tgamma`. `ldexp`, `jn`, and `yn` convert an exponent through a C `int`, and `scalbln` through a C `long`. On x86_64 an out-of-range value, including `nan` and infinity, becomes the minimum integer. Elsewhere it saturates, and `nan` becomes 0. On a Mac, `ldexp(1; nan)` is 1 and `ldexp(1; infinite)` is infinite.
 
-Of the 447 programs in jq 1.7.1's test file, 213 come out the same.
+`abs` is `if . < 0 then -. else . end`. A string, array, or object is left as it is. `null` and a boolean fail with `cannot be negated`, and the exit status is 5. `lgamma_r` returns `[log-gamma, sign]`. A value that is not a number fails with `number required`. `nexttoward(x; y)` is the next number after `x` in the direction of `y`. A value that is not a number fails with `number required`. `pow10` fails with `Error: pow10/0 not found at build time` and exit status 5. The input is not examined.
+
+Of the 447 programs in jq 1.7.1's test file, 216 come out the same.
 
 ## 0.4.0
 

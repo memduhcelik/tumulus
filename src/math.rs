@@ -28,6 +28,7 @@ pub enum Unary {
     J0,
     J1,
     Lgamma,
+    LgammaR,
     Log,
     Log10,
     Log1p,
@@ -62,6 +63,7 @@ pub enum Binary {
     Jn,
     Ldexp,
     Nextafter,
+    Nexttoward,
     Pow,
     Remainder,
     Scalb,
@@ -73,6 +75,10 @@ pub enum Kind {
     Unary(Unary),
     Binary(Binary),
     Fma,
+    /// `if . < 0 then -. else . end`.
+    Abs,
+    /// Always raises `Error: pow10/0 not found at build time`.
+    Pow10,
 }
 
 pub enum Out {
@@ -106,6 +112,7 @@ pub fn kind(name: &str) -> Option<Kind> {
         "j0" => Kind::Unary(Unary::J0),
         "j1" => Kind::Unary(Unary::J1),
         "lgamma" => Kind::Unary(Unary::Lgamma),
+        "lgamma_r" => Kind::Unary(Unary::LgammaR),
         "log" => Kind::Unary(Unary::Log),
         "log10" => Kind::Unary(Unary::Log10),
         "log1p" => Kind::Unary(Unary::Log1p),
@@ -136,12 +143,15 @@ pub fn kind(name: &str) -> Option<Kind> {
         "jn" => Kind::Binary(Binary::Jn),
         "ldexp" => Kind::Binary(Binary::Ldexp),
         "nextafter" => Kind::Binary(Binary::Nextafter),
+        "nexttoward" => Kind::Binary(Binary::Nexttoward),
         "pow" => Kind::Binary(Binary::Pow),
         "remainder" => Kind::Binary(Binary::Remainder),
         "scalb" => Kind::Binary(Binary::Scalb),
         "scalbln" => Kind::Binary(Binary::Scalbln),
         "yn" => Kind::Binary(Binary::Yn),
         "fma" => Kind::Fma,
+        "abs" => Kind::Abs,
+        "pow10" => Kind::Pow10,
         _ => return None,
     })
 }
@@ -156,6 +166,11 @@ pub fn unary(op: Unary, n: f64) -> Out {
         let mut whole = 0.0;
         let frac = unsafe { modf(n, &mut whole) };
         return Out::Pair(frac, whole);
+    }
+    if matches!(op, Unary::LgammaR) {
+        let mut sign = 0;
+        let value = unsafe { lgamma_r(n, &mut sign) };
+        return Out::Pair(value, f64::from(sign));
     }
     let value = unsafe {
         match op {
@@ -199,7 +214,9 @@ pub fn unary(op: Unary, n: f64) -> Out {
             Unary::Trunc => trunc(n),
             Unary::Y0 => y0(n),
             Unary::Y1 => y1(n),
-            Unary::Frexp | Unary::Modf => unreachable!("pair results return above"),
+            Unary::Frexp | Unary::Modf | Unary::LgammaR => {
+                unreachable!("pair results return above")
+            }
         }
     };
     Out::Num(value)
@@ -219,6 +236,7 @@ pub fn binary(op: Binary, a: f64, b: f64) -> f64 {
             Binary::Jn => jn(number::c_cast_i32(a), b),
             Binary::Ldexp => ldexp(a, number::c_cast_i32(b)),
             Binary::Nextafter => nextafter(a, b),
+            Binary::Nexttoward => tumulus_nexttoward(a, b),
             Binary::Pow => pow(a, b),
             Binary::Remainder => remainder(a, b),
             Binary::Scalb => scalb(a, b),
@@ -368,6 +386,7 @@ extern "C" {
     fn jn(n: i32, x: f64) -> f64;
     fn ldexp(x: f64, exp: i32) -> f64;
     fn lgamma(x: f64) -> f64;
+    fn lgamma_r(x: f64, sign: *mut i32) -> f64;
     fn log(x: f64) -> f64;
     fn log10(x: f64) -> f64;
     fn log1p(x: f64) -> f64;
@@ -396,4 +415,8 @@ extern "C" {
     fn y0(x: f64) -> f64;
     fn y1(x: f64) -> f64;
     fn yn(n: i32, x: f64) -> f64;
+}
+
+extern "C" {
+    fn tumulus_nexttoward(x: f64, y: f64) -> f64;
 }

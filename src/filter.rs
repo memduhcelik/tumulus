@@ -145,6 +145,10 @@ pub enum Filter {
     Math2(math::Binary, Box<Filter>, Box<Filter>),
     /// `fma(x; y; z)`. The third filter runs outermost.
     Math3(Box<Filter>, Box<Filter>, Box<Filter>),
+    /// `if . < 0 then -. else . end`.
+    Abs,
+    /// Raises `Error: pow10/0 not found at build time`.
+    Pow10,
     /// `error` with no argument. Raises the current input.
     Error,
     /// `error(expr)`. A call written after it is a syntax error.
@@ -388,6 +392,10 @@ fn eval_in(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Ve
             let z = number_required(&args[2])?;
             Ok(from_f64(math::fma(x, y, z)))
         }),
+        Filter::Abs => eval_abs(input),
+        Filter::Pow10 => Err(raise(Value::String(
+            "Error: pow10/0 not found at build time".to_string(),
+        ))),
         Filter::Error => Err(raise(input.clone())),
         Filter::Raise(arg) => eval_raise(arg, input, env),
         Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
@@ -1005,6 +1013,15 @@ fn number_required(value: &Value) -> Result<f64, String> {
 
 fn from_f64(n: f64) -> Value {
     Value::Number(number::mark_f64(number::format_jq_f64(n)))
+}
+
+fn eval_abs(input: &Value) -> Result<Vec<Value>, Failure> {
+    let zero = Value::Number("0".to_string());
+    if cmp_value(input, &zero) < 0 {
+        one(negate_value(input))
+    } else {
+        Ok(vec![input.clone()])
+    }
 }
 
 fn apply_unary(op: math::Unary, input: &Value) -> Result<Value, String> {
@@ -1701,6 +1718,8 @@ fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
         | Filter::MkTime
         | Filter::Now
         | Filter::Math1(_)
+        | Filter::Abs
+        | Filter::Pow10
         | Filter::Error => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
@@ -2199,13 +2218,15 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('(') {
             return match kind {
                 Kind::Unary(op) => Ok(Some(Filter::Math1(op))),
+                Kind::Abs => Ok(Some(Filter::Abs)),
+                Kind::Pow10 => Ok(Some(Filter::Pow10)),
                 Kind::Binary(_) | Kind::Fma => Err(self.undefined(at, name, 0)),
             };
         }
         let args = self.parse_call_args()?;
         let arity = args.len();
         match kind {
-            Kind::Unary(_) => Err(self.undefined(at, name, arity)),
+            Kind::Unary(_) | Kind::Abs | Kind::Pow10 => Err(self.undefined(at, name, arity)),
             Kind::Binary(op) if arity == 2 => {
                 let mut args = args.into_iter();
                 Ok(Some(Filter::Math2(
@@ -3523,6 +3544,8 @@ fn forbids_call(filter: &Filter) -> bool {
         | Filter::Math1(_)
         | Filter::Math2(_, _, _)
         | Filter::Math3(_, _, _)
+        | Filter::Abs
+        | Filter::Pow10
         | Filter::Error
         | Filter::Raise(_)
         | Filter::Try { .. } => true,

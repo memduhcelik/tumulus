@@ -4722,4 +4722,94 @@ fn math_matches_jq() {
     compare_exact("fma four", &["-n", "--", "fma(1;2;3;4)"], b"");
     compare_exact("sqrt call", &["-n", "--", "sqrt(-1)"], b"");
     compare_exact("jn three", &["-n", "--", "jn(1;2;3)"], b"");
+
+    let abs_values = r#"[0,-0,1,-1,1.5,-1.5,0.5,-0.5,nan,-nan,infinite,-infinite,"a","",[],{},[1],{"a":1}] | .[] | abs"#;
+    compare_exact("abs values", &["-n", "-c", "--", abs_values], b"");
+    compare_exact(
+        "abs signs",
+        &[
+            "-n",
+            "-c",
+            "--",
+            "[nan,-nan,-1.5] | .[] | abs | copysign(1; .)",
+        ],
+        b"",
+    );
+    compare_exact("abs null", &["-n", "-c", "--", "null | abs"], b"");
+    compare_exact("abs true", &["-n", "-c", "--", "true | abs"], b"");
+    compare_exact("abs false", &["-n", "-c", "--", "false | abs"], b"");
+    compare_exact(
+        "abs stream",
+        &["-n", "-c", "--", r#"1, "a", -2, null, 3 | abs"#],
+        b"",
+    );
+    compare_exact(
+        "abs caught",
+        &["-n", "-c", "--", "try (-1, null, 2 | abs) catch ."],
+        b"",
+    );
+    compare_exact("abs arity", &["-n", "--", "abs(1)"], b"");
+    compare_exact("abs json", &["-c", "map(abs)"], b"[-0, 0, -10, -1.1]\n");
+
+    let lgamma = "[0,-0,1,-1,1.5,-1.5,0.5,-0.5,2,3,-2,4.5,nan,-nan,infinite,-infinite,5e-324] | .[] | lgamma_r";
+    compare_exact("lgamma_r", &["-n", "-c", "--", lgamma], b"");
+    compare_exact("lgamma_r string", &["-c", "lgamma_r"], b"\"a\"\n");
+    compare_exact("lgamma_r bool", &["-n", "-c", "--", "true | lgamma_r"], b"");
+    compare_exact("lgamma_r null", &["-n", "-c", "--", "null | lgamma_r"], b"");
+    compare_exact("lgamma_r array", &["-n", "-c", "--", "[1] | lgamma_r"], b"");
+    compare_exact(
+        "lgamma_r object",
+        &["-n", "-c", "--", r#"{"a":1} | lgamma_r"#],
+        b"",
+    );
+    compare_exact("lgamma_r arity", &["-n", "--", "lgamma_r(1)"], b"");
+    compare_exact(
+        "lgamma_r caught",
+        &["-n", "-c", "--", r#"try ("z" | lgamma_r) catch ."#],
+        b"",
+    );
+
+    compare_exact(
+        "nexttoward",
+        &[
+            "-n",
+            "-c",
+            "--",
+            "[nexttoward(0;-1), nexttoward(-0;1), nexttoward(1;2), nexttoward(1;1), nexttoward(-1;2), nexttoward(0.1;1), nexttoward(nan;1), nexttoward(1;nan), nexttoward(infinite;-1), nexttoward(-infinite;1), nexttoward(5e-324;-1)]",
+        ],
+        b"",
+    );
+    compare_exact(
+        "nexttoward string",
+        &["-n", "-c", "--", r#"nexttoward("a"; 1)"#],
+        b"",
+    );
+    compare_exact(
+        "nexttoward second",
+        &["-n", "-c", "--", r#"nexttoward(1; "b")"#],
+        b"",
+    );
+    compare_exact(
+        "nexttoward null",
+        &["-n", "-c", "--", "nexttoward(null; 1), nexttoward(1; null)"],
+        b"",
+    );
+    compare_exact(
+        "nexttoward partial",
+        &["-n", "-c", "--", r#"nexttoward(1,2; 3,"a",4)"#],
+        b"",
+    );
+    compare_exact("nexttoward arity", &["-n", "--", "nexttoward(1;2;3)"], b"");
+
+    compare_exact("pow10 number", &["-n", "-c", "--", "1 | pow10"], b"");
+    compare_exact("pow10 string", &["-n", "-c", "--", r#""a" | pow10"#], b"");
+    compare_exact("pow10 null", &["-n", "-c", "--", "null | pow10"], b"");
+    compare_exact("pow10 stream", &["-n", "-c", "--", "1, 2 | pow10"], b"");
+    compare_exact("pow10 empty", &["-n", "-c", "--", "empty | pow10"], b"");
+    compare_exact(
+        "pow10 caught",
+        &["-n", "-c", "--", "try pow10 catch ."],
+        b"",
+    );
+    compare_exact("pow10 arity", &["-n", "--", "pow10(1)"], b"");
 }
