@@ -817,8 +817,8 @@ pub(super) fn eval_object(
 }
 
 pub(super) struct Alts {
-    pairs: Vec<(String, Value)>,
-    error: Option<Failure>,
+    pub(super) pairs: Vec<(String, Value)>,
+    pub(super) error: Option<Failure>,
 }
 
 pub(super) fn field_alts(field: &ObjField, input: &Value, env: &[(String, Value)]) -> Alts {

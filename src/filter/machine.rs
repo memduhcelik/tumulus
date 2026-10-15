@@ -10,7 +10,8 @@ use crate::value::Value;
 use super::ast::*;
 use super::eval::{self, fail, fresh, truthy};
 use super::func::{self, ScopeNode};
-use super::value::{apply_op, negate_value};
+use super::stream::LimitHow;
+use super::value::{apply_op, cmp_value, negate_value, sub_values};
 
 const ROOT: u32 = u32::MAX;
 
@@ -34,6 +35,9 @@ enum Body {
     Neg(Neg),
     If(Ifs),
     Call(Call),
+    /// `[]`, `{}`, `//`, `try`, `reduce`, `as`, `first`, `limit`, `map`, and
+    /// the index after an array. The child runs on this stack.
+    Nest(Nest),
 }
 
 struct Run {
@@ -132,6 +136,78 @@ struct Level {
     err: Option<Failure>,
 }
 
+struct Nest {
+    kind: Kind,
+    input: Value,
+    env: Rc<func::EnvLink>,
+    scope: Rc<ScopeNode>,
+    phase: u8,
+    started: bool,
+    /// The child was stopped after `first` or a full `limit` count.
+    stopped_child: bool,
+    got: Vec<Value>,
+    err: Option<Failure>,
+    out: Vec<Value>,
+    out_at: usize,
+    emit_now: bool,
+    fail_last: Option<Failure>,
+    buf: Vec<Value>,
+    items: Vec<Value>,
+    item_at: usize,
+    acc: Value,
+    frames: Vec<Vec<(String, Value)>>,
+    frame_at: usize,
+    alts: Vec<eval::Alts>,
+    keys: Vec<Value>,
+    key_err: Option<Failure>,
+    take: Take,
+    seen: usize,
+}
+
+enum Kind {
+    Collect(Rc<Filter>),
+    At {
+        base: Rc<Filter>,
+        key: Rc<Filter>,
+        optional: bool,
+        bases: Vec<Value>,
+    },
+    Alt {
+        left: Rc<Filter>,
+        right: Rc<Filter>,
+    },
+    Try {
+        body: Rc<Filter>,
+        handler: Option<Rc<Filter>>,
+    },
+    Bind {
+        expr: Rc<Filter>,
+        pattern: Pattern,
+        body: Rc<Filter>,
+    },
+    Reduce {
+        pattern: Pattern,
+        init: Rc<Filter>,
+        stream: Rc<Filter>,
+        update: Rc<Filter>,
+        inits: Vec<Value>,
+    },
+    Map(Rc<Filter>),
+    First(Rc<Filter>),
+    Limit {
+        count: Rc<Filter>,
+        expr: Rc<Filter>,
+    },
+    Object(Vec<ObjField>),
+}
+
+enum Take {
+    Off,
+    All,
+    Count(usize),
+    Sub(Value),
+}
+
 enum Act {
     Cont,
     Value(Value),
@@ -218,6 +294,7 @@ fn install_top(machine: &Machine, index: usize) {
         } else {
             &call.caller_scope
         }),
+        Body::Nest(nest) => Some(&nest.scope),
     };
     if let Some(scope) = scope {
         func::install_scope(Rc::clone(scope));
@@ -288,6 +365,7 @@ fn step(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         }
         Body::If(_) => Ok(Act::Cont),
         Body::Call(_) => step_call(machine, index),
+        Body::Nest(_) => step_nest(machine, index),
     }
 }
 
@@ -426,6 +504,123 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Filter::Unresolved { name, arity, .. } => {
             Ok(Act::Fail(fail(format!("{name}/{arity} is not defined"))))
         }
+        Filter::Collect(inner) => replace_nest(
+            machine,
+            index,
+            Kind::Collect(Rc::new((**inner).clone())),
+            input,
+            env,
+            scope,
+        ),
+        Filter::At {
+            base,
+            key,
+            optional,
+        } => replace_nest(
+            machine,
+            index,
+            Kind::At {
+                base: Rc::new((**base).clone()),
+                key: Rc::new((**key).clone()),
+                optional: *optional,
+                bases: Vec::new(),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Alt(left, right) => replace_nest(
+            machine,
+            index,
+            Kind::Alt {
+                left: Rc::new((**left).clone()),
+                right: Rc::new((**right).clone()),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Try { body, handler } => replace_nest(
+            machine,
+            index,
+            Kind::Try {
+                body: Rc::new((**body).clone()),
+                handler: handler.as_ref().map(|handler| Rc::new((**handler).clone())),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Bind {
+            expr,
+            pattern,
+            body,
+        } => replace_nest(
+            machine,
+            index,
+            Kind::Bind {
+                expr: Rc::new((**expr).clone()),
+                pattern: pattern.clone(),
+                body: Rc::new((**body).clone()),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Reduce {
+            stream,
+            pattern,
+            init,
+            update,
+        } => replace_nest(
+            machine,
+            index,
+            Kind::Reduce {
+                pattern: pattern.clone(),
+                init: Rc::new((**init).clone()),
+                stream: Rc::new((**stream).clone()),
+                update: Rc::new((**update).clone()),
+                inits: Vec::new(),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Map(inner) => replace_nest(
+            machine,
+            index,
+            Kind::Map(Rc::new((**inner).clone())),
+            input,
+            env,
+            scope,
+        ),
+        Filter::First(Some(expr)) => replace_nest(
+            machine,
+            index,
+            Kind::First(Rc::new((**expr).clone())),
+            input,
+            env,
+            scope,
+        ),
+        Filter::Limit(count, expr) => replace_nest(
+            machine,
+            index,
+            Kind::Limit {
+                count: Rc::new((**count).clone()),
+                expr: Rc::new((**expr).clone()),
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Object(fields) => replace_nest(
+            machine,
+            index,
+            Kind::Object(fields.clone()),
+            input,
+            env,
+            scope,
+        ),
         other => fallback(machine, index, other, &input, &env),
     }
 }
@@ -715,6 +910,12 @@ fn give(
                 value = next;
             }
             Taken::Spawn => return Ok(false),
+            Taken::Cut(next) => {
+                let next_parent = machine.stack[index].parent;
+                machine.stack.truncate(index + 1);
+                parent = next_parent;
+                value = next;
+            }
         }
     }
 }
@@ -723,6 +924,8 @@ enum Taken {
     Keep,
     Send(Value),
     Spawn,
+    /// Emit `value` and drop every frame above the one that accepted it.
+    Cut(Value),
 }
 
 fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
@@ -776,6 +979,7 @@ fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Fa
             }
         }
         Body::Run(_) => Ok(Taken::Send(value)),
+        Body::Nest(_) => nest_accept(machine, index, value),
     }
 }
 
@@ -869,6 +1073,7 @@ fn on_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
         Body::Neg(_) => Ok(DoneAct::Finish),
         Body::If(_) => finish_if(machine, index),
         Body::Call(_) => finish_call(machine, index),
+        Body::Nest(_) => nest_child_done(machine, index),
         Body::Run(_) => Ok(DoneAct::Finish),
     }
 }
@@ -1049,6 +1254,8 @@ enum Halt {
     IfCond,
     /// A call is still reading a `$` argument.
     CallPull,
+    /// `[]`, `try`, `//`, and the other forms that own their child.
+    Nest,
     Drop,
 }
 
@@ -1057,6 +1264,7 @@ fn halt_kind(machine: &Machine, index: usize) -> Halt {
         Body::Bin(bin) if !bin.on_left => Halt::BinRight,
         Body::If(ifs) if ifs.phase == 0 => Halt::IfCond,
         Body::Call(call) if call.pulling => Halt::CallPull,
+        Body::Nest(_) => Halt::Nest,
         _ => Halt::Drop,
     }
 }
@@ -1168,11 +1376,1232 @@ fn failed(
                     }
                 }
             }
+            Halt::Nest => match nest_on_error(machine, index, &mut failure)? {
+                NestErr::Stay => return Ok(None),
+                NestErr::Go(next_failure) => {
+                    let next = machine.stack[index].parent;
+                    machine.stack.truncate(index);
+                    failure = next_failure;
+                    parent = next;
+                }
+                NestErr::Done => {
+                    let next = machine.stack[index].parent;
+                    machine.stack.truncate(index);
+                    if next == ROOT {
+                        return Ok(Some(false));
+                    }
+                    return Ok(Some(finished(machine, next, emit)?));
+                }
+            },
             Halt::Drop => {
                 let next = machine.stack[index].parent;
                 machine.stack.truncate(index);
                 parent = next;
             }
         }
+    }
+}
+
+enum NestErr {
+    Stay,
+    Go(Failure),
+    Done,
+}
+
+fn replace_nest(
+    machine: &mut Machine,
+    index: usize,
+    kind: Kind,
+    input: Value,
+    env: Rc<func::EnvLink>,
+    scope: Rc<ScopeNode>,
+) -> Result<Act, Failure> {
+    machine.stack[index].body = Box::new(Body::Nest(Nest {
+        kind,
+        input,
+        env,
+        scope,
+        phase: 0,
+        started: false,
+        stopped_child: false,
+        got: Vec::new(),
+        err: None,
+        out: Vec::new(),
+        out_at: 0,
+        emit_now: false,
+        fail_last: None,
+        buf: Vec::new(),
+        items: Vec::new(),
+        item_at: 0,
+        acc: Value::Null,
+        frames: Vec::new(),
+        frame_at: 0,
+        alts: Vec::new(),
+        keys: Vec::new(),
+        key_err: None,
+        take: Take::Off,
+        seen: 0,
+    }));
+    Ok(Act::Cont)
+}
+
+fn step_nest(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let started = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.started,
+        _ => false,
+    };
+    if !started {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.started = true;
+        }
+        return nest_begin(machine, index);
+    }
+    let stopped = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.stopped_child,
+        _ => false,
+    };
+    if stopped {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.stopped_child = false;
+        }
+        return match nest_after_stop(machine, index)? {
+            DoneAct::Stay => Ok(Act::Cont),
+            DoneAct::Finish => Ok(Act::Done),
+            DoneAct::Fail(failure) => Ok(Act::Fail(failure)),
+        };
+    }
+    let emit_now = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.emit_now,
+        _ => false,
+    };
+    if emit_now {
+        return nest_emit(machine, index);
+    }
+    Ok(Act::Cont)
+}
+
+fn nest_emit(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let ready = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.out_at < nest.out.len(),
+        _ => false,
+    };
+    if ready {
+        let value = match &mut *machine.stack[index].body {
+            Body::Nest(nest) => {
+                let value = nest.out[nest.out_at].clone();
+                nest.out_at += 1;
+                value
+            }
+            _ => unreachable!("nest"),
+        };
+        return Ok(Act::Value(value));
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.emit_now = false;
+        nest.out.clear();
+        nest.out_at = 0;
+    }
+    let failure = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.fail_last.take(),
+        _ => None,
+    };
+    match failure {
+        Some(failure) => Ok(Act::Fail(failure)),
+        None => Ok(Act::Done),
+    }
+}
+
+fn nest_accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let (phase, limit_expr, first, bind_body) = match &*machine.stack[index].body {
+        Body::Nest(nest) => (
+            nest.phase,
+            matches!(nest.kind, Kind::Limit { .. }) && nest.phase == 1,
+            matches!(nest.kind, Kind::First(_)),
+            matches!(nest.kind, Kind::Bind { .. }) && nest.phase == 1,
+        ),
+        _ => (0, false, false, false),
+    };
+    if first {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.stopped_child = true;
+        }
+        return Ok(Taken::Cut(value));
+    }
+    if bind_body {
+        return Ok(Taken::Send(value));
+    }
+    if limit_expr {
+        return limit_take(machine, index, value);
+    }
+    let _ = phase;
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.got.push(value);
+    }
+    Ok(Taken::Keep)
+}
+
+fn limit_take(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let take = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => match &mut nest.take {
+            Take::All => {
+                return Ok(Taken::Send(value));
+            }
+            Take::Count(need) => {
+                nest.seen += 1;
+                let stop = nest.seen >= *need;
+                if stop {
+                    nest.stopped_child = true;
+                }
+                return Ok(if stop {
+                    Taken::Cut(value)
+                } else {
+                    Taken::Send(value)
+                });
+            }
+            Take::Sub(current) => current.clone(),
+            Take::Off => return Ok(Taken::Send(value)),
+        },
+        _ => return Ok(Taken::Send(value)),
+    };
+    let one = Value::Number("1".to_string());
+    let next = match sub_values(&take, &one) {
+        Ok(next) => next,
+        Err(message) => return Err(fresh(Vec::new(), message)),
+    };
+    let zero = Value::Number("0".to_string());
+    let stop = cmp_value(&next, &zero) <= 0;
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.take = Take::Sub(next);
+        if stop {
+            nest.stopped_child = true;
+        }
+    }
+    Ok(if stop {
+        Taken::Cut(value)
+    } else {
+        Taken::Send(value)
+    })
+}
+
+fn nest_arm(machine: &mut Machine, index: usize, filter: Rc<Filter>, input: Value) {
+    let env = match &*machine.stack[index].body {
+        Body::Nest(nest) => Rc::clone(&nest.env),
+        _ => unreachable!("nest"),
+    };
+    nest_arm_in(machine, index, filter, input, env);
+}
+
+fn nest_arm_in(
+    machine: &mut Machine,
+    index: usize,
+    filter: Rc<Filter>,
+    input: Value,
+    env: Rc<func::EnvLink>,
+) {
+    let scope = match &*machine.stack[index].body {
+        Body::Nest(nest) => Rc::clone(&nest.scope),
+        _ => unreachable!("nest"),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.got.clear();
+        nest.err = None;
+    }
+    push_run(machine, index, filter, input, env, scope);
+}
+
+fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let kind = match &*machine.stack[index].body {
+        Body::Nest(nest) => kind_tag(&nest.kind),
+        _ => 0,
+    };
+    let input = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.input.clone(),
+        _ => Value::Null,
+    };
+    match kind {
+        1 => {
+            let inner = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Collect(inner),
+                    ..
+                }) => Rc::clone(inner),
+                _ => unreachable!("collect"),
+            };
+            nest_arm(machine, index, inner, input);
+        }
+        2 => {
+            let base = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::At { base, .. },
+                    ..
+                }) => Rc::clone(base),
+                _ => unreachable!("at"),
+            };
+            nest_arm(machine, index, base, input);
+        }
+        3 => {
+            let left = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Alt { left, .. },
+                    ..
+                }) => Rc::clone(left),
+                _ => unreachable!("alt"),
+            };
+            nest_arm(machine, index, left, input);
+        }
+        4 => {
+            let body = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Try { body, .. },
+                    ..
+                }) => Rc::clone(body),
+                _ => unreachable!("try"),
+            };
+            nest_arm(machine, index, body, input);
+        }
+        5 => {
+            let expr = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Bind { expr, .. },
+                    ..
+                }) => Rc::clone(expr),
+                _ => unreachable!("bind"),
+            };
+            nest_arm(machine, index, expr, input);
+        }
+        6 => {
+            let init = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Reduce { init, .. },
+                    ..
+                }) => Rc::clone(init),
+                _ => unreachable!("reduce"),
+            };
+            nest_arm(machine, index, init, input);
+        }
+        7 => {
+            let items = match &*machine.stack[index].body {
+                Body::Nest(nest) => eval::iterate(&nest.input),
+                _ => unreachable!("map"),
+            };
+            match items {
+                Err(failure) => return Ok(Act::Fail(failure)),
+                Ok(items) if items.is_empty() => {
+                    return hold(machine, index, vec![Value::Array(Vec::new())], None);
+                }
+                Ok(items) => {
+                    let inner = match &*machine.stack[index].body {
+                        Body::Nest(Nest {
+                            kind: Kind::Map(inner),
+                            ..
+                        }) => Rc::clone(inner),
+                        _ => unreachable!("map"),
+                    };
+                    let first = items[0].clone();
+                    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                        nest.items = items;
+                        nest.item_at = 0;
+                    }
+                    nest_arm(machine, index, inner, first);
+                }
+            }
+        }
+        8 => {
+            let expr = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::First(expr),
+                    ..
+                }) => Rc::clone(expr),
+                _ => unreachable!("first"),
+            };
+            nest_arm(machine, index, expr, input);
+        }
+        9 => {
+            let count = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Limit { count, .. },
+                    ..
+                }) => Rc::clone(count),
+                _ => unreachable!("limit"),
+            };
+            nest_arm(machine, index, count, input);
+        }
+        _ => {
+            let empty = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Object(fields),
+                    ..
+                }) => fields.is_empty(),
+                _ => true,
+            };
+            if empty {
+                return hold(machine, index, vec![Value::Object(Vec::new())], None);
+            }
+            let key = object_key(machine, index);
+            nest_arm(machine, index, key, input);
+        }
+    }
+    Ok(Act::Cont)
+}
+
+fn kind_tag(kind: &Kind) -> u8 {
+    match kind {
+        Kind::Collect(_) => 1,
+        Kind::At { .. } => 2,
+        Kind::Alt { .. } => 3,
+        Kind::Try { .. } => 4,
+        Kind::Bind { .. } => 5,
+        Kind::Reduce { .. } => 6,
+        Kind::Map(_) => 7,
+        Kind::First(_) => 8,
+        Kind::Limit { .. } => 9,
+        Kind::Object(_) => 10,
+    }
+}
+
+fn object_key(machine: &Machine, index: usize) -> Rc<Filter> {
+    match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Object(fields),
+            item_at,
+            ..
+        }) => {
+            let field = &fields[*item_at];
+            let key = match field {
+                ObjField::Lookup(key) | ObjField::Pair { key, .. } => key,
+            };
+            Rc::new((**key).clone())
+        }
+        _ => unreachable!("object"),
+    }
+}
+
+fn hold(
+    machine: &mut Machine,
+    index: usize,
+    values: Vec<Value>,
+    failure: Option<Failure>,
+) -> Result<Act, Failure> {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.out = values;
+        nest.out_at = 0;
+        nest.fail_last = failure;
+        nest.emit_now = true;
+    }
+    nest_emit(machine, index)
+}
+
+fn nest_child_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let tag = match &*machine.stack[index].body {
+        Body::Nest(nest) => (kind_tag(&nest.kind), nest.phase),
+        _ => (0, 0),
+    };
+    match tag {
+        (1, _) => finish_collect(machine, index),
+        (2, 0) => finish_at_base(machine, index),
+        (2, _) => finish_at_key(machine, index),
+        (3, 0) => finish_alt_left(machine, index),
+        (3, _) => finish_alt_right(machine, index),
+        (4, 0) => finish_try_body(machine, index),
+        (4, _) => finish_try_handler(machine, index),
+        (5, 0) => finish_bind_expr(machine, index),
+        (5, _) => finish_bind_body(machine, index),
+        (6, 0) => finish_reduce_init(machine, index),
+        (6, 1) => finish_reduce_stream(machine, index),
+        (6, _) => finish_reduce_update(machine, index),
+        (7, _) => finish_map_item(machine, index),
+        (8, _) => finish_first(machine, index),
+        (9, 0) => finish_limit_count(machine, index),
+        (9, _) => finish_limit_expr(machine, index),
+        (10, 0) => finish_object_key(machine, index),
+        _ => finish_object_value(machine, index),
+    }
+}
+
+fn nest_after_stop(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let limit = match &*machine.stack[index].body {
+        Body::Nest(nest) => matches!(nest.kind, Kind::Limit { .. }),
+        _ => false,
+    };
+    if limit {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.take = Take::Off;
+            nest.seen = 0;
+        }
+        return limit_next(machine, index);
+    }
+    Ok(DoneAct::Finish)
+}
+
+fn finish_collect(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (items, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        return Ok(DoneAct::Fail(eval::bare_fail(failure)));
+    }
+    queue_out(machine, index, vec![Value::Array(items)], None)
+}
+
+fn finish_at_base(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (bases, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        return Ok(DoneAct::Fail(eval::with_partial(bases, failure)));
+    }
+    let key = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::At { key, .. },
+            ..
+        }) => Rc::clone(key),
+        _ => unreachable!("at"),
+    };
+    let input = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.input.clone(),
+        _ => Value::Null,
+    };
+    if let Body::Nest(Nest {
+        kind: Kind::At { bases: slot, .. },
+        phase,
+        ..
+    }) = &mut *machine.stack[index].body
+    {
+        *slot = bases;
+        *phase = 1;
+    }
+    nest_arm(machine, index, key, input);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_at_key(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (keys, key_err) = take_got(machine, index);
+    let (bases, optional) = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::At {
+                bases, optional, ..
+            },
+            ..
+        }) => (bases.clone(), *optional),
+        _ => (Vec::new(), false),
+    };
+    match index_pairs(&bases, &keys, optional, key_err) {
+        Ok(values) => queue_out(machine, index, values, None),
+        Err(failure) => {
+            let partial = failure.partial.clone();
+            queue_out(machine, index, partial, Some(eval::bare_fail(failure)))
+        }
+    }
+}
+
+fn index_pairs(
+    bases: &[Value],
+    keys: &[Value],
+    optional: bool,
+    key_err: Option<Failure>,
+) -> Result<Vec<Value>, Failure> {
+    if let Some(failure) = key_err {
+        let caught = failure.caught.clone();
+        let message = failure.message;
+        let mut partial = Vec::new();
+        for key in keys {
+            for value in bases {
+                match eval::index_by(value, key) {
+                    Ok(got) => partial.extend(got),
+                    Err(inner) => {
+                        partial.extend(inner.partial);
+                        return Err(Failure {
+                            partial,
+                            message,
+                            caught,
+                        });
+                    }
+                }
+            }
+        }
+        return Err(Failure {
+            partial,
+            message,
+            caught,
+        });
+    }
+    let mut out = Vec::new();
+    for key in keys {
+        for value in bases {
+            match eval::index_by(value, key) {
+                Ok(got) => out.extend(got),
+                Err(mut failure) => {
+                    out.extend(std::mem::take(&mut failure.partial));
+                    if !optional {
+                        return Err(eval::with_partial(out, failure));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn finish_alt_left(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        let kept = values.into_iter().filter(truthy).collect();
+        return Ok(DoneAct::Fail(eval::with_partial(kept, failure)));
+    }
+    let defined: Vec<Value> = values.into_iter().filter(truthy).collect();
+    if !defined.is_empty() {
+        return queue_out(machine, index, defined, None);
+    }
+    let right = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Alt { right, .. },
+            ..
+        }) => Rc::clone(right),
+        _ => unreachable!("alt"),
+    };
+    let input = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.input.clone(),
+        _ => Value::Null,
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 1;
+    }
+    nest_arm(machine, index, right, input);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_alt_right(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    match err {
+        Some(failure) => Ok(DoneAct::Fail(eval::with_partial(values, failure))),
+        None => queue_out(machine, index, values, None),
+    }
+}
+
+fn finish_try_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (partial, err) = take_got(machine, index);
+    let Some(failure) = err else {
+        return queue_out(machine, index, partial, None);
+    };
+    let handler = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Try { handler, .. },
+            ..
+        }) => handler.clone(),
+        _ => None,
+    };
+    let Some(handler) = handler else {
+        return queue_out(machine, index, partial, None);
+    };
+    let caught = match failure.caught {
+        Some(value) => value,
+        None => Value::String(failure.message),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.buf = partial;
+        nest.phase = 1;
+    }
+    nest_arm(machine, index, handler, caught);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_try_handler(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (more, err) = take_got(machine, index);
+    let mut partial = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => std::mem::take(&mut nest.buf),
+        _ => Vec::new(),
+    };
+    if let Some(failure) = err {
+        partial.extend(more);
+        return Ok(DoneAct::Fail(eval::with_partial(partial, failure)));
+    }
+    partial.extend(more);
+    queue_out(machine, index, partial, None)
+}
+
+fn finish_bind_expr(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    let pattern = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Bind { pattern, .. },
+            ..
+        }) => pattern.clone(),
+        _ => unreachable!("bind"),
+    };
+    let flat = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.env.flatten(),
+        _ => Vec::new(),
+    };
+    let mut frames = Vec::new();
+    for value in &values {
+        bind_frames(&pattern, value, &flat, &mut frames)?;
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.frames = frames;
+        nest.frame_at = 0;
+        nest.fail_last = err;
+        nest.phase = 1;
+    }
+    bind_next(machine, index)
+}
+
+fn bind_frames(
+    pattern: &Pattern,
+    value: &Value,
+    env: &[(String, Value)],
+    frames: &mut Vec<Vec<(String, Value)>>,
+) -> Result<(), Failure> {
+    if let Pattern::Var(name) = pattern {
+        frames.push(vec![(name.clone(), value.clone())]);
+        return Ok(());
+    }
+    eval::match_pat(pattern, value, env, &[], &mut |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+}
+
+fn bind_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let next = match &*machine.stack[index].body {
+        Body::Nest(nest) if nest.frame_at < nest.frames.len() => {
+            let frame = nest.frames[nest.frame_at].clone();
+            let body = match &nest.kind {
+                Kind::Bind { body, .. } => Rc::clone(body),
+                _ => unreachable!("bind"),
+            };
+            let env = func::EnvLink::child(frame, &nest.env);
+            Some((body, env, nest.input.clone()))
+        }
+        _ => None,
+    };
+    if let Some((body, env, input)) = next {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.frame_at += 1;
+        }
+        nest_arm_in(machine, index, body, input, env);
+        return Ok(DoneAct::Stay);
+    }
+    let failure = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.fail_last.take(),
+        _ => None,
+    };
+    match failure {
+        Some(failure) => Ok(DoneAct::Fail(failure)),
+        None => Ok(DoneAct::Finish),
+    }
+}
+
+fn finish_bind_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let err = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.err.take(),
+        _ => None,
+    };
+    if let Some(failure) = err {
+        return Ok(DoneAct::Fail(failure));
+    }
+    bind_next(machine, index)
+}
+
+fn finish_reduce_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (inits, err) = take_got(machine, index);
+    if inits.is_empty() {
+        return Ok(match err {
+            Some(failure) => DoneAct::Fail(failure),
+            None => DoneAct::Finish,
+        });
+    }
+    if let Body::Nest(Nest {
+        kind: Kind::Reduce { inits: slot, .. },
+        ..
+    }) = &mut *machine.stack[index].body
+    {
+        *slot = inits;
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.fail_last = err;
+        nest.seen = 0;
+        nest.phase = 1;
+    }
+    reduce_stream(machine, index)
+}
+
+fn reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (stream, input, acc) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let init = match &nest.kind {
+                Kind::Reduce { inits, stream, .. } => {
+                    let value = inits.get(nest.seen).cloned().unwrap_or(Value::Null);
+                    (Rc::clone(stream), value)
+                }
+                _ => (Rc::new(Filter::Empty), Value::Null),
+            };
+            let input = if nest.seen == 0 {
+                nest.input.clone()
+            } else {
+                Value::Null
+            };
+            (init.0, input, init.1)
+        }
+        _ => (Rc::new(Filter::Empty), Value::Null, Value::Null),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.acc = acc;
+        nest.phase = 1;
+    }
+    nest_arm(machine, index, stream, input);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (items, err) = take_got(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.items = items;
+        nest.item_at = 0;
+        nest.frame_at = 0;
+        nest.frames.clear();
+        nest.key_err = err;
+        nest.phase = 2;
+    }
+    reduce_item(machine, index)
+}
+
+fn reduce_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let more = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.item_at < nest.items.len(),
+        _ => false,
+    };
+    if !more {
+        return reduce_end_init(machine, index);
+    }
+    let (pattern, item, flat) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let pattern = match &nest.kind {
+                Kind::Reduce { pattern, .. } => pattern.clone(),
+                _ => Pattern::Var(String::new()),
+            };
+            let item = nest.items[nest.item_at].clone();
+            (pattern, item, nest.env.flatten())
+        }
+        _ => (Pattern::Var(String::new()), Value::Null, Vec::new()),
+    };
+    let mut frames = Vec::new();
+    bind_frames(&pattern, &item, &flat, &mut frames)?;
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.item_at += 1;
+        nest.frames = frames;
+        nest.frame_at = 0;
+    }
+    reduce_frame(machine, index)
+}
+
+fn reduce_frame(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let ready = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.frame_at < nest.frames.len(),
+        _ => false,
+    };
+    if !ready {
+        return reduce_item(machine, index);
+    }
+    let (update, env, acc) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let frame = nest.frames[nest.frame_at].clone();
+            let update = match &nest.kind {
+                Kind::Reduce { update, .. } => Rc::clone(update),
+                _ => Rc::new(Filter::Empty),
+            };
+            let env = func::EnvLink::child(frame, &nest.env);
+            (update, env, nest.acc.clone())
+        }
+        _ => (
+            Rc::new(Filter::Empty),
+            func::EnvLink::from_slice(&[]),
+            Value::Null,
+        ),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.frame_at += 1;
+        nest.phase = 2;
+    }
+    nest_arm_in(machine, index, update, acc, env);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_reduce_update(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        let done = match &mut *machine.stack[index].body {
+            Body::Nest(nest) => std::mem::take(&mut nest.buf),
+            _ => Vec::new(),
+        };
+        return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
+    }
+    let acc = values.last().cloned().unwrap_or(Value::Null);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.acc = acc;
+    }
+    reduce_frame(machine, index)
+}
+
+fn reduce_end_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let acc = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.acc.clone(),
+        _ => Value::Null,
+    };
+    let stream_err = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => {
+            nest.buf.push(acc);
+            nest.key_err.take()
+        }
+        _ => None,
+    };
+    if let Some(failure) = stream_err {
+        let done = match &mut *machine.stack[index].body {
+            Body::Nest(nest) => std::mem::take(&mut nest.buf),
+            _ => Vec::new(),
+        };
+        return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.seen += 1;
+    }
+    let more = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Reduce { inits, .. },
+            seen,
+            ..
+        }) => *seen < inits.len(),
+        _ => false,
+    };
+    if more {
+        return reduce_stream(machine, index);
+    }
+    let (out, err) = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => (std::mem::take(&mut nest.buf), nest.fail_last.take()),
+        _ => (Vec::new(), None),
+    };
+    queue_out(machine, index, out, err)
+}
+
+fn finish_map_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        return Ok(DoneAct::Fail(eval::bare_fail(failure)));
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.buf.extend(values);
+        nest.item_at += 1;
+    }
+    let more = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.item_at < nest.items.len(),
+        _ => false,
+    };
+    if !more {
+        let items = match &mut *machine.stack[index].body {
+            Body::Nest(nest) => std::mem::take(&mut nest.buf),
+            _ => Vec::new(),
+        };
+        return queue_out(machine, index, vec![Value::Array(items)], None);
+    }
+    let (inner, input) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let inner = match &nest.kind {
+                Kind::Map(inner) => Rc::clone(inner),
+                _ => unreachable!("map"),
+            };
+            (inner, nest.items[nest.item_at].clone())
+        }
+        _ => unreachable!("map"),
+    };
+    nest_arm(machine, index, inner, input);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_first(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let err = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.err.take(),
+        _ => None,
+    };
+    Ok(match err {
+        Some(failure) => DoneAct::Fail(failure),
+        None => DoneAct::Finish,
+    })
+}
+
+fn finish_limit_count(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (counts, err) = take_got(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.items = counts;
+        nest.item_at = 0;
+        nest.fail_last = err;
+        nest.phase = 1;
+        nest.take = Take::Off;
+    }
+    limit_next(machine, index)
+}
+
+fn finish_limit_expr(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let err = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => {
+            nest.take = Take::Off;
+            nest.seen = 0;
+            nest.err.take()
+        }
+        _ => None,
+    };
+    if let Some(failure) = err {
+        return Ok(DoneAct::Fail(failure));
+    }
+    limit_next(machine, index)
+}
+
+fn limit_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    loop {
+        let count = match &*machine.stack[index].body {
+            Body::Nest(nest) => {
+                if nest.item_at >= nest.items.len() {
+                    None
+                } else {
+                    let count = nest.items[nest.item_at].clone();
+                    let expr = match &nest.kind {
+                        Kind::Limit { expr, .. } => Rc::clone(expr),
+                        _ => Rc::new(Filter::Empty),
+                    };
+                    Some((count, expr, nest.input.clone()))
+                }
+            }
+            _ => None,
+        };
+        let Some((count, expr, input)) = count else {
+            let failure = match &mut *machine.stack[index].body {
+                Body::Nest(nest) => nest.fail_last.take(),
+                _ => None,
+            };
+            return Ok(match failure {
+                Some(failure) => DoneAct::Fail(failure),
+                None => DoneAct::Finish,
+            });
+        };
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.item_at += 1;
+            nest.seen = 0;
+        }
+        match super::stream::limit_how(&count) {
+            LimitHow::None => continue,
+            LimitHow::All => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.take = Take::All;
+                }
+                nest_arm(machine, index, expr, input);
+                return Ok(DoneAct::Stay);
+            }
+            LimitHow::Count(need) => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.take = Take::Count(need);
+                }
+                nest_arm(machine, index, expr, input);
+                return Ok(DoneAct::Stay);
+            }
+            LimitHow::Subtract => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.take = Take::Sub(count);
+                }
+                nest_arm(machine, index, expr, input);
+                return Ok(DoneAct::Stay);
+            }
+        }
+    }
+}
+
+fn finish_object_key(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (keys, err) = take_got(machine, index);
+    let is_lookup = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Object(fields),
+            item_at,
+            ..
+        }) => {
+            matches!(fields.get(*item_at), Some(ObjField::Lookup(_)))
+        }
+        _ => false,
+    };
+    if is_lookup {
+        let input = match &*machine.stack[index].body {
+            Body::Nest(nest) => nest.input.clone(),
+            _ => Value::Null,
+        };
+        let alt = lookup_alt(&keys, err, &input);
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.alts.push(alt);
+        }
+        return object_next(machine, index);
+    }
+    let input = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.input.clone(),
+        _ => Value::Null,
+    };
+    let value = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Object(fields),
+            item_at,
+            ..
+        }) => match &fields[*item_at] {
+            ObjField::Pair { value, .. } => Rc::new((**value).clone()),
+            ObjField::Lookup(_) => unreachable!("lookup"),
+        },
+        _ => unreachable!("object"),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.keys = keys;
+        nest.key_err = err;
+        nest.phase = 1;
+    }
+    nest_arm(machine, index, value, input);
+    Ok(DoneAct::Stay)
+}
+
+fn finish_object_value(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, value_err) = take_got(machine, index);
+    let (keys, key_err) = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => (std::mem::take(&mut nest.keys), nest.key_err.take()),
+        _ => (Vec::new(), None),
+    };
+    let alt = pair_alt(&keys, key_err, &values, value_err);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.alts.push(alt);
+    }
+    object_next(machine, index)
+}
+
+fn object_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.item_at += 1;
+        nest.phase = 0;
+    }
+    let more = match &*machine.stack[index].body {
+        Body::Nest(Nest {
+            kind: Kind::Object(fields),
+            item_at,
+            ..
+        }) => *item_at < fields.len(),
+        _ => false,
+    };
+    if !more {
+        let alts = match &mut *machine.stack[index].body {
+            Body::Nest(nest) => std::mem::take(&mut nest.alts),
+            _ => Vec::new(),
+        };
+        return match eval::combine_fields(&alts, 0, Vec::new()) {
+            Ok(values) => queue_out(machine, index, values, None),
+            Err(mut failure) => {
+                let partial = std::mem::take(&mut failure.partial);
+                queue_out(machine, index, partial, Some(failure))
+            }
+        };
+    }
+    let key = object_key(machine, index);
+    let input = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.input.clone(),
+        _ => Value::Null,
+    };
+    nest_arm(machine, index, key, input);
+    Ok(DoneAct::Stay)
+}
+
+fn lookup_alt(keys: &[Value], key_err: Option<Failure>, input: &Value) -> eval::Alts {
+    let mut pairs = Vec::new();
+    for value in keys {
+        let Value::String(name) = value else {
+            return eval::Alts {
+                pairs,
+                error: Some(fail(super::parse::key_message(value))),
+            };
+        };
+        match eval::index_by(input, &Value::String(name.clone())) {
+            Ok(got) => {
+                let one = got.into_iter().next().unwrap_or(Value::Null);
+                pairs.push((name.clone(), one));
+            }
+            Err(failure) => {
+                return eval::Alts {
+                    pairs,
+                    error: Some(eval::bare_fail(failure)),
+                };
+            }
+        }
+    }
+    eval::Alts {
+        pairs,
+        error: key_err,
+    }
+}
+
+fn pair_alt(
+    keys: &[Value],
+    key_err: Option<Failure>,
+    values: &[Value],
+    value_err: Option<Failure>,
+) -> eval::Alts {
+    let mut pairs = Vec::new();
+    for key in keys {
+        let Value::String(name) = key else {
+            return eval::Alts {
+                pairs,
+                error: Some(fail(super::parse::key_message(key))),
+            };
+        };
+        for item in values {
+            pairs.push((name.clone(), item.clone()));
+        }
+        if let Some(failure) = &value_err {
+            return eval::Alts {
+                pairs,
+                error: Some(failure.clone()),
+            };
+        }
+    }
+    eval::Alts {
+        pairs,
+        error: key_err.or(value_err),
+    }
+}
+
+fn take_got(machine: &mut Machine, index: usize) -> (Vec<Value>, Option<Failure>) {
+    match &mut *machine.stack[index].body {
+        Body::Nest(nest) => (std::mem::take(&mut nest.got), nest.err.take()),
+        _ => (Vec::new(), None),
+    }
+}
+
+fn queue_out(
+    machine: &mut Machine,
+    index: usize,
+    values: Vec<Value>,
+    failure: Option<Failure>,
+) -> Result<DoneAct, Failure> {
+    if values.is_empty() {
+        return Ok(match failure {
+            Some(failure) => DoneAct::Fail(failure),
+            None => DoneAct::Finish,
+        });
+    }
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.out = values;
+        nest.out_at = 0;
+        nest.fail_last = failure;
+        nest.emit_now = true;
+    }
+    Ok(DoneAct::Stay)
+}
+
+fn nest_on_error(
+    machine: &mut Machine,
+    index: usize,
+    failure: &mut Failure,
+) -> Result<NestErr, Failure> {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        if nest.err.is_none() {
+            nest.err = Some(note(failure));
+        }
+    }
+    match nest_child_done(machine, index)? {
+        DoneAct::Stay => Ok(NestErr::Stay),
+        DoneAct::Fail(failure) => Ok(NestErr::Go(failure)),
+        DoneAct::Finish => Ok(NestErr::Done),
     }
 }
