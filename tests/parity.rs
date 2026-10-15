@@ -6852,3 +6852,68 @@ fn ordering_match_jq() {
         compare_exact(program, &["--", program], input.as_bytes());
     }
 }
+
+#[test]
+fn reduce_build_matches_jq() {
+    require_jq();
+    let programs = [
+        "reduce range(80) as $i ([]; . + [$i])",
+        "reduce range(40) as $i ([]; . + [$i, $i + 1])",
+        "reduce range(5) as $i ([1]; . + [$i])",
+        "reduce range(4) as $i (null; . + [$i])",
+        "reduce range(0) as $i ([9]; . + [$i])",
+        "reduce range(3) as $i (0; . + [$i])",
+        "reduce range(4) as $i ([0]; . + [.[-1] + $i])",
+        "reduce range(3) as $i ([]; . + [])",
+        "reduce range(3) as $i ([]; . + [if $i == 1 then error(\"z\") else $i end])",
+        "[1,2,3] | reduce .[] as $x ([]; . + [$x])",
+        "reduce (1,2) as $x ((10,20); . + [$x])",
+        "reduce range(3) as $i ([]; . + [$i], . + [10])",
+        "reduce range(80) as $i ({}; .[$i | tostring] = $i)",
+        "reduce range(80) as $i ([]; .[$i] = $i)",
+        "reduce range(5) as $i (null; .[$i | tostring] = $i)",
+        "reduce range(5) as $i (null; .[$i] = $i)",
+        "reduce (\"b\",\"a\",\"b\") as $k ({c:0}; .[$k] = 1)",
+        "reduce range(4) as $i ({a:1}; .a = $i)",
+        "reduce range(4) as $i ([9,8,7]; .[0] = $i)",
+        "reduce range(3) as $i ([]; .[$i] = ($i, $i + 10))",
+        "reduce range(3) as $i ({}; .[\"a\",\"b\"] = $i)",
+        "reduce (0,1,-1) as $i ([9,8,7]; .[$i] = $i)",
+        "reduce range(1) as $i ([]; .[-1] = $i)",
+        "reduce range(1) as $i (null; .[-1] = 1)",
+        "reduce range(4) as $i ([]; .[$i + 2] = $i)",
+        "reduce range(5) as $i ([]; .[length] = $i)",
+        "reduce range(2) as $i (1; .[$i] = $i)",
+        "reduce range(2) as $i (\"ab\"; .[0] = $i)",
+        "reduce range(2) as $i ({}; .[0] = $i)",
+        "reduce range(1) as $i ([]; .[\"a\"] = 1)",
+        "reduce range(2) as $i ([1,2,3]; .[1:2] = [$i])",
+        "reduce range(3) as $i ({}; .a.b = $i)",
+        "reduce range(4) as $i ([]; .[0] |= . + [$i])",
+        "reduce range(4) as $i ({}; .[($i|tostring)] += 1)",
+        "[foreach range(5) as $i (0; . + $i)]",
+        "[foreach range(5) as $i ([]; . + [$i])]",
+        "[foreach range(4) as $i ({}; .[$i|tostring] = $i)]",
+        "def f: reduce range(40) as $i ([]; . + [$i]); f",
+        "def f: reduce range(40) as $i ({}; .[$i|tostring] = $i); f",
+        "def f: reduce range(40) as $i ([]; .[$i] = $i); f",
+        "reduce range(3) as $i ([]; .[empty] = $i)",
+        "reduce range(2) as $i ([1]; .[0] = empty)",
+        "reduce range(1) as $i ({}; .[error(\"z\")] = 1)",
+        "reduce range(1) as $i ([]; .[0] = (1, error(\"z\")))",
+        "reduce range(1) as $i ([]; .[nan] = $i)",
+        "{\"a\":1,\"a\":2} | reduce range(1) as $i (.; .a = 9)",
+        "reduce range(3) as $i ({}; .[$i|tostring] = .)",
+        "reduce range(80) as $i ([]; . + [$i]) | [.[0], .[-1], length]",
+        "reduce range(80) as $i ({}; .[$i|tostring] = $i) | [.[\"0\"], .[\"79\"], length]",
+        "reduce range(80) as $i ([]; .[$i] = $i) | [.[0], .[-1], length]",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    compare_exact(
+        "append input",
+        &["-n", "-c", "--", "reduce range(3) as $i ([]; . + [input])"],
+        b"10\n20\n30\n",
+    );
+}

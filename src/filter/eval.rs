@@ -504,9 +504,20 @@ pub(super) fn eval_fold(
         let stream_input = if index == 0 { input } else { &null_input };
         let (items, stream_err) = parts(eval_in(stream, stream_input, env));
         let mut acc = init_value.clone();
+        // Reused while the accumulator stays one object. A slow step replaces
+        // the value, and the next fast step builds the index again.
+        let mut lookup = None;
         for item in &items {
             let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
                 let child = child_scope(frame, env);
+                // `foreach` emits every step, so it keeps the copying path.
+                if !emit {
+                    match super::update::accelerate_reduce(update, &mut acc, &child, &mut lookup) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => lookup = None,
+                        Err(failure) => return Err(failure),
+                    }
+                }
                 let (updates, update_err) = parts(eval_in(update, &acc, &child));
                 if emit {
                     if let Some(extract) = extract {

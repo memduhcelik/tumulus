@@ -3,6 +3,7 @@
 //! finishes, so a later index is not shifted by an earlier deletion.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use crate::number::array_index;
 use crate::value::Value;
@@ -11,7 +12,7 @@ use super::stream::{self, LimitHow, NthSpan};
 use super::{
     add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
     finish, fresh, mul_values, parts, rem_values, shown, slice as slice_value, slice_range,
-    sub_values, truthy, with_partial, ArrayIndex, Failure, Filter, PatField, Pattern, UpdateOp,
+    sub_values, truthy, with_partial, ArrayIndex, Failure, Filter, Op, PatField, Pattern, UpdateOp,
 };
 
 enum Found {
@@ -133,6 +134,376 @@ fn collect(
         }
     }
     Ok(paths)
+}
+
+/// Where the keys of one object live, so a `reduce` can set the next key
+/// without scanning the pairs it has already stored.
+pub(super) struct ObjIndex {
+    ptr: usize,
+    len: usize,
+    map: HashMap<String, usize>,
+}
+
+/// `true` when `reduce` can apply `update` without building a fresh copy of
+/// the accumulator. The shape is `. + [expr]`, or an assignment whose path
+/// starts at `.`.
+pub(super) fn reduce_can_accelerate(update: &Filter) -> bool {
+    match update {
+        Filter::Bin {
+            op: Op::Add,
+            left,
+            right,
+        } if matches!(left.as_ref(), Filter::Identity) => {
+            matches!(
+                right.as_ref(),
+                Filter::Collect(_) | Filter::Literal(Value::Array(_))
+            )
+        }
+        Filter::Update {
+            op: UpdateOp::Assign,
+            path,
+            ..
+        } => assignment_root(path),
+        _ => false,
+    }
+}
+
+fn assignment_root(path: &Filter) -> bool {
+    match path {
+        Filter::Field(_) => true,
+        Filter::Index {
+            at: ArrayIndex::At(_),
+            ..
+        } => true,
+        Filter::At {
+            base,
+            optional: false,
+            ..
+        } => matches!(base.as_ref(), Filter::Identity),
+        _ => false,
+    }
+}
+
+/// Apply one `reduce` step in place. `Ok(false)` means the update is not one
+/// of the shapes above, and nothing was run. The accumulator is the only
+/// owner of its array or object, so appending and writing one key or index
+/// reuse that buffer.
+pub(super) fn accelerate_reduce(
+    update: &Filter,
+    acc: &mut Value,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<bool, Failure> {
+    match update {
+        Filter::Bin {
+            op: Op::Add,
+            left,
+            right,
+        } if matches!(left.as_ref(), Filter::Identity) => match right.as_ref() {
+            Filter::Collect(inner) => {
+                accelerate_append(inner, acc, env, lookup)?;
+                Ok(true)
+            }
+            Filter::Literal(Value::Array(items)) => {
+                extend_acc(acc, items.clone(), lookup)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
+        Filter::Update {
+            op: UpdateOp::Assign,
+            path,
+            expr,
+        } if assignment_root(path) => {
+            accelerate_assign(path, expr, acc, env, lookup)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn accelerate_append(
+    inner: &Filter,
+    acc: &mut Value,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    // `[expr]` is one array, or an error with nothing kept from `expr`.
+    let items = match eval_in(inner, acc, env) {
+        Ok(items) => items,
+        Err(failure) => return Err(bare_fail(failure)),
+    };
+    extend_acc(acc, items, lookup)
+}
+
+fn extend_acc(
+    acc: &mut Value,
+    items: Vec<Value>,
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    if matches!(acc, Value::Null) {
+        *acc = Value::Array(items);
+        *lookup = None;
+        return Ok(());
+    }
+    if let Value::Array(slot) = acc {
+        slot.extend(items);
+        return Ok(());
+    }
+    let right = Value::Array(items);
+    match add_values(acc, &right) {
+        Ok(value) => {
+            *acc = value;
+            *lookup = None;
+            Ok(())
+        }
+        Err(message) => Err(fail(message)),
+    }
+}
+
+fn accelerate_assign(
+    path: &Filter,
+    expr: &Filter,
+    acc: &mut Value,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    // `=` runs the right-hand side first. An empty stream yields nothing,
+    // which `reduce` stores as null, and does not read the path.
+    let (rhs, rhs_err) = parts(eval_in(expr, acc, env));
+    if rhs.is_empty() {
+        if let Some(failure) = rhs_err {
+            return Err(failure);
+        }
+        *acc = Value::Null;
+        *lookup = None;
+        return Ok(());
+    }
+    let paths = match path {
+        Filter::Field(name) => vec![vec![Step::Key(name.clone())]],
+        Filter::Index {
+            at: ArrayIndex::At(index),
+            text,
+        } => vec![vec![Step::Index {
+            at: *index,
+            text: text.clone(),
+        }]],
+        Filter::At { key, .. } => assignment_paths(acc, key, env)?,
+        _ => unreachable!("assignment root"),
+    };
+    if let Some(failure) = rhs_err {
+        return Err(failure);
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let simple = paths
+        .iter()
+        .all(|path| matches!(path.as_slice(), [Step::Key(_)] | [Step::Index { .. }]));
+    if simple {
+        let value = rhs.into_iter().next_back().expect("value");
+        return write_simple(acc, &paths, value, lookup);
+    }
+    // A slice or another compound path. Each value is tried against the
+    // original accumulator, and `reduce` keeps only the last success.
+    let last = rhs.len() - 1;
+    for (i, value) in rhs.into_iter().enumerate() {
+        match assign_one(&paths, acc, value) {
+            Err(message) => return Err(fail(message)),
+            Ok(produced) if i == last => {
+                *acc = produced;
+                *lookup = None;
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Paths of `.[expr]`, read from the accumulator before any write.
+fn assignment_paths(
+    acc: &Value,
+    key: &Filter,
+    env: &[(String, Value)],
+) -> Result<Vec<Vec<Step>>, Failure> {
+    let (keys, key_err) = parts(eval_in(key, acc, env));
+    if let Some(failure) = key_err {
+        // A later failure in the key wins over an index error, and over a
+        // failure that already happened on the right-hand side.
+        return Err(failure);
+    }
+    let mut paths = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match classify_step(acc, key) {
+            Ok(step) => paths.push(vec![step]),
+            Err(message) => return Err(fail(message)),
+        }
+    }
+    Ok(paths)
+}
+
+/// The step a key will write, without reading the value already stored there.
+fn classify_step(container: &Value, key: &Value) -> Result<Step, String> {
+    match key {
+        Value::String(name) => match container {
+            Value::Null | Value::Object(_) => Ok(Step::Key(name.clone())),
+            other => Err(format!(
+                "Cannot index {} with string \"{name}\"",
+                other.type_name()
+            )),
+        },
+        Value::Number(text) => {
+            let shown = canonical_number(text);
+            let Some(index) = array_index(&shown) else {
+                return if matches!(container, Value::Null | Value::Array(_)) {
+                    if matches!(crate::number::real(&shown), crate::number::Real::Nan) {
+                        Err("Cannot set array element at NaN index".to_string())
+                    } else {
+                        Err(format!(
+                            "Invalid path expression with result {}",
+                            clipped(&Value::Null, 29)
+                        ))
+                    }
+                } else {
+                    Err(format!(
+                        "Cannot index {} with number",
+                        container.type_name()
+                    ))
+                };
+            };
+            match container {
+                Value::Null | Value::Array(_) => Ok(Step::Index {
+                    at: index,
+                    text: shown,
+                }),
+                other => Err(format!("Cannot index {} with number", other.type_name())),
+            }
+        }
+        _ => match real_step(container, key) {
+            Ok(Real::Done(step, _)) => Ok(step),
+            Ok(Real::Huge(text)) => {
+                if matches!(crate::number::real(&text), crate::number::Real::Nan) {
+                    Err("Cannot set array element at NaN index".to_string())
+                } else {
+                    Err(format!(
+                        "Invalid path expression with result {}",
+                        clipped(&Value::Null, 29)
+                    ))
+                }
+            }
+            Err(message) => Err(message),
+        },
+    }
+}
+
+fn write_simple(
+    acc: &mut Value,
+    paths: &[Vec<Step>],
+    mut value: Value,
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    let last = paths.len() - 1;
+    for (i, path) in paths.iter().enumerate() {
+        let piece = if i == last {
+            std::mem::replace(&mut value, Value::Null)
+        } else {
+            value.clone()
+        };
+        match &path[0] {
+            Step::Key(key) => object_set(acc, key, piece, lookup).map_err(fail)?,
+            Step::Index { at, .. } => {
+                array_set(acc, *at, piece).map_err(fail)?;
+                *lookup = None;
+            }
+            _ => unreachable!("simple path"),
+        }
+    }
+    Ok(())
+}
+
+fn object_set(
+    acc: &mut Value,
+    key: &str,
+    value: Value,
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), String> {
+    match acc {
+        Value::Null => {
+            *acc = Value::Object(vec![(key.to_string(), value)]);
+            let ptr = match acc {
+                Value::Object(pairs) => pairs.as_ptr() as usize,
+                _ => 0,
+            };
+            let mut map = HashMap::with_capacity(8);
+            map.insert(key.to_string(), 0);
+            *lookup = Some(ObjIndex { ptr, len: 1, map });
+            return Ok(());
+        }
+        Value::Array(_) => {
+            return Err(format!("Cannot index array with string \"{key}\""));
+        }
+        Value::Object(_) => {}
+        other => {
+            return Err(format!(
+                "Cannot index {} with string \"{key}\"",
+                other.type_name()
+            ));
+        }
+    }
+    let Value::Object(pairs) = acc else {
+        unreachable!("object");
+    };
+    let ptr = pairs.as_ptr() as usize;
+    let current = lookup
+        .as_ref()
+        .is_some_and(|index| index.ptr == ptr && index.len == pairs.len());
+    if !current {
+        let mut map = HashMap::with_capacity(pairs.len().saturating_mul(2).max(8));
+        for (i, (name, _)) in pairs.iter().enumerate() {
+            map.entry(name.clone()).or_insert(i);
+        }
+        *lookup = Some(ObjIndex {
+            ptr,
+            len: pairs.len(),
+            map,
+        });
+    }
+    let index = lookup.as_mut().expect("index");
+    if let Some(&slot) = index.map.get(key) {
+        pairs[slot].1 = value;
+        return Ok(());
+    }
+    let slot = pairs.len();
+    index.map.insert(key.to_string(), slot);
+    pairs.push((key.to_string(), value));
+    index.ptr = pairs.as_ptr() as usize;
+    index.len = pairs.len();
+    Ok(())
+}
+
+fn array_set(acc: &mut Value, index: i64, value: Value) -> Result<(), String> {
+    if let Value::String(_) = acc {
+        return Err("Cannot index string with number".to_string());
+    }
+    match acc {
+        Value::Object(_) => return Err("Cannot index object with number".to_string()),
+        Value::Null => *acc = Value::Array(Vec::new()),
+        Value::Array(_) => {}
+        other => {
+            return Err(format!("Cannot index {} with number", other.type_name()));
+        }
+    }
+    let Value::Array(items) = acc else {
+        unreachable!("array");
+    };
+    let Some(position) = resolve_index(index, items.len()) else {
+        return Err("Out of bounds negative array index".to_string());
+    };
+    if position >= items.len() {
+        items.resize(position + 1, Value::Null);
+    }
+    items[position] = value;
+    Ok(())
 }
 
 fn assign_one(paths: &[Vec<Step>], input: &Value, value: Value) -> Result<Value, String> {

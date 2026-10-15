@@ -164,6 +164,8 @@ struct Nest {
     items: Vec<Value>,
     item_at: usize,
     acc: Value,
+    /// Key positions for the accumulator object while `reduce` writes in place.
+    lookup: Option<super::update::ObjIndex>,
     frames: Vec<Vec<(String, Value)>>,
     frame_at: usize,
     alts: Vec<eval::Alts>,
@@ -1543,6 +1545,7 @@ fn replace_nest(
         items: Vec::new(),
         item_at: 0,
         acc: Value::Null,
+        lookup: None,
         frames: Vec::new(),
         frame_at: 0,
         alts: Vec::new(),
@@ -2251,6 +2254,7 @@ fn reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure
     };
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.acc = acc;
+        nest.lookup = None;
         nest.phase = 1;
     }
     nest_arm(machine, index, stream, input);
@@ -2270,13 +2274,18 @@ fn finish_reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, 
     reduce_item(machine, index)
 }
 
-fn reduce_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+enum NextItem {
+    End,
+    Loaded,
+}
+
+fn load_next_reduce_item(machine: &mut Machine, index: usize) -> Result<NextItem, Failure> {
     let more = match &*machine.stack[index].body {
         Body::Nest(nest) => nest.item_at < nest.items.len(),
         _ => false,
     };
     if !more {
-        return reduce_end_init(machine, index);
+        return Ok(NextItem::End);
     }
     let (pattern, item, flat) = match &*machine.stack[index].body {
         Body::Nest(nest) => {
@@ -2296,16 +2305,70 @@ fn reduce_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> 
         nest.frames = frames;
         nest.frame_at = 0;
     }
-    reduce_frame(machine, index)
+    Ok(NextItem::Loaded)
+}
+
+fn reduce_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    match load_next_reduce_item(machine, index)? {
+        NextItem::End => reduce_end_init(machine, index),
+        NextItem::Loaded => reduce_frame(machine, index),
+    }
+}
+
+/// One fast step. `Ok(false)` leaves the frame for the copying path.
+fn accelerate_machine_frame(machine: &mut Machine, index: usize) -> Result<bool, Failure> {
+    let (update, env) = {
+        let Body::Nest(nest) = &*machine.stack[index].body else {
+            return Ok(false);
+        };
+        let update = match &nest.kind {
+            Kind::Reduce { update, .. } => std::rc::Rc::clone(update),
+            _ => return Ok(false),
+        };
+        if !super::update::reduce_can_accelerate(&update) {
+            return Ok(false);
+        }
+        let frame = nest.frames[nest.frame_at].clone();
+        let outer = nest.env.flatten();
+        let env = eval::child_scope(&frame, &outer);
+        (update, env)
+    };
+    let Body::Nest(nest) = &mut *machine.stack[index].body else {
+        return Ok(false);
+    };
+    let handled = super::update::accelerate_reduce(&update, &mut nest.acc, &env, &mut nest.lookup)?;
+    if !handled {
+        return Ok(false);
+    }
+    nest.frame_at += 1;
+    nest.phase = 2;
+    Ok(true)
 }
 
 fn reduce_frame(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let ready = match &*machine.stack[index].body {
-        Body::Nest(nest) => nest.frame_at < nest.frames.len(),
-        _ => false,
-    };
-    if !ready {
-        return reduce_item(machine, index);
+    loop {
+        let ready = match &*machine.stack[index].body {
+            Body::Nest(nest) => nest.frame_at < nest.frames.len(),
+            _ => false,
+        };
+        if !ready {
+            match load_next_reduce_item(machine, index)? {
+                NextItem::End => return reduce_end_init(machine, index),
+                NextItem::Loaded => continue,
+            }
+        }
+        match accelerate_machine_frame(machine, index) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(failure) => {
+                let done = match &mut *machine.stack[index].body {
+                    Body::Nest(nest) => std::mem::take(&mut nest.buf),
+                    _ => Vec::new(),
+                };
+                return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
+            }
+        }
+        break;
     }
     let (update, env, acc) = match &*machine.stack[index].body {
         Body::Nest(nest) => {
@@ -2343,6 +2406,7 @@ fn finish_reduce_update(machine: &mut Machine, index: usize) -> Result<DoneAct, 
     let acc = values.last().cloned().unwrap_or(Value::Null);
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.acc = acc;
+        nest.lookup = None;
     }
     reduce_frame(machine, index)
 }
