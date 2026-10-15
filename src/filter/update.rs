@@ -401,6 +401,9 @@ fn run(
         Filter::Slice { start, end } => run_slice(start, end, input, path, line, input_gen, ctx),
         Filter::Iterate => run_iterate(input, path, line, input_gen, ctx),
         Filter::Recurse => run_recurse(input, path, line, input_gen, ctx),
+        Filter::RecurseDown { step, cond } => {
+            run_recurse_down(step, cond.as_deref(), input, path, line, input_gen, ctx)
+        }
         Filter::Optional(inner) => run_optional(inner, input, path, line, input_gen, ctx),
         Filter::Pipe(left, right) => run_pipe(left, right, input, path, line, input_gen, ctx),
         Filter::Comma(left, right) => run_comma(left, right, input, path, line, input_gen, ctx),
@@ -1106,6 +1109,113 @@ fn run_recurse(
         _ => {}
     }
     Ok(out)
+}
+
+/// `recurse(f)` and `recurse(f; cond)` as a path. The current value is
+/// included, then each output of `f` is entered once per truthy `cond`
+/// result. An output that was not reached by indexing is an invalid path,
+/// and a later output of `f` is left for the next index so a following
+/// error is not raised first.
+fn run_recurse_down(
+    step: &Filter,
+    cond: Option<&Filter>,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    if !carrier_now(line, input_gen) {
+        return Ok(vec![constant(input.clone(), path, line.get(), ctx.root)]);
+    }
+    let mut out = vec![pass(input, path, line, input_gen, ctx.root)];
+    let mut step_i = 0usize;
+    loop {
+        let child = match nth_path(step, input, path, line, input_gen, ctx, step_i) {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(err) => return Err(attach(out, err)),
+        };
+        step_i += 1;
+        if !child.carrier {
+            out.push(child);
+            break;
+        }
+        let mut cond_i = 0usize;
+        loop {
+            let go = match cond {
+                Some(cond) => match truthy_at(cond, &child.value, ctx.env, cond_i) {
+                    Ok(hit) => hit,
+                    Err(err) => return Err(attach(out, err)),
+                },
+                None => cond_i == 0,
+            };
+            if !go {
+                break;
+            }
+            cond_i += 1;
+            let cell = Cell::new(child.value_gen);
+            match run_recurse_down(
+                step,
+                cond,
+                &child.value,
+                &child.path,
+                &cell,
+                child.value_gen,
+                ctx,
+            ) {
+                Ok(more) => out.extend(more),
+                Err(err) => return Err(attach(out, err)),
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn nth_path(
+    step: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    index: usize,
+) -> Result<Option<POut>, PathErr> {
+    let saved = line.get();
+    let result = run_take(step, input, path, line, input_gen, ctx, index + 1);
+    line.set(saved);
+    match result {
+        Ok(mut got) => {
+            if got.len() <= index {
+                Ok(None)
+            } else {
+                Ok(Some(got.swap_remove(index)))
+            }
+        }
+        // Outputs before this index were already walked. Keeping them here
+        // would report those paths twice.
+        Err(err) => Err(PathErr {
+            partial: Vec::new(),
+            message: err.message,
+            caught: err.caught,
+        }),
+    }
+}
+
+fn truthy_at(
+    cond: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    index: usize,
+) -> Result<bool, PathErr> {
+    match stream::nth_truthy(cond, input, env, index) {
+        Ok(hit) => Ok(hit),
+        Err(failure) => Err(PathErr {
+            partial: Vec::new(),
+            message: failure.message,
+            caught: failure.caught,
+        }),
+    }
 }
 
 fn run_optional(

@@ -310,6 +310,117 @@ pub(super) fn eval_select(
     finish(out, err)
 }
 
+/// Compact JSON. A string is quoted. Anything else matches `tostring`.
+pub(super) fn eval_tojson(input: &Value) -> Result<Vec<Value>, Failure> {
+    let style = crate::print::Style {
+        layout: crate::print::Layout::Compact,
+        ..crate::print::Style::default()
+    };
+    Ok(vec![Value::String(crate::print::render(input, style))])
+}
+
+/// `reduce .[] as $x (null; . + $x)`. An empty walk is null.
+pub(super) fn eval_add(input: &Value) -> Result<Vec<Value>, Failure> {
+    let items = iterate(input)?;
+    let mut acc = Value::Null;
+    for item in items {
+        acc = add_values(&acc, &item).map_err(fail)?;
+    }
+    Ok(vec![acc])
+}
+
+pub(super) fn eval_to_entries(input: &Value) -> Result<Vec<Value>, Failure> {
+    let entries = match input {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, value)| entry(Value::Number(index.to_string()), value.clone()))
+            .collect(),
+        Value::Object(pairs) => pairs
+            .iter()
+            .map(|(key, value)| entry(Value::String(key.clone()), value.clone()))
+            .collect(),
+        other => {
+            return Err(fail(format!(
+                "{} ({}) has no keys",
+                other.type_name(),
+                shown(other)
+            )));
+        }
+    };
+    Ok(vec![Value::Array(entries)])
+}
+
+fn entry(key: Value, value: Value) -> Value {
+    Value::Object(vec![("key".to_string(), key), ("value".to_string(), value)])
+}
+
+/// `key`, then `Key`, then `name`, then `Name`. Null and false are skipped,
+/// as with `//`. The value is `value` when that field is present, otherwise
+/// `Value`, otherwise null. A null value does not fall through.
+pub(super) fn eval_from_entries(input: &Value) -> Result<Vec<Value>, Failure> {
+    let items = iterate(input)?;
+    let mut pairs = Vec::new();
+    for item in items {
+        let key = entry_key(&item)?;
+        let Value::String(name) = key else {
+            return Err(fail(super::parse::key_message(&key)));
+        };
+        put(&mut pairs, name, entry_value(&item));
+    }
+    Ok(vec![Value::Object(pairs)])
+}
+
+fn entry_key(item: &Value) -> Result<Value, Failure> {
+    match item {
+        Value::Object(pairs) => {
+            for name in ["key", "Key", "name", "Name"] {
+                if let Some(value) = field(pairs, name) {
+                    if truthy(value) {
+                        return Ok(value.clone());
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+        Value::Null => Ok(Value::Null),
+        other => {
+            index_string(other, "key")?;
+            Ok(Value::Null)
+        }
+    }
+}
+
+fn entry_value(item: &Value) -> Value {
+    let Value::Object(pairs) = item else {
+        return Value::Null;
+    };
+    if let Some(value) = field(pairs, "value") {
+        return value.clone();
+    }
+    if let Some(value) = field(pairs, "Value") {
+        return value.clone();
+    }
+    Value::Null
+}
+
+fn field<'a>(pairs: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
+pub(super) fn eval_with_entries(
+    update: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let entries = eval_to_entries(input)?;
+    let mapped = eval_map(update, &entries[0], env)?;
+    eval_from_entries(&mapped[0])
+}
+
 /// `map` is `[.[] | f]`. A failure inside drops the array.
 pub(super) fn eval_map(
     inner: &Filter,

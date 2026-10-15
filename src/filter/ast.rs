@@ -36,8 +36,26 @@ pub enum Filter {
         end: Option<String>,
     },
     Iterate,
-    /// `..`, the value and then every value inside it.
+    /// `..` and `recurse` with no arguments. The value, then every value inside it.
     Recurse,
+    /// `recurse(f)` or `recurse(f; cond)`. Depth first. `cond` is checked on
+    /// each output of `f`, and that output is entered once per truthy result.
+    RecurseDown {
+        step: Box<Filter>,
+        cond: Option<Box<Filter>>,
+    },
+    /// `walk(f)`. Arrays and objects are rebuilt from the bottom, then `f` runs.
+    Walk(Box<Filter>),
+    /// `to_entries`.
+    ToEntries,
+    /// `from_entries`.
+    FromEntries,
+    /// `with_entries(f)`.
+    WithEntries(Box<Filter>),
+    /// `tojson`. Compact JSON, with a string quoted.
+    ToJson,
+    /// `add`. `reduce .[] as $x (null; . + $x)`.
+    Add,
     Pipe(Box<Filter>, Box<Filter>),
     Comma(Box<Filter>, Box<Filter>),
     Optional(Box<Filter>),

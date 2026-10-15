@@ -112,6 +112,15 @@ pub(super) fn produce(
         Filter::Type => Ok(vec![Value::String(input.type_name().to_string())]),
         Filter::ToNumber => eval_tonumber(input),
         Filter::ToString => Ok(vec![Value::String(jq_text(input))]),
+        Filter::ToJson => super::builtin::eval_tojson(input),
+        Filter::Add => super::builtin::eval_add(input),
+        Filter::ToEntries => super::builtin::eval_to_entries(input),
+        Filter::FromEntries => super::builtin::eval_from_entries(input),
+        Filter::WithEntries(arg) => super::builtin::eval_with_entries(arg, input, env),
+        Filter::Walk(arg) => super::stream::walk_values(arg, input, env),
+        Filter::RecurseDown { step, cond } => {
+            super::stream::recurse_values(step, cond.as_deref(), input, env)
+        }
         Filter::Join(arg) => eval_join(arg, input, env),
         Filter::LTrim(arg) => eval_trim(arg, input, env, true),
         Filter::RTrim(arg) => eval_trim(arg, input, env, false),

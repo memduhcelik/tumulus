@@ -38,6 +38,13 @@ enum Body {
     /// `[]`, `{}`, `//`, `try`, `reduce`, `as`, `first`, `limit`, `map`, and
     /// the index after an array. The child runs on this stack.
     Nest(Nest),
+    /// `..` and `recurse` with no arguments, once a call is already here.
+    /// One value leaves at a time, so `limit` can stop.
+    Dots(Dots),
+    /// `recurse(f)` and `recurse(f; cond)`. One value leaves at a time.
+    Recur(Recur),
+    /// `walk(f)`. Children are rebuilt here, then `f` runs.
+    Walk(Walk),
 }
 
 struct Run {
@@ -208,6 +215,44 @@ enum Take {
     Sub(Value),
 }
 
+struct Dots {
+    stack: Vec<Value>,
+}
+
+struct Recur {
+    step: Rc<Filter>,
+    cond: Option<Rc<Filter>>,
+    env: Vec<(String, Value)>,
+    scope: Rc<ScopeNode>,
+    frames: Vec<RecurFrame>,
+}
+
+struct RecurFrame {
+    value: Value,
+    emitted: bool,
+    step_i: usize,
+    cond_i: usize,
+    child: Option<Value>,
+}
+
+struct Walk {
+    update: Rc<Filter>,
+    env: Rc<func::EnvLink>,
+    scope: Rc<ScopeNode>,
+    input: Value,
+    /// `None` is an array element. `Some` is an object field, in order.
+    kids: Vec<(Option<String>, Value)>,
+    kid_at: usize,
+    built_arr: Vec<Value>,
+    built_obj: Vec<(String, Value)>,
+    is_object: bool,
+    /// 0 not opened, 1 walking children, 2 running `f`.
+    mode: u8,
+    kept: bool,
+    /// An object field keeps one value and drops the rest of that walk.
+    cut_child: bool,
+}
+
 enum Act {
     Cont,
     Value(Value),
@@ -295,6 +340,9 @@ fn install_top(machine: &Machine, index: usize) {
             &call.caller_scope
         }),
         Body::Nest(nest) => Some(&nest.scope),
+        Body::Dots(_) => None,
+        Body::Recur(recur) => Some(&recur.scope),
+        Body::Walk(walk) => Some(&walk.scope),
     };
     if let Some(scope) = scope {
         func::install_scope(Rc::clone(scope));
@@ -366,6 +414,9 @@ fn step(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Body::If(_) => Ok(Act::Cont),
         Body::Call(_) => step_call(machine, index),
         Body::Nest(_) => step_nest(machine, index),
+        Body::Dots(_) => step_dots(machine, index),
+        Body::Recur(_) => step_recur(machine, index),
+        Body::Walk(_) => step_walk(machine, index),
     }
 }
 
@@ -621,6 +672,45 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             env,
             scope,
         ),
+        Filter::Recurse => {
+            machine.stack[index].body = Box::new(Body::Dots(Dots { stack: vec![input] }));
+            Ok(Act::Cont)
+        }
+        Filter::RecurseDown { step, cond } => {
+            let cond = cond.as_ref().map(|cond| Rc::new((**cond).clone()));
+            let step = Rc::new((**step).clone());
+            machine.stack[index].body = Box::new(Body::Recur(Recur {
+                step,
+                cond,
+                env: env.flatten(),
+                scope,
+                frames: vec![RecurFrame {
+                    value: input,
+                    emitted: false,
+                    step_i: 0,
+                    cond_i: 0,
+                    child: None,
+                }],
+            }));
+            Ok(Act::Cont)
+        }
+        Filter::Walk(update) => {
+            machine.stack[index].body = Box::new(Body::Walk(Walk {
+                update: Rc::new((**update).clone()),
+                env,
+                scope,
+                input,
+                kids: Vec::new(),
+                kid_at: 0,
+                built_arr: Vec::new(),
+                built_obj: Vec::new(),
+                is_object: false,
+                mode: 0,
+                kept: false,
+                cut_child: false,
+            }));
+            Ok(Act::Cont)
+        }
         other => fallback(machine, index, other, &input, &env),
     }
 }
@@ -978,8 +1068,9 @@ fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Fa
                 Ok(Taken::Send(value))
             }
         }
-        Body::Run(_) => Ok(Taken::Send(value)),
+        Body::Run(_) | Body::Dots(_) | Body::Recur(_) => Ok(Taken::Send(value)),
         Body::Nest(_) => nest_accept(machine, index, value),
+        Body::Walk(_) => walk_accept(machine, index, value),
     }
 }
 
@@ -1074,7 +1165,8 @@ fn on_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
         Body::If(_) => finish_if(machine, index),
         Body::Call(_) => finish_call(machine, index),
         Body::Nest(_) => nest_child_done(machine, index),
-        Body::Run(_) => Ok(DoneAct::Finish),
+        Body::Run(_) | Body::Dots(_) | Body::Recur(_) => Ok(DoneAct::Finish),
+        Body::Walk(_) => walk_done(machine, index),
     }
 }
 
@@ -2604,4 +2696,280 @@ fn nest_on_error(
         DoneAct::Fail(failure) => Ok(NestErr::Go(failure)),
         DoneAct::Finish => Ok(NestErr::Done),
     }
+}
+
+fn step_dots(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let value = match &mut *machine.stack[index].body {
+        Body::Dots(dots) => dots.stack.pop(),
+        _ => None,
+    };
+    let Some(value) = value else {
+        return Ok(Act::Done);
+    };
+    if let Ok(mut children) = eval::iterate(&value) {
+        children.reverse();
+        if let Body::Dots(dots) = &mut *machine.stack[index].body {
+            dots.stack.extend(children);
+        }
+    }
+    Ok(Act::Value(value))
+}
+
+/// Emit the frame, then enter the next output of `step`. With no `cond`,
+/// that output is entered once. With `cond`, once per truthy result.
+/// The current value is emitted before `cond` runs. A later output of `step`
+/// or `cond` is not run until this branch is finished, so `limit` can stop
+/// an endless walk before an error sitting beside it.
+fn step_recur(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let Body::Recur(recur) = &mut *machine.stack[index].body else {
+        return Ok(Act::Done);
+    };
+    match recur_pull(recur) {
+        Ok(Some(value)) => Ok(Act::Value(value)),
+        Ok(None) => Ok(Act::Done),
+        Err(failure) => Ok(Act::Fail(failure)),
+    }
+}
+
+fn recur_pull(recur: &mut Recur) -> Result<Option<Value>, Failure> {
+    loop {
+        if recur.frames.is_empty() {
+            return Ok(None);
+        }
+        let emitted = recur.frames.last().unwrap().emitted;
+        if !emitted {
+            recur.frames.last_mut().unwrap().emitted = true;
+            let value = recur.frames.last().unwrap().value.clone();
+            return Ok(Some(value));
+        }
+        let has_child = recur.frames.last().unwrap().child.is_some();
+        if !has_child {
+            let value = recur.frames.last().unwrap().value.clone();
+            let step_i = recur.frames.last().unwrap().step_i;
+            let step = Rc::clone(&recur.step);
+            match super::stream::nth_value(&step, &value, &recur.env, step_i)? {
+                None => {
+                    recur.frames.pop();
+                }
+                Some(child) => {
+                    let frame = recur.frames.last_mut().unwrap();
+                    frame.child = Some(child);
+                    frame.cond_i = 0;
+                }
+            }
+            continue;
+        }
+        let child = recur.frames.last().unwrap().child.clone().unwrap();
+        let cond_i = recur.frames.last().unwrap().cond_i;
+        let descend = if let Some(cond) = recur.cond.clone() {
+            super::stream::nth_truthy(&cond, &child, &recur.env, cond_i)?
+        } else {
+            cond_i == 0
+        };
+        if descend {
+            recur.frames.last_mut().unwrap().cond_i += 1;
+            let child = recur.frames.last().unwrap().child.clone().unwrap();
+            recur.frames.push(RecurFrame {
+                value: child,
+                emitted: false,
+                step_i: 0,
+                cond_i: 0,
+                child: None,
+            });
+        } else {
+            let frame = recur.frames.last_mut().unwrap();
+            frame.child = None;
+            frame.step_i += 1;
+        }
+    }
+}
+
+fn step_walk(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let (mode, cut) = match &*machine.stack[index].body {
+        Body::Walk(walk) => (walk.mode, walk.cut_child),
+        _ => return Ok(Act::Cont),
+    };
+    if mode == 0 {
+        walk_open(machine, index);
+        return Ok(Act::Cont);
+    }
+    if !cut {
+        return Ok(Act::Cont);
+    }
+    if let Body::Walk(walk) = &mut *machine.stack[index].body {
+        walk.cut_child = false;
+    }
+    match walk_done(machine, index)? {
+        DoneAct::Stay => Ok(Act::Cont),
+        DoneAct::Finish => Ok(Act::Done),
+        DoneAct::Fail(failure) => Ok(Act::Fail(failure)),
+    }
+}
+
+fn walk_open(machine: &mut Machine, index: usize) {
+    let input = match &mut *machine.stack[index].body {
+        Body::Walk(walk) => std::mem::replace(&mut walk.input, Value::Null),
+        _ => return,
+    };
+    match input {
+        Value::Array(items) => {
+            let kids = items.into_iter().map(|value| (None, value)).collect();
+            walk_set_kids(machine, index, false, kids);
+        }
+        Value::Object(pairs) => {
+            let kids = pairs
+                .into_iter()
+                .map(|(key, value)| (Some(key), value))
+                .collect();
+            walk_set_kids(machine, index, true, kids);
+        }
+        other => walk_apply(machine, index, other),
+    }
+}
+
+fn walk_set_kids(
+    machine: &mut Machine,
+    index: usize,
+    is_object: bool,
+    kids: Vec<(Option<String>, Value)>,
+) {
+    let empty = kids.is_empty();
+    if let Body::Walk(walk) = &mut *machine.stack[index].body {
+        walk.is_object = is_object;
+        walk.kids = kids;
+        walk.kid_at = 0;
+        walk.mode = 1;
+        walk.kept = false;
+    }
+    if empty {
+        let value = if is_object {
+            Value::Object(Vec::new())
+        } else {
+            Value::Array(Vec::new())
+        };
+        walk_apply(machine, index, value);
+        return;
+    }
+    walk_push_child(machine, index);
+}
+
+fn walk_apply(machine: &mut Machine, index: usize, value: Value) {
+    let (update, env, scope) = match &*machine.stack[index].body {
+        Body::Walk(walk) => (
+            Rc::clone(&walk.update),
+            Rc::clone(&walk.env),
+            Rc::clone(&walk.scope),
+        ),
+        _ => return,
+    };
+    if let Body::Walk(walk) = &mut *machine.stack[index].body {
+        walk.mode = 2;
+    }
+    push_run(machine, index, update, value, env, scope);
+}
+
+fn walk_push_child(machine: &mut Machine, index: usize) {
+    let (update, env, scope, input) = match &*machine.stack[index].body {
+        Body::Walk(walk) => {
+            let input = walk.kids[walk.kid_at].1.clone();
+            (
+                Rc::clone(&walk.update),
+                Rc::clone(&walk.env),
+                Rc::clone(&walk.scope),
+                input,
+            )
+        }
+        _ => return,
+    };
+    machine.stack.push(Item {
+        parent: index as u32,
+        body: Box::new(Body::Walk(Walk {
+            update,
+            env,
+            scope,
+            input,
+            kids: Vec::new(),
+            kid_at: 0,
+            built_arr: Vec::new(),
+            built_obj: Vec::new(),
+            is_object: false,
+            mode: 0,
+            kept: false,
+            cut_child: false,
+        })),
+    });
+}
+
+/// An array keeps every output of a child. An object keeps the first and
+/// drops a field whose walk yields nothing. Outputs of `f` go upward.
+fn walk_accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let mode = match &*machine.stack[index].body {
+        Body::Walk(walk) => walk.mode,
+        _ => return Ok(Taken::Send(value)),
+    };
+    if mode == 2 {
+        return Ok(Taken::Send(value));
+    }
+    let mut cut = false;
+    if let Body::Walk(walk) = &mut *machine.stack[index].body {
+        if walk.is_object {
+            if !walk.kept {
+                let key = walk
+                    .kids
+                    .get(walk.kid_at)
+                    .and_then(|(key, _)| key.clone())
+                    .unwrap_or_default();
+                walk.built_obj.push((key, value));
+                walk.kept = true;
+                // The rest of this field is not run. An error or an endless
+                // `recurse` there never starts.
+                walk.cut_child = true;
+                cut = true;
+            }
+        } else {
+            walk.built_arr.push(value);
+        }
+    }
+    if cut {
+        machine.stack.truncate(index + 1);
+    }
+    Ok(Taken::Keep)
+}
+
+fn walk_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let mode = match &*machine.stack[index].body {
+        Body::Walk(walk) => walk.mode,
+        _ => return Ok(DoneAct::Finish),
+    };
+    if mode != 1 {
+        return Ok(DoneAct::Finish);
+    }
+    let kid_at = match &mut *machine.stack[index].body {
+        Body::Walk(walk) => {
+            walk.kid_at += 1;
+            walk.kept = false;
+            walk.kid_at
+        }
+        _ => 0,
+    };
+    let more = match &*machine.stack[index].body {
+        Body::Walk(walk) => kid_at < walk.kids.len(),
+        _ => false,
+    };
+    if more {
+        walk_push_child(machine, index);
+        return Ok(DoneAct::Stay);
+    }
+    let value = match &mut *machine.stack[index].body {
+        Body::Walk(walk) => {
+            if walk.is_object {
+                Value::Object(std::mem::take(&mut walk.built_obj))
+            } else {
+                Value::Array(std::mem::take(&mut walk.built_arr))
+            }
+        }
+        _ => Value::Null,
+    };
+    walk_apply(machine, index, value);
+    Ok(DoneAct::Stay)
 }

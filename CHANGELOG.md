@@ -20,7 +20,9 @@
 
 A filter that does not call a user function runs at the speed it did before a function could call itself a million levels deep. A function can still call itself that deep. A call inside `[]`, `{}`, `//`, `try`, `reduce`, `as`, `first`, `limit`, or `map` can go 100000 levels deep.
 
-Of the 447 programs in jq 1.7.1's test file, 284 come out the same.
+`recurse` and `..` yield a value and then each value inside it. `recurse(f)` walks each value `f` yields, depth first. `recurse(f; cond)` walks such a value once for each truthy result of `cond`. `limit` and `first` stop that walk before a later value is produced. Used as a path, `recurse(f)` includes the current value and then each value `f` reaches by indexing, and `cond` decides whether that value is entered. A computed value is an invalid path. `walk(f)` rebuilds an array or object from the bottom and then runs `f`. An array keeps every value a child yields. An object keeps the first value of a field and does not run the rest of that field, and a field that yields nothing is left out. `to_entries` writes `{key, value}` pairs in stored order. An array's keys are numbers. `from_entries` reads `key`, then `Key`, then `name`, then `Name`, and skips null and false. `k` is not a key. The value is the `value` field when it is present, even if that value is null, otherwise `Value`, otherwise null. `with_entries(f)` runs `f` over those pairs and reads them back. `tojson` writes compact JSON, and a string is quoted. `add` folds with `+`, starting from null. An empty array or object is null. A value of the wrong kind fails the way jq fails, and the exit status is 5.
+
+Of the 447 programs in jq 1.7.1's test file, 293 come out the same.
 
 ## 0.5.0
 

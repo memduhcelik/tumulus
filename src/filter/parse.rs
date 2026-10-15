@@ -65,6 +65,10 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString
+        | Filter::ToJson
+        | Filter::Add
+        | Filter::ToEntries
+        | Filter::FromEntries
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
@@ -102,6 +106,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner)
+        | Filter::Walk(inner)
+        | Filter::WithEntries(inner)
         | Filter::Join(inner)
         | Filter::LTrim(inner)
         | Filter::RTrim(inner)
@@ -151,6 +157,13 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         Filter::At { base, key, .. } => {
             check_vars(base, scope)?;
             check_vars(key, scope)
+        }
+        Filter::RecurseDown { step, cond } => {
+            check_vars(step, scope)?;
+            if let Some(cond) = cond {
+                check_vars(cond, scope)?;
+            }
+            Ok(())
         }
         Filter::Math2(_, left, right) => {
             check_vars(left, scope)?;
@@ -323,6 +336,10 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString
+        | Filter::ToJson
+        | Filter::Add
+        | Filter::ToEntries
+        | Filter::FromEntries
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime
@@ -357,6 +374,8 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner)
+        | Filter::Walk(inner)
+        | Filter::WithEntries(inner)
         | Filter::Join(inner)
         | Filter::LTrim(inner)
         | Filter::RTrim(inner)
@@ -370,6 +389,12 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::First(Some(inner))
         | Filter::Last(Some(inner))
         | Filter::Repeat(inner) => walk_defs(inner, seen, errors),
+        Filter::RecurseDown { step, cond } => {
+            walk_defs(step, seen, errors);
+            if let Some(cond) = cond {
+                walk_defs(cond, seen, errors);
+            }
+        }
         Filter::Paths(Some(inner)) => walk_defs(inner, seen, errors),
         Filter::Try { body, handler } => {
             walk_defs(body, seen, errors);
@@ -525,13 +550,14 @@ fn unbox(args: Vec<Box<Filter>>) -> Vec<Filter> {
 
 fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
-        "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "todate"
-        | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" => arity == 0,
+        "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "tojson"
+        | "todate" | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" | "add"
+        | "to_entries" | "from_entries" => arity == 0,
         "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "strftime"
-        | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat" => {
-            arity == 1
-        }
+        | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat"
+        | "walk" | "with_entries" => arity == 1,
         "paths" | "first" | "last" | "error" => arity <= 1,
+        "recurse" => arity <= 2,
         "nth" => arity == 1 || arity == 2,
         "range" => (1..=3).contains(&arity),
         "limit" | "until" | "while" | "setpath" => arity == 2,
@@ -558,6 +584,23 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "type" => Filter::Type,
         "tonumber" => Filter::ToNumber,
         "tostring" => Filter::ToString,
+        "tojson" => Filter::ToJson,
+        "add" => Filter::Add,
+        "to_entries" => Filter::ToEntries,
+        "from_entries" => Filter::FromEntries,
+        "walk" => Filter::Walk(args.next().expect("walk")),
+        "with_entries" => Filter::WithEntries(args.next().expect("with_entries")),
+        "recurse" => match args.len() {
+            0 => Filter::Recurse,
+            1 => Filter::RecurseDown {
+                step: args.next().expect("step"),
+                cond: None,
+            },
+            _ => Filter::RecurseDown {
+                step: args.next().expect("step"),
+                cond: Some(args.next().expect("cond")),
+            },
+        },
         "todate" => Filter::ToDate,
         "fromdate" => Filter::FromDate,
         "gmtime" => Filter::GmTime,
@@ -2382,6 +2425,13 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString
+        | Filter::ToJson
+        | Filter::Add
+        | Filter::ToEntries
+        | Filter::FromEntries
+        | Filter::WithEntries(_)
+        | Filter::Walk(_)
+        | Filter::RecurseDown { .. }
         | Filter::Join(_)
         | Filter::LTrim(_)
         | Filter::RTrim(_)

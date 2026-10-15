@@ -212,6 +212,11 @@ fn drive(
         Filter::Until(cond, next) => drive_until(cond, next, input, env, emit),
         Filter::While(cond, update) => drive_while(cond, update, input, env, emit),
         Filter::Repeat(expr) => drive_repeat(expr, input, env, emit),
+        Filter::Recurse => drive_dots(input, emit),
+        Filter::RecurseDown { .. } | Filter::Walk(_) => {
+            let mut forward = |value| emit.call(value);
+            super::machine::run(filter, input, env, &mut forward)
+        }
         // A call runs on the heap so a function can call itself a million
         // levels deep. Every other filter stays on the direct path. That path
         // is what walks a large array.
@@ -988,6 +993,117 @@ fn drive_while(
     }
     let cond_stopped = result?;
     Ok(stopped.get() || cond_stopped)
+}
+
+/// `..` and `recurse`. Parent first, then each element or object value.
+fn drive_dots(input: &Value, emit: &Emit) -> Result<bool, Failure> {
+    let mut stack = vec![input.clone()];
+    while let Some(value) = stack.pop() {
+        if let Ok(mut children) = super::eval::iterate(&value) {
+            children.reverse();
+            stack.extend(children);
+        }
+        if emit.call(value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn recurse_values(
+    step: &Filter,
+    cond: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    streamed(input, env, |emit| {
+        super::machine::run(
+            &Filter::RecurseDown {
+                step: Box::new(step.clone()),
+                cond: cond.map(|cond| Box::new(cond.clone())),
+            },
+            input,
+            env,
+            &mut |value| emit.call(value),
+        )
+    })
+}
+
+pub(super) fn walk_values(
+    update: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    streamed(input, env, |emit| {
+        super::machine::run(
+            &Filter::Walk(Box::new(update.clone())),
+            input,
+            env,
+            &mut |value| emit.call(value),
+        )
+    })
+}
+
+/// The `index`th value of `filter`, or nothing when the stream ends first.
+/// Later values are not run. An earlier error is returned.
+pub(super) fn nth_value(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    index: usize,
+) -> Result<Option<Value>, Failure> {
+    let mut seen = 0usize;
+    let mut found = None;
+    let mut on_value = |value: Value| {
+        if seen == index {
+            found = Some(value);
+            return true;
+        }
+        seen += 1;
+        false
+    };
+    let emit = Emit {
+        f: RefCell::new(&mut on_value),
+    };
+    match drive(filter, input, env, &emit) {
+        Ok(_) => Ok(found),
+        Err(_) if found.is_some() => Ok(found),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `cond` has an `index`th truthy output. The stream stops there, so
+/// a later error is left for the next index.
+pub(super) fn nth_truthy(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    index: usize,
+) -> Result<bool, Failure> {
+    let mut truths = 0usize;
+    let mut hit = false;
+    let mut on_value = |value: Value| {
+        if !super::eval::truthy(&value) {
+            return false;
+        }
+        if truths == index {
+            hit = true;
+            return true;
+        }
+        truths += 1;
+        false
+    };
+    let emit = Emit {
+        f: RefCell::new(&mut on_value),
+    };
+    match drive(filter, input, env, &emit) {
+        Ok(_) => Ok(hit),
+        Err(err) if hit => {
+            let _ = err;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn drive_repeat(
