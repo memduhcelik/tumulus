@@ -1254,8 +1254,7 @@ fn operator_syntax_stays_generic() {
     require_jq();
     let bin = env!("CARGO_BIN_EXE_tumulus");
     for program in [
-        "1<2<3", "1==1==1", "{a:1+2}", "not true", "1++2", ".a=.b=1", ".a|=.|=.",
-        ".a+=1+=2",
+        "1<2<3", "1==1==1", "{a:1+2}", "not true", "1++2", ".a=.b=1", ".a|=.|=.", ".a+=1+=2",
     ] {
         let args: Vec<String> = ["-n", "-c", "--", program]
             .into_iter()
@@ -5743,6 +5742,43 @@ fn defs_match_jq() {
         "def f($a): $a; [limit(2; f(1,2,3,4))]",
         "def f($a; b; $c): [$a, b, $c]; [f(1,2; 10,20; 3,4)]",
         "def fac($n): if $n <= 1 then 1 else $n * fac($n-1) end; fac(5)",
+        "def f($a): a; f(5)",
+        "def f($a): a + 1; f(5)",
+        "def f($a): 1 | a; f(5)",
+        "def f($a): 1 | a; 10 | f(.+5)",
+        "10 as $x | def f($a): 1 | a; f($x)",
+        "def f($a): a; f(1,2)",
+        "def f($a): [a, a]; [f(1,2)]",
+        "def f($a): [a, $a]; f(5)",
+        "def f($a): [a, $a]; [f(1,2)]",
+        "def f($a): a+1; [f(1,2)]",
+        "def f($a): a, a; [f(1,2)]",
+        "def f($a; $b): [a, b]; f(1,2; 3,4)",
+        "def f($a): . + a; 10 | f(1)",
+        "def f($a): a | . + 1; f(5)",
+        "def f($a): a(.); f(5)",
+        "5 as $a | a",
+        "def f($a): a; try f(1, error(\"z\")) catch .",
+        "def f($nan): nan; f(1)",
+        "def f(nan): nan; f(1)",
+        "def f($length): length; f(3)",
+        "def f(length): length; f(3)",
+        "def f(g): def g: 5; g; f(1)",
+        "def g: 1; def f(g): g; f(2)",
+        "def f(g): [g, def g: 5; g]; f(1)",
+        "def f($a): def a: 9; a; f(5)",
+        "def a: 9; def f($a): a; f(5)",
+        "def f($a): def g: a; g; f(3)",
+        "def f(a): def g: a; def a: 4; g; f(3)",
+        "def f($a; a): [$a, a]; f(1; 2)",
+        "def f(a; $a): [$a, a]; f(2; 1)",
+        "def f($a; $a): [$a, a]; f(1; 2)",
+        "def f($a; $b; $a): [$a, $b, a]; f(1; 3; 2)",
+        "def f(a; a): a; f(1; 2)",
+        "def f: if . == 0 then 0 else .-1 | f end; 100000 | f",
+        "def f: if . == 0 then 0 else (.-1 | f) + 0 end; 100000 | f",
+        "def f($n): if $n<=0 then 0 else f($n-1) end; f(100000)",
+        "def f($n): if $n<=0 then 0 else f($n-1)+0 end; f(100000)",
         "def f: 1,2; [limit(1; f)]",
         "def f: 1, error(\"z\"), 3; try f catch .",
         "[limit(3; def f: 1, f; f)]",
@@ -5790,6 +5826,11 @@ fn defs_match_jq() {
     }
     let fed = [
         ("def f: . + 1; f", "3"),
+        ("def f($a): . + a; f(5)", "10"),
+        (
+            "def f(g): def g: if . == 0 then 0 else .-1 | g end; g; f(1)",
+            "4",
+        ),
         (
             "def f: .+1; def g: f; def f: .+100; def f(a):a+.+11; [(g|f(20)), f]",
             "1",

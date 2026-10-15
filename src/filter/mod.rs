@@ -4,6 +4,7 @@ mod ast;
 mod builtin;
 mod eval;
 mod func;
+mod machine;
 mod parse;
 mod stream;
 mod update;

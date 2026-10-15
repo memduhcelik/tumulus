@@ -212,13 +212,10 @@ fn drive(
         Filter::Until(cond, next) => drive_until(cond, next, input, env, emit),
         Filter::While(cond, update) => drive_while(cond, update, input, env, emit),
         Filter::Repeat(expr) => drive_repeat(expr, input, env, emit),
-        Filter::Define { rest, .. } => drive(rest, input, env, emit),
-        Filter::Call { func, args } => drive_call(func, args, input, env, emit),
-        Filter::Param(name) => drive_param(name, input, env, emit),
-        Filter::Unresolved { name, arity, .. } => {
-            Err(fail(format!("{name}/{arity} is not defined")))
+        other => {
+            let mut emit = |value| emit.call(value);
+            super::machine::run(other, input, env, &mut emit)
         }
-        other => relay(eval::produce(other, input, env), emit),
     }
 }
 
@@ -248,31 +245,6 @@ fn drive_call(
     })
 }
 
-fn drive_param(
-    name: &str,
-    input: &Value,
-    _env: &[(String, Value)],
-    emit: &Emit,
-) -> Result<bool, Failure> {
-    let Some(closure) = func::lookup(name) else {
-        return Err(fail(format!("{name} is not defined")));
-    };
-    // The argument runs in the caller's scope. Values it yields are consumed
-    // by the caller, which still sees this function's parameters. Restore
-    // that scope before handing a value on, or `a | a` looks the name up in
-    // the caller's scope.
-    let here = func::current_scope();
-    let _guard = func::set_scope(Rc::clone(&closure.scope));
-    let mut forward = |value: Value| {
-        let _back = func::set_scope(Rc::clone(&here));
-        emit.call(value)
-    };
-    let forward = Emit {
-        f: RefCell::new(&mut forward),
-    };
-    drive(&closure.expr, input, &closure.env, &forward)
-}
-
 /// Every combination of the `$` arguments, leftmost outermost.
 /// A filter argument is not run here. An empty `$` argument runs nothing.
 /// A later value is not run once the body asks to stop or fails.
@@ -287,14 +259,9 @@ pub(super) fn each_binding(
         return Err(fail("function is not defined".to_string()));
     };
     let caller_scope = func::current_scope();
-    let slots = func::prepare(&cell.params, args, env, &caller_scope);
-    let filters: Vec<(String, Rc<func::Closure>)> = slots
-        .iter()
-        .filter_map(|slot| match slot {
-            func::Slot::Filter { name, closure } => Some((name.clone(), Rc::clone(closure))),
-            func::Slot::Value { .. } => None,
-        })
-        .collect();
+    let link = func::EnvLink::from_slice(env);
+    let slots = func::prepare(&cell.params, args, &link, &caller_scope);
+    let filters: Vec<(String, Rc<func::Closure>)> = slots.iter().map(func::slot_closure).collect();
     bind_from(
         &slots,
         0,
@@ -332,7 +299,7 @@ fn bind_from(
             caller_scope,
             visit,
         ),
-        func::Slot::Value { name, expr } => {
+        func::Slot::Value { name, expr, .. } => {
             let name = name.clone();
             for_each(expr, input, caller_env, |value| {
                 values.push((name.clone(), value));

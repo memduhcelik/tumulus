@@ -524,7 +524,7 @@ fn run_param(
         return Err(bare(format!("{name} is not defined")));
     };
     let _guard = super::func::set_scope(std::rc::Rc::clone(&closure.scope));
-    let env = closure.env.clone();
+    let env = closure.env.flatten();
     let child = Ctx {
         root: ctx.root,
         next: ctx.next,

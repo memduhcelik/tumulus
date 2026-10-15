@@ -618,9 +618,7 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
             Kind::Unary(op) => Filter::Math1(op),
             Kind::Abs => Filter::Abs,
             Kind::Pow10 => Filter::Pow10,
-            Kind::Binary(op) => {
-                Filter::Math2(op, args.next().expect("x"), args.next().expect("y"))
-            }
+            Kind::Binary(op) => Filter::Math2(op, args.next().expect("x"), args.next().expect("y")),
             Kind::Fma => Filter::Math3(
                 args.next().expect("x"),
                 args.next().expect("y"),
@@ -666,6 +664,11 @@ pub(super) struct Parser<'a> {
 struct PScope {
     funcs: Vec<Sig>,
     params: Vec<String>,
+}
+
+enum Found {
+    Func(Rc<FnCell>),
+    Param,
 }
 
 struct Sig {
@@ -966,26 +969,24 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
         let arity = args.len();
-        // A filter parameter is only the bare name. `a(1)` is a call.
-        if arity == 0 && self.lookup_param(&name) {
-            return Ok(Filter::Param(name));
+        // An inner function hides a parameter of the same name. A parameter
+        // hides an outer function. `$name` is also the filter `name`.
+        if let Some(found) = self.resolve(&name, arity) {
+            return Ok(match found {
+                Found::Func(func) => Filter::Call {
+                    func: Rc::downgrade(&func),
+                    args: unbox(args),
+                },
+                Found::Param => Filter::Param(name),
+            });
         }
-        if arity == 0
-            && matches!(name.as_str(), "nan" | "infinite")
-            && self.lookup_func(&name, 0).is_none()
-        {
+        if arity == 0 && matches!(name.as_str(), "nan" | "infinite") {
             let text = if name == "nan" {
                 number::nan_text()
             } else {
                 number::pos_inf()
             };
             return Ok(Filter::Literal(Value::Number(text)));
-        }
-        if let Some(func) = self.lookup_func(&name, arity) {
-            return Ok(Filter::Call {
-                func: Rc::downgrade(&func),
-                args: unbox(args),
-            });
         }
         if is_builtin(&name, arity) {
             return Ok(build_builtin(&name, args));
@@ -1023,16 +1024,15 @@ impl<'a> Parser<'a> {
         // The name is visible in the body and the rest, then it drops out so
         // a `def` inside parentheses does not shadow the code after them.
         let slot = self.define(&name, Rc::clone(&func));
-        let filter_params = params
-            .iter()
-            .filter_map(|param| match param {
-                FnParam::Filter(name) => Some(name.clone()),
-                FnParam::Value(_) => None,
-            })
-            .collect();
+        let mut names = Vec::with_capacity(params.len());
+        for param in &params {
+            match param {
+                FnParam::Filter(name) | FnParam::Value(name) => names.push(name.clone()),
+            }
+        }
         self.scopes.push(PScope {
             funcs: Vec::new(),
-            params: filter_params,
+            params: names,
         });
         let body = self.parse_pipe();
         self.scopes.pop();
@@ -1102,7 +1102,9 @@ impl<'a> Parser<'a> {
         (scope, index)
     }
 
-    fn lookup_func(&self, name: &str, arity: usize) -> Option<Rc<FnCell>> {
+    /// The innermost scope wins. In one scope a function hides a parameter,
+    /// and the later parameter of a name hides the earlier one.
+    fn resolve(&self, name: &str, arity: usize) -> Option<Found> {
         for scope in self.scopes.iter().rev() {
             if let Some(sig) = scope
                 .funcs
@@ -1110,17 +1112,13 @@ impl<'a> Parser<'a> {
                 .rev()
                 .find(|sig| sig.name == name && sig.arity == arity)
             {
-                return Some(Rc::clone(&sig.func));
+                return Some(Found::Func(Rc::clone(&sig.func)));
+            }
+            if arity == 0 && scope.params.iter().rev().any(|param| param == name) {
+                return Some(Found::Param);
             }
         }
         None
-    }
-
-    fn lookup_param(&self, name: &str) -> bool {
-        self.scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.params.iter().rev().any(|param| param == name))
     }
 
     /// Arguments of one call, separated by `;`. The count is how many
