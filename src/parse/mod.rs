@@ -52,21 +52,94 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
 
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
     let (bom, text) = split_bom(bytes);
+    let scanned = scan_text(text, 0, 1);
+    Ok(ParsedStream {
+        values: locate(bytes, bom, scanned.values),
+        error: scanned.error.map(|err| err.text()),
+    })
+}
+
+/// One pass over `bytes` starting at `start`, which is an index into the
+/// original buffer. `line` is the parser line already reached.
+///
+/// `resume` is where a later pass should start after a hard error. An
+/// `incomplete` error still needs more bytes; `restart` is the start of
+/// the value that ran out.
+pub struct InputScan {
+    pub values: Vec<(Value, usize)>,
+    pub error: Option<String>,
+    pub incomplete: bool,
+    /// Absolute index of the byte the error was noticed on.
+    pub error_at: usize,
+    /// Absolute index to continue from after a hard error.
+    pub resume: usize,
+    /// Parser line at `resume`, or at `restart` when the value is unfinished.
+    pub resume_line: usize,
+    /// Absolute index of an unfinished value. More bytes are parsed again
+    /// from here, so the values before it are not produced twice.
+    pub restart: usize,
+    pub restart_line: usize,
+}
+
+pub fn scan_input(bytes: &[u8], start: usize, line: usize) -> InputScan {
+    let bom = if start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    let origin = if start == 0 { bom } else { start };
+    let scanned = scan_text(&bytes[bom..], origin - bom, line);
+    let shift = |index: usize| index + bom;
+    InputScan {
+        values: scanned
+            .values
+            .into_iter()
+            .map(|(value, end)| (value, shift(end)))
+            .collect(),
+        error: scanned.error.as_ref().map(parser::ParseErr::text),
+        incomplete: scanned.incomplete,
+        error_at: shift(scanned.error_at),
+        resume: shift(scanned.resume),
+        resume_line: scanned.resume_line,
+        restart: shift(scanned.restart),
+        restart_line: scanned.restart_line,
+    }
+}
+
+struct Scanned {
+    values: Vec<(Value, usize)>,
+    error: Option<parser::ParseErr>,
+    incomplete: bool,
+    error_at: usize,
+    resume: usize,
+    resume_line: usize,
+    restart: usize,
+    restart_line: usize,
+}
+
+fn scan_text(text: &[u8], start: usize, line: usize) -> Scanned {
     let mut parser = Parser::new(text);
-    let mut parsed = Vec::new();
+    parser.seek(start, line);
+    let mut values = Vec::new();
     loop {
         parser.skip_ws();
         if parser.eof() {
-            break;
+            return Scanned {
+                values,
+                error: None,
+                incomplete: false,
+                error_at: parser.index,
+                resume: parser.index,
+                resume_line: parser.line,
+                restart: parser.index,
+                restart_line: parser.line,
+            };
         }
+        let restart = parser.index;
+        let restart_line = parser.line;
         let value = match parser.parse_value() {
             Ok(value) => value,
-            Err(err) => {
-                return Ok(ParsedStream {
-                    values: locate(bytes, bom, parsed),
-                    error: Some(err.text()),
-                });
-            }
+            Err(err) => return stop(values, err, &parser, restart, restart_line),
         };
         let end = parser.index;
         // A number or literal glued to ] } , : is not a finished value.
@@ -81,18 +154,74 @@ pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
             };
             if let Some(phrase) = phrase {
                 parser.bump();
-                return Ok(ParsedStream {
-                    values: locate(bytes, bom, parsed),
-                    error: Some(parser.fail(phrase, false).text()),
-                });
+                let err = parser.fail(phrase, false);
+                return stop(values, err, &parser, restart, restart_line);
             }
         }
-        parsed.push((value, end));
+        values.push((value, end));
     }
-    Ok(ParsedStream {
-        values: locate(bytes, bom, parsed),
-        error: None,
-    })
+}
+
+fn stop(
+    values: Vec<(Value, usize)>,
+    err: parser::ParseErr,
+    parser: &Parser,
+    restart: usize,
+    restart_line: usize,
+) -> Scanned {
+    let incomplete = err.ran_out();
+    let (resume, resume_line) = if incomplete || parser.column() == 0 {
+        // A column of 0 means the bad token already consumed its newline.
+        (parser.index, parser.line)
+    } else {
+        skip_rest_of_line(parser.src, parser.index, parser.line)
+    };
+    Scanned {
+        values,
+        error: Some(err),
+        incomplete,
+        error_at: parser.index,
+        resume,
+        resume_line,
+        restart,
+        restart_line,
+    }
+}
+
+/// The next value after a hard error starts on the following line.
+fn skip_rest_of_line(text: &[u8], mut index: usize, mut line: usize) -> (usize, usize) {
+    while index < text.len() && text[index] != b'\n' {
+        index += 1;
+    }
+    if index < text.len() && text[index] == b'\n' {
+        index += 1;
+        line += 1;
+    }
+    (index, line)
+}
+
+/// Newlines jq's reader has consumed to reach `end`.
+///
+/// `end` is the next byte after a value, in `text`. An atom is not finished
+/// until that next byte has been read. One read is at most 4095 bytes and
+/// stops at a newline, so a newline later in that chunk still counts.
+pub fn stream_line(text: &[u8], end: usize, atom: bool) -> usize {
+    let need = if atom && end < text.len() {
+        end
+    } else {
+        end.saturating_sub(1)
+    };
+    let mut line = 0usize;
+    let mut filled = 0usize;
+    while filled <= need && filled < text.len() {
+        let next = read_chunk(text, filled);
+        line += newline_count(&text[filled..next]);
+        if next == filled {
+            break;
+        }
+        filled = next;
+    }
+    line
 }
 
 /// Decode one JSON string token, or jq's message for a bad escape.

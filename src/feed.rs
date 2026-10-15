@@ -1,0 +1,611 @@
+//! The input shared by the main loop and by `input` / `inputs`.
+//!
+//! jq reads the next value when the program asks for it. A missing file is
+//! reported and skipped. A value that is not valid JSON fails that read.
+//! `input` turns the end of the stream into `break`. `inputs` stops there.
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::fs;
+use std::io::{self};
+
+use crate::parse::{scan_input, stream_line};
+use crate::value::Value;
+use crate::Error;
+
+thread_local! {
+    static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    static ENVIRON: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// What `input` got from the stream.
+pub enum Read {
+    Value(Value),
+    /// The stream is finished. `inputs` stops. `input` fails with `break`.
+    Break,
+    /// The next value was not valid JSON. The message is jq's parse text.
+    Parse(String),
+    /// A file could not be read for a reason other than being missing.
+    Fatal(String),
+}
+
+pub struct Source {
+    pub files: Vec<String>,
+    pub raw: bool,
+    pub slurp: bool,
+}
+
+pub struct SourceGuard;
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        SESSION.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+pub fn bind_source(source: Source) -> SourceGuard {
+    SESSION.with(|slot| *slot.borrow_mut() = Some(Session::open(source)));
+    SourceGuard
+}
+
+pub fn set_environ(value: Value) {
+    ENVIRON.with(|slot| *slot.borrow_mut() = Some(value));
+}
+
+pub fn environ_now() -> Value {
+    environment()
+}
+
+pub fn environ() -> Value {
+    ENVIRON.with(|slot| slot.borrow().clone().unwrap_or_else(environment))
+}
+
+pub fn here(line: usize) -> Value {
+    Value::Object(vec![
+        ("file".to_string(), Value::String("<top-level>".to_string())),
+        ("line".to_string(), Value::Number(line.to_string())),
+    ])
+}
+
+pub fn input_filename() -> Value {
+    with(|session| match &session.yielded {
+        Some(name) => Value::String(name.clone()),
+        None => Value::Null,
+    })
+    .unwrap_or(Value::Null)
+}
+
+pub fn set_unknown() {
+    let _ = with_mut(|session| session.at = "<unknown>".to_string());
+}
+
+pub fn location() -> Option<String> {
+    with(|session| session.at.clone())
+}
+
+pub fn open_failed() -> bool {
+    with(|session| session.missing).unwrap_or(false)
+}
+
+pub fn read_one() -> Read {
+    with_mut(|session| match session.pull(true) {
+        Ok(Pulled::Value(value)) => Read::Value(value),
+        Ok(Pulled::Parse(message)) => Read::Parse(message),
+        Ok(Pulled::End) => {
+            session.mark_break();
+            Read::Break
+        }
+        Err(message) => Read::Fatal(message),
+    })
+    .unwrap_or(Read::Break)
+}
+
+pub fn next_main() -> Result<MainNext, Error> {
+    let Some(next) = with_mut(|session| -> Result<MainNext, String> {
+        if session.halt_main {
+            return Ok(MainNext::Eof);
+        }
+        let pulled = session.pull(false)?;
+        if session.arm_stop {
+            session.halt_main = true;
+        }
+        Ok(match pulled {
+            Pulled::Value(value) => MainNext::Value(value),
+            Pulled::Parse(message) => MainNext::Parse(message),
+            Pulled::End => MainNext::Eof,
+        })
+    }) else {
+        return Ok(MainNext::Eof);
+    };
+    next.map_err(Error::new)
+}
+
+pub enum MainNext {
+    Value(Value),
+    Parse(String),
+    Eof,
+}
+
+enum Pulled {
+    Value(Value),
+    Parse(String),
+    End,
+}
+
+enum Opened {
+    Data(Vec<u8>),
+    Missing(String),
+    Directory,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum More {
+    Added,
+    Eof,
+}
+
+struct Chunk {
+    name: String,
+    /// First byte of this file in the parse buffer.
+    parse_start: usize,
+    raw: Vec<u8>,
+    /// Bytes skipped at the start of `raw` before they were parsed.
+    bom: usize,
+}
+
+struct Item {
+    value: Value,
+    name: String,
+    line: usize,
+}
+
+struct Fault {
+    message: String,
+    name: String,
+    line: usize,
+}
+
+struct Cur {
+    name: String,
+    line: usize,
+    any_byte: bool,
+    ended_nl: bool,
+}
+
+struct Session {
+    files: Vec<String>,
+    file_at: usize,
+    raw: bool,
+    slurp: bool,
+    buf: Vec<u8>,
+    chunks: Vec<Chunk>,
+    scan_at: usize,
+    scan_line: usize,
+    pending: VecDeque<Item>,
+    fault: Option<Fault>,
+    /// Where to continue after the program catches a bad value.
+    staged: Option<(usize, usize)>,
+    yielded: Option<String>,
+    at: String,
+    cur: Option<Cur>,
+    eof_once: bool,
+    missing: bool,
+    dir_pending: bool,
+    /// A directory noticed while the main loop slurped, not yet printed.
+    dir_from_main: bool,
+    /// The file that failed just before a value ran out of bytes.
+    failed_here: Option<String>,
+    arm_stop: bool,
+    halt_main: bool,
+    slurp_done: bool,
+    raw_at: usize,
+    dead: bool,
+}
+
+impl Session {
+    fn open(source: Source) -> Self {
+        let files = if source.files.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            source.files
+        };
+        Self {
+            files,
+            file_at: 0,
+            raw: source.raw,
+            slurp: source.slurp,
+            buf: Vec::new(),
+            chunks: Vec::new(),
+            scan_at: 0,
+            scan_line: 1,
+            pending: VecDeque::new(),
+            fault: None,
+            staged: None,
+            yielded: None,
+            at: "<unknown>".to_string(),
+            cur: None,
+            eof_once: false,
+            missing: false,
+            dir_pending: false,
+            dir_from_main: false,
+            failed_here: None,
+            arm_stop: false,
+            halt_main: false,
+            slurp_done: false,
+            raw_at: 0,
+            dead: false,
+        }
+    }
+
+    fn pull(&mut self, from_input: bool) -> Result<Pulled, String> {
+        if from_input && self.dir_pending && self.dir_from_main {
+            self.flush_dir();
+        }
+        if self.dead {
+            return Ok(Pulled::End);
+        }
+        if self.slurp {
+            return self.pull_slurp(from_input);
+        }
+        if self.raw {
+            return self.pull_raw();
+        }
+        self.pull_json(from_input)
+    }
+
+    fn pull_json(&mut self, recover: bool) -> Result<Pulled, String> {
+        loop {
+            if let Some(item) = self.pending.pop_front() {
+                self.note(&item.name, item.line);
+                return Ok(Pulled::Value(item.value));
+            }
+            if let Some(fault) = self.fault.take() {
+                self.note(&fault.name, fault.line);
+                if recover {
+                    if let Some((at, line)) = self.staged.take() {
+                        self.scan_at = at;
+                        self.scan_line = line;
+                    }
+                } else {
+                    self.dead = true;
+                }
+                return Ok(Pulled::Parse(fault.message));
+            }
+            if !self.fill_json()? {
+                return Ok(Pulled::End);
+            }
+        }
+    }
+
+    /// Parse what is buffered. Returns true when a value or an error is waiting.
+    fn fill_json(&mut self) -> Result<bool, String> {
+        if !self.pending.is_empty() || self.fault.is_some() {
+            return Ok(true);
+        }
+        loop {
+            let scan = scan_input(&self.buf, self.scan_at, self.scan_line);
+            for (value, end) in scan.values {
+                let (name, line) = self.place(end, is_atom(&value));
+                self.pending.push_back(Item { value, name, line });
+            }
+            if scan.incomplete {
+                self.scan_at = scan.restart;
+                self.scan_line = scan.restart_line;
+                if self.append()? == More::Added {
+                    continue;
+                }
+                let (name, line) = if let Some(name) = self.failed_here.clone() {
+                    (name, 0)
+                } else {
+                    self.place(scan.error_at, false)
+                };
+                self.fault = Some(Fault {
+                    message: scan.error.unwrap_or_else(|| "parse error".to_string()),
+                    name,
+                    line,
+                });
+                return Ok(true);
+            }
+            if let Some(message) = scan.error {
+                let (name, line) = self.place(scan.error_at, false);
+                self.fault = Some(Fault {
+                    message,
+                    name,
+                    line,
+                });
+                self.staged = Some((scan.resume, scan.resume_line));
+                return Ok(true);
+            }
+            self.scan_at = scan.resume;
+            self.scan_line = scan.resume_line;
+            if !self.pending.is_empty() {
+                return Ok(true);
+            }
+            if self.append()? == More::Eof {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn pull_raw(&mut self) -> Result<Pulled, String> {
+        let mut pending = Vec::new();
+        let mut name = String::new();
+        loop {
+            match self.next_byte()? {
+                Some((byte, at_name)) => {
+                    name = at_name;
+                    if byte == b'\n' {
+                        let line = self.line_through(self.raw_at);
+                        let text = decode(&pending);
+                        self.note(&name, line);
+                        return Ok(Pulled::Value(Value::String(text)));
+                    }
+                    pending.push(byte);
+                }
+                None => {
+                    if pending.is_empty() {
+                        return Ok(Pulled::End);
+                    }
+                    let line = self.cur.as_ref().map(|cur| cur.line).unwrap_or(0);
+                    if name.is_empty() {
+                        name = self
+                            .cur
+                            .as_ref()
+                            .map(|cur| cur.name.clone())
+                            .unwrap_or_else(|| "<stdin>".to_string());
+                    }
+                    self.note(&name, line);
+                    return Ok(Pulled::Value(Value::String(decode(&pending))));
+                }
+            }
+        }
+    }
+
+    fn next_byte(&mut self) -> Result<Option<(u8, String)>, String> {
+        loop {
+            if self.raw_at < self.buf.len() {
+                let byte = self.buf[self.raw_at];
+                self.raw_at += 1;
+                let name = self.place(self.raw_at, false).0;
+                return Ok(Some((byte, name)));
+            }
+            if self.append()? == More::Eof {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Newlines in the current file up to `raw_at`, which has just moved past one.
+    fn line_through(&self, raw_at: usize) -> usize {
+        let Some(chunk) = self.chunk_at(raw_at) else {
+            return 0;
+        };
+        let offset = chunk.bom + raw_at.saturating_sub(chunk.parse_start);
+        stream_line(&chunk.raw, offset, false)
+    }
+
+    fn pull_slurp(&mut self, from_input: bool) -> Result<Pulled, String> {
+        if self.slurp_done {
+            return Ok(Pulled::End);
+        }
+        while self.append()? == More::Added {}
+        if from_input {
+            self.flush_dir();
+        } else if self.dir_pending {
+            self.dir_from_main = true;
+        }
+        self.slurp_done = true;
+        if self.raw {
+            let name = self.cur.as_ref().map(|cur| cur.name.clone());
+            let line = self.cur.as_ref().map(|cur| cur.line).unwrap_or(0);
+            if let Some(name) = name {
+                self.note(&name, line);
+            }
+            return Ok(Pulled::Value(Value::String(decode(&self.buf))));
+        }
+        let scan = scan_input(&self.buf, 0, 1);
+        if let Some(message) = scan.error {
+            let (name, line) = if scan.incomplete {
+                if let Some(name) = self.failed_here.clone() {
+                    (name, 0)
+                } else {
+                    self.place(scan.error_at, false)
+                }
+            } else {
+                self.place(scan.error_at, false)
+            };
+            self.note(&name, line);
+            return Ok(Pulled::Parse(message));
+        }
+        let items: Vec<Value> = scan.values.into_iter().map(|(value, _)| value).collect();
+        if let Some((name, line)) = self.cur.as_ref().map(|cur| (cur.name.clone(), cur.line)) {
+            self.note(&name, line);
+        }
+        Ok(Pulled::Value(Value::Array(items)))
+    }
+
+    fn append(&mut self) -> Result<More, String> {
+        loop {
+            if self.file_at >= self.files.len() {
+                return Ok(More::Eof);
+            }
+            let path = self.files[self.file_at].clone();
+            self.file_at += 1;
+            let name = source_name(&path);
+            match read_path(&path)? {
+                Opened::Data(bytes) => {
+                    if self.dir_pending {
+                        self.flush_dir();
+                    }
+                    self.failed_here = None;
+                    self.remember(&name, &bytes);
+                    let bom = if self.buf.is_empty() && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                        3
+                    } else {
+                        0
+                    };
+                    // Raw input keeps every byte. JSON parsing skips one leading BOM.
+                    let bom = if self.raw { 0 } else { bom };
+                    let parse_start = self.buf.len();
+                    self.buf.extend_from_slice(&bytes[bom..]);
+                    self.chunks.push(Chunk {
+                        name,
+                        parse_start,
+                        raw: bytes,
+                        bom,
+                    });
+                    return Ok(More::Added);
+                }
+                Opened::Missing(reason) => {
+                    eprintln!("jq: error: Could not open file {name}: {reason}");
+                    self.missing = true;
+                    self.failed_here = Some(name.clone());
+                    self.remember_failed(&name);
+                    if self.raw {
+                        self.arm_stop = true;
+                    }
+                }
+                Opened::Directory => {
+                    if self.dir_pending {
+                        self.flush_dir();
+                    }
+                    self.dir_pending = true;
+                    self.missing = true;
+                    self.failed_here = Some(name.clone());
+                    self.remember_failed(&name);
+                    if self.raw {
+                        self.arm_stop = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_dir(&mut self) {
+        if self.dir_pending {
+            eprintln!("jq: error: Is a directory");
+            self.dir_pending = false;
+            self.dir_from_main = false;
+        }
+    }
+
+    fn remember(&mut self, name: &str, bytes: &[u8]) {
+        self.cur = Some(Cur {
+            name: name.to_string(),
+            line: stream_line(bytes, bytes.len(), false),
+            any_byte: !bytes.is_empty(),
+            ended_nl: bytes.last() == Some(&b'\n'),
+        });
+    }
+
+    fn remember_failed(&mut self, name: &str) {
+        self.cur = Some(Cur {
+            name: name.to_string(),
+            line: 0,
+            any_byte: false,
+            ended_nl: false,
+        });
+    }
+
+    fn place(&self, end: usize, atom: bool) -> (String, usize) {
+        let Some(chunk) = self.chunk_at(end) else {
+            return ("<stdin>".to_string(), 0);
+        };
+        let offset = end.saturating_sub(chunk.parse_start);
+        let raw_end = chunk.bom + offset;
+        (chunk.name.clone(), stream_line(&chunk.raw, raw_end, atom))
+    }
+
+    fn chunk_at(&self, end: usize) -> Option<&Chunk> {
+        self.chunks
+            .iter()
+            .rev()
+            .find(|chunk| end > chunk.parse_start && end <= chunk.parse_start + chunk.stored())
+            .or_else(|| self.chunks.last())
+    }
+
+    fn note(&mut self, name: &str, line: usize) {
+        self.yielded = Some(name.to_string());
+        self.at = format!("{name}:{line}");
+    }
+
+    fn mark_break(&mut self) {
+        self.at = if self.eof_once {
+            "<unknown>".to_string()
+        } else {
+            self.eof_once = true;
+            match &self.cur {
+                Some(cur) if !(cur.any_byte && !cur.ended_nl) => {
+                    format!("{}:{}", cur.name, cur.line)
+                }
+                _ => "<unknown>".to_string(),
+            }
+        };
+    }
+}
+
+impl Chunk {
+    fn stored(&self) -> usize {
+        self.raw.len().saturating_sub(self.bom)
+    }
+}
+
+fn with<T>(read: impl FnOnce(&Session) -> T) -> Option<T> {
+    SESSION.with(|slot| slot.borrow().as_ref().map(read))
+}
+
+fn with_mut<T>(write: impl FnOnce(&mut Session) -> T) -> Option<T> {
+    SESSION.with(|slot| slot.borrow_mut().as_mut().map(write))
+}
+
+fn source_name(path: &str) -> String {
+    if path == "-" {
+        "<stdin>".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn read_path(path: &str) -> Result<Opened, String> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        io::Read::read_to_end(&mut io::stdin(), &mut buf)
+            .map_err(|err| format!("cannot read -: {err}"))?;
+        return Ok(Opened::Data(buf));
+    }
+    match fs::read(path) {
+        Ok(bytes) => Ok(Opened::Data(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Opened::Missing(os_reason(&err))),
+        Err(err) if is_directory(path, &err) => Ok(Opened::Directory),
+        Err(err) => Err(format!("cannot read {path}: {err}")),
+    }
+}
+
+fn is_directory(path: &str, err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::IsADirectory
+        || err.raw_os_error() == Some(21)
+        || fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+fn os_reason(err: &io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
+}
+
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn is_atom(value: &Value) -> bool {
+    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
+}
+
+fn environment() -> Value {
+    let fields = std::env::vars()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect();
+    Value::Object(fields)
+}

@@ -212,6 +212,8 @@ fn drive(
         Filter::Until(cond, next) => drive_until(cond, next, input, env, emit),
         Filter::While(cond, update) => drive_while(cond, update, input, env, emit),
         Filter::Repeat(expr) => drive_repeat(expr, input, env, emit),
+        // One value at a time, so `limit` and `first` stop before the next read.
+        Filter::Inputs => drive_inputs(emit),
         Filter::Recurse => drive_dots(input, emit),
         Filter::RecurseDown { .. } | Filter::Walk(_) => {
             let mut forward = |value| emit.call(value);
@@ -1103,6 +1105,23 @@ pub(super) fn nth_truthy(
             Ok(true)
         }
         Err(err) => Err(err),
+    }
+}
+
+fn drive_inputs(emit: &Emit) -> Result<bool, Failure> {
+    loop {
+        match crate::feed::read_one() {
+            crate::feed::Read::Value(value) => {
+                if emit.call(value) {
+                    return Ok(true);
+                }
+            }
+            // The end of the stream is not a result. A bad value still fails.
+            crate::feed::Read::Break => return Ok(false),
+            crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => {
+                return Err(fail(message));
+            }
+        }
     }
 }
 

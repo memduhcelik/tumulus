@@ -20,6 +20,154 @@ pub fn compile(source: &str) -> Result<Filter, ProgramError> {
     compile_with(source, &[])
 }
 
+/// True when running `filter` can call `input`, `inputs`, or `input_filename`.
+/// A function that is never called does not count.
+pub fn reads_input(filter: &Filter) -> bool {
+    fn walk(filter: &Filter, seen: &mut HashSet<usize>) -> bool {
+        match filter {
+            Filter::Input | Filter::Inputs | Filter::InputFilename => true,
+            Filter::Identity
+            | Filter::Field(_)
+            | Filter::Index { .. }
+            | Filter::Slice { .. }
+            | Filter::Iterate
+            | Filter::Recurse
+            | Filter::Literal(_)
+            | Filter::Not
+            | Filter::Empty
+            | Filter::Length
+            | Filter::Keys
+            | Filter::Type
+            | Filter::ToNumber
+            | Filter::ToString
+            | Filter::ToJson
+            | Filter::Add
+            | Filter::ToEntries
+            | Filter::FromEntries
+            | Filter::ToDate
+            | Filter::FromDate
+            | Filter::GmTime
+            | Filter::LocalTime
+            | Filter::MkTime
+            | Filter::Now
+            | Filter::Math1(_)
+            | Filter::Abs
+            | Filter::Pow10
+            | Filter::Error
+            | Filter::First(None)
+            | Filter::Last(None)
+            | Filter::Var(_)
+            | Filter::Here(_)
+            | Filter::Environ
+            | Filter::Param(_)
+            | Filter::Paths(None)
+            | Filter::Unresolved { .. } => false,
+            Filter::Pipe(left, right)
+            | Filter::Comma(left, right)
+            | Filter::And(left, right)
+            | Filter::Or(left, right)
+            | Filter::Alt(left, right)
+            | Filter::Bin { left, right, .. }
+            | Filter::Math2(_, left, right)
+            | Filter::Limit(left, right)
+            | Filter::Until(left, right)
+            | Filter::While(left, right)
+            | Filter::SetPath(left, right) => walk(left, seen) || walk(right, seen),
+            Filter::Optional(inner)
+            | Filter::Collect(inner)
+            | Filter::Neg(inner)
+            | Filter::Has(inner)
+            | Filter::Select(inner)
+            | Filter::Map(inner)
+            | Filter::Walk(inner)
+            | Filter::WithEntries(inner)
+            | Filter::Join(inner)
+            | Filter::LTrim(inner)
+            | Filter::RTrim(inner)
+            | Filter::StrfTime(inner)
+            | Filter::StrfLocalTime(inner)
+            | Filter::StrpTime(inner)
+            | Filter::Raise(inner)
+            | Filter::PathOf(inner)
+            | Filter::GetPath(inner)
+            | Filter::DelPaths(inner)
+            | Filter::Repeat(inner) => walk(inner, seen),
+            Filter::First(inner) | Filter::Last(inner) | Filter::Paths(inner) => {
+                inner.as_deref().is_some_and(|inner| walk(inner, seen))
+            }
+            Filter::RecurseDown { step, cond } => {
+                walk(step, seen) || cond.as_deref().is_some_and(|cond| walk(cond, seen))
+            }
+            Filter::Try { body, handler } => {
+                walk(body, seen)
+                    || handler
+                        .as_deref()
+                        .is_some_and(|handler| walk(handler, seen))
+            }
+            Filter::Update { path, expr, .. } => walk(path, seen) || walk(expr, seen),
+            Filter::Interpolate(pieces) => pieces.iter().any(|piece| match piece {
+                Piece::Text(_) => false,
+                Piece::Interp(inner) => walk(inner, seen),
+            }),
+            Filter::Object(fields) => fields.iter().any(|field| match field {
+                ObjField::Pair { key, value } => walk(key, seen) || walk(value, seen),
+                ObjField::Lookup(key) => walk(key, seen),
+            }),
+            Filter::At { base, key, .. } => walk(base, seen) || walk(key, seen),
+            Filter::Math3(x, y, z) => walk(x, seen) || walk(y, seen) || walk(z, seen),
+            Filter::Nth { index, expr } => {
+                walk(index, seen) || expr.as_deref().is_some_and(|expr| walk(expr, seen))
+            }
+            Filter::Range { from, to, step } => {
+                from.as_deref().is_some_and(|from| walk(from, seen))
+                    || walk(to, seen)
+                    || step.as_deref().is_some_and(|step| walk(step, seen))
+            }
+            Filter::If { cond, yes, no } => walk(cond, seen) || walk(yes, seen) || walk(no, seen),
+            Filter::Bind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
+            Filter::Reduce {
+                stream,
+                init,
+                update,
+                ..
+            }
+            | Filter::Foreach {
+                stream,
+                init,
+                update,
+                ..
+            } => {
+                walk(stream, seen)
+                    || walk(init, seen)
+                    || walk(update, seen)
+                    || match filter {
+                        Filter::Foreach {
+                            extract: Some(extract),
+                            ..
+                        } => walk(extract, seen),
+                        _ => false,
+                    }
+            }
+            Filter::Define { rest, .. } => walk(rest, seen),
+            Filter::Call { func, args } => {
+                if args.iter().any(|arg| walk(arg, seen)) {
+                    return true;
+                }
+                let Some(cell) = func.upgrade() else {
+                    return false;
+                };
+                let ptr = Rc::as_ptr(&cell) as usize;
+                if !seen.insert(ptr) {
+                    return false;
+                }
+                let body = Rc::clone(&cell.body.borrow());
+                walk(&body, seen)
+            }
+        }
+    }
+    walk(filter, &mut HashSet::new())
+}
+
 /// `scope` names variables that are already bound, ahead of the program.
 pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramError> {
     let mut parser = Parser {
@@ -80,7 +228,12 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Pow10
         | Filter::Error
         | Filter::First(None)
-        | Filter::Last(None) => Ok(()),
+        | Filter::Last(None)
+        | Filter::Here(_)
+        | Filter::Input
+        | Filter::Inputs
+        | Filter::InputFilename
+        | Filter::Environ => Ok(()),
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -353,6 +506,11 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::First(None)
         | Filter::Last(None)
         | Filter::Var(_)
+        | Filter::Here(_)
+        | Filter::Input
+        | Filter::Inputs
+        | Filter::InputFilename
+        | Filter::Environ
         | Filter::Param(_)
         | Filter::Paths(None) => {}
         Filter::Pipe(left, right)
@@ -552,7 +710,9 @@ fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
         "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "tojson"
         | "todate" | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" | "add"
-        | "to_entries" | "from_entries" => arity == 0,
+        | "to_entries" | "from_entries" | "input" | "inputs" | "input_filename" | "env" => {
+            arity == 0
+        }
         "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "strftime"
         | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat"
         | "walk" | "with_entries" => arity == 1,
@@ -578,6 +738,10 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
     let mut args = args.into_iter();
     match name {
         "not" => Filter::Not,
+        "input" => Filter::Input,
+        "inputs" => Filter::Inputs,
+        "input_filename" => Filter::InputFilename,
+        "env" => Filter::Environ,
         "empty" => Filter::Empty,
         "length" => Filter::Length,
         "keys" => Filter::Keys,
@@ -953,8 +1117,16 @@ impl<'a> Parser<'a> {
             }
             return Ok(inner);
         }
-        if self.eat('$') {
+        if self.peek() == Some('$') {
+            self.skip_ws();
+            let at = self.index;
+            self.bump();
             let name = self.ident()?;
+            // `$__loc__` is the source of that `$`, not a binding. `-f` keeps
+            // the file name `<top-level>`.
+            if name == "__loc__" {
+                return Ok(Filter::Here(line_at(self.src, at).0));
+            }
             return Ok(Filter::Var(name));
         }
         if self.peek() == Some('[') {
@@ -1106,7 +1278,12 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             if self.eat('$') {
-                params.push(FnParam::Value(self.ident()?));
+                let name = self.ident()?;
+                // `$__loc__` is not a name a parameter can take.
+                if name == "__loc__" {
+                    return Err(ProgramError::Syntax);
+                }
+                params.push(FnParam::Value(name));
             } else if self.starts_ident() {
                 let name = self.ident()?;
                 if reserved(&name) {
@@ -1249,6 +1426,10 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         if self.eat('$') {
             let name = self.ident()?;
+            // `as $__loc__` is rejected. The name is not a binding.
+            if name == "__loc__" {
+                return Err(ProgramError::Syntax);
+            }
             return Ok(Pattern::Var(name));
         }
         if self.eat('[') {
@@ -1304,6 +1485,9 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         if self.eat('$') {
             let name = self.ident()?;
+            if name == "__loc__" {
+                return Err(ProgramError::Syntax);
+            }
             self.skip_ws();
             if self.eat(':') {
                 let pattern = self.parse_pattern()?;

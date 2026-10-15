@@ -45,6 +45,8 @@ enum Body {
     Recur(Recur),
     /// `walk(f)`. Children are rebuilt here, then `f` runs.
     Walk(Walk),
+    /// `inputs`. One value is read each time this frame is stepped.
+    Inputs,
 }
 
 struct Run {
@@ -340,7 +342,7 @@ fn install_top(machine: &Machine, index: usize) {
             &call.caller_scope
         }),
         Body::Nest(nest) => Some(&nest.scope),
-        Body::Dots(_) => None,
+        Body::Dots(_) | Body::Inputs => None,
         Body::Recur(recur) => Some(&recur.scope),
         Body::Walk(walk) => Some(&walk.scope),
     };
@@ -417,6 +419,17 @@ fn step(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Body::Dots(_) => step_dots(machine, index),
         Body::Recur(_) => step_recur(machine, index),
         Body::Walk(_) => step_walk(machine, index),
+        Body::Inputs => step_inputs(machine),
+    }
+}
+
+fn step_inputs(_machine: &mut Machine) -> Result<Act, Failure> {
+    match crate::feed::read_one() {
+        crate::feed::Read::Value(value) => Ok(Act::Value(value)),
+        crate::feed::Read::Break => Ok(Act::Done),
+        crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => {
+            Ok(Act::Fail(fail(message)))
+        }
     }
 }
 
@@ -554,6 +567,10 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         }
         Filter::Unresolved { name, arity, .. } => {
             Ok(Act::Fail(fail(format!("{name}/{arity} is not defined"))))
+        }
+        Filter::Inputs => {
+            machine.stack[index].body = Box::new(Body::Inputs);
+            Ok(Act::Cont)
         }
         Filter::Collect(inner) => replace_nest(
             machine,
@@ -1068,7 +1085,7 @@ fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Fa
                 Ok(Taken::Send(value))
             }
         }
-        Body::Run(_) | Body::Dots(_) | Body::Recur(_) => Ok(Taken::Send(value)),
+        Body::Run(_) | Body::Dots(_) | Body::Recur(_) | Body::Inputs => Ok(Taken::Send(value)),
         Body::Nest(_) => nest_accept(machine, index, value),
         Body::Walk(_) => walk_accept(machine, index, value),
     }
@@ -1165,7 +1182,7 @@ fn on_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
         Body::If(_) => finish_if(machine, index),
         Body::Call(_) => finish_call(machine, index),
         Body::Nest(_) => nest_child_done(machine, index),
-        Body::Run(_) | Body::Dots(_) | Body::Recur(_) => Ok(DoneAct::Finish),
+        Body::Run(_) | Body::Dots(_) | Body::Recur(_) | Body::Inputs => Ok(DoneAct::Finish),
         Body::Walk(_) => walk_done(machine, index),
     }
 }

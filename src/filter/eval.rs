@@ -76,6 +76,11 @@ pub(super) fn produce(
             Some(value) => Ok(vec![value.clone()]),
             None => Err(fail(format!("unbound {name}"))),
         },
+        Filter::Here(line) => Ok(vec![crate::feed::here(*line)]),
+        Filter::Input => one_read(crate::feed::read_one()),
+        Filter::Inputs => all_reads(),
+        Filter::InputFilename => Ok(vec![crate::feed::input_filename()]),
+        Filter::Environ => Ok(vec![crate::feed::environ()]),
         Filter::Bind {
             expr,
             pattern,
@@ -405,6 +410,27 @@ pub(super) fn finish(out: Vec<Value>, err: Option<Failure>) -> Result<Vec<Value>
     match err {
         Some(failure) => Err(with_partial(out, failure)),
         None => Ok(out),
+    }
+}
+
+fn one_read(read: crate::feed::Read) -> Result<Vec<Value>, Failure> {
+    match read {
+        crate::feed::Read::Value(value) => Ok(vec![value]),
+        crate::feed::Read::Break => Err(fail("break".to_string())),
+        crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => Err(fail(message)),
+    }
+}
+
+fn all_reads() -> Result<Vec<Value>, Failure> {
+    let mut out = Vec::new();
+    loop {
+        match crate::feed::read_one() {
+            crate::feed::Read::Value(value) => out.push(value),
+            crate::feed::Read::Break => return Ok(out),
+            crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => {
+                return Err(with_partial(out, fail(message)));
+            }
+        }
     }
 }
 

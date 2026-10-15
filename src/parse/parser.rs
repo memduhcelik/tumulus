@@ -8,6 +8,10 @@ pub(in crate::parse) struct ParseErr {
 }
 
 impl ParseErr {
+    pub(in crate::parse) fn ran_out(&self) -> bool {
+        self.at_eof
+    }
+
     pub(in crate::parse) fn text(&self) -> String {
         if self.at_eof {
             format!(
@@ -47,6 +51,18 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parse) fn eof(&self) -> bool {
         self.index >= self.src.len()
+    }
+
+    /// Continue a scan that already passed `index` bytes. `line` is jq's
+    /// count at that byte, and the column starts over at 0.
+    pub(in crate::parse) fn seek(&mut self, index: usize, line: usize) {
+        self.index = index;
+        self.line = line;
+        self.column = 0;
+    }
+
+    pub(in crate::parse) fn column(&self) -> usize {
+        self.column
     }
 
     pub(in crate::parse) fn peek(&self) -> Option<char> {

@@ -94,6 +94,17 @@ pub enum Filter {
     },
     /// `$name`
     Var(String),
+    /// `$__loc__`. The line is the line of that `$` in the program.
+    /// The file is always `<top-level>`, including a program read with `-f`.
+    Here(usize),
+    /// `input`. The next value from the program's input, or `break` at the end.
+    Input,
+    /// `inputs`. Every remaining value. The final `break` is not a result.
+    Inputs,
+    /// `input_filename`. The file of the value most recently read, or null.
+    InputFilename,
+    /// `env`. The process environment, not the binding of `$ENV`.
+    Environ,
     /// `expr as pattern | body`. `.` in the body is the input of this expression.
     Bind {
         expr: Box<Filter>,

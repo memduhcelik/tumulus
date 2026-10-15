@@ -4756,6 +4756,399 @@ fn filter_files_match_jq() {
 }
 
 #[test]
+fn input_and_arguments_match_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("feed");
+    let one = write_bytes(&dir, "one.json", b"1\n");
+    let two = write_bytes(&dir, "two.json", b"2\n3\n");
+    let bad = write_bytes(&dir, "bad.json", b"not json\n");
+    let partial = write_bytes(&dir, "partial.json", b"{\"a\":");
+    let empty = write_bytes(&dir, "empty", b"");
+    let spanned = write_bytes(&dir, "span-a.json", b"{\"a\":");
+    let span_b = write_bytes(&dir, "span-b.json", b"1}\n2\n");
+    let early = write_bytes(&dir, "early.json", b"1\n2\n3\n");
+    let later = write_bytes(&dir, "later.json", b"not\n");
+    let after = write_bytes(&dir, "after.json", b"4\n");
+    let lines = write_bytes(&dir, "lines.txt", b"a\nb\nc\n");
+    let raw = write_bytes(&dir, "raw.txt", b"hello\nworld");
+    let slurp = write_bytes(&dir, "slurp.json", b"1\n{\"a\":2}\n\"x\"\n");
+    let missing = dir
+        .join("missing.json")
+        .to_str()
+        .expect("utf-8")
+        .to_string();
+    let folder = dir.join("folder");
+    fs::create_dir(&folder).expect("dir");
+    let folder = folder.to_str().expect("utf-8").to_string();
+    let prog = write_bytes(&dir, "loc.jq", b"# c\n\n$__loc__\n");
+
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("input empty", &["-n", "input"], b""),
+        ("inputs empty", &["-n", "inputs"], b""),
+        ("filename empty", &["-n", "input_filename"], b""),
+        ("input one", &["-n", "-c", "input"], b"1\n"),
+        ("input no newline", &["-n", "-c", "input"], b"42"),
+        ("inputs three", &["-n", "-c", "[inputs]"], b"1\n2\n3\n"),
+        ("input twice", &["-n", "-c", "[input, input]"], b"1\n2\n"),
+        (
+            "input runs out",
+            &["-n", "-c", "[input, input, input]"],
+            b"1\n2\n",
+        ),
+        (
+            "inputs then input",
+            &["-n", "-c", "inputs, input"],
+            b"1\n2\n",
+        ),
+        ("try input", &["-n", "-c", "try input catch ."], b""),
+        ("try inputs", &["-n", "-c", "try inputs catch ."], b""),
+        ("try input type", &["-n", "-c", "try input catch type"], b""),
+        ("dot input", &["-c", "input"], b"1\n2\n3\n"),
+        ("dot input one", &["-c", "input"], b"1\n"),
+        ("dot inputs", &["-c", "inputs"], b"1\n2\n3\n"),
+        ("dot and input", &["-c", "., input"], b"1\n2\n3\n"),
+        (
+            "limit stops",
+            &["-n", "-c", "limit(1; inputs), input"],
+            b"1\n2\n3\n",
+        ),
+        (
+            "limit zero",
+            &["-n", "-c", "limit(0; inputs), input"],
+            b"1\n2\n",
+        ),
+        (
+            "first stops",
+            &["-n", "-c", "first(inputs), input"],
+            b"1\n2\n3\n",
+        ),
+        (
+            "bad caught",
+            &["-n", "-c", "try inputs catch ."],
+            b"1\nnot\n2\n",
+        ),
+        ("bad stops inputs", &["-n", "-c", "inputs"], b"1\nnot\n2\n"),
+        (
+            "bad resumes",
+            &["-n", "-c", "(try inputs catch .), inputs"],
+            b"1\nnot\n2\n3\n",
+        ),
+        (
+            "same line skipped",
+            &["-n", "-c", "(try inputs catch .), inputs"],
+            b"1 not 2\n3\n",
+        ),
+        ("main parse", &["-c", "."], b"1\nnot\n2\n"),
+        (
+            "filename after",
+            &["-n", "-c", "[input_filename, input, input_filename]"],
+            b"1\n",
+        ),
+        ("filename stdin", &["-c", "input_filename"], b"1\n"),
+        ("break line", &["-n", "input, input"], b"1\n"),
+        ("break unknown", &["-n", "input, input"], b"1"),
+        (
+            "break again",
+            &["-n", "-c", "try input catch ., input"],
+            b"",
+        ),
+        ("empty lines", &["-n", "-c", "[inputs]"], b"\n\n"),
+        ("optional", &["-n", "-c", "input?"], b""),
+        ("def input", &["-n", "-c", "def f: input; f, f"], b"1\n2\n"),
+        (
+            "def inputs limit",
+            &["-n", "-c", "def f: inputs; limit(1; f), input"],
+            b"1\n2\n3\n",
+        ),
+        ("shadow input", &["-n", "-c", "def input: 7; input"], b""),
+        ("input arity", &["-n", "input(1)"], b""),
+        (
+            "reduce inputs",
+            &["-n", "-c", "reduce inputs as $x (0; . + $x)"],
+            b"1\n2\n3\n",
+        ),
+        ("error line", &["-n", "inputs | .a"], b"1\n2\n"),
+        ("raw lines", &["-n", "-R", "-c", "[inputs]"], b"a\nb\nc"),
+        ("raw break", &["-n", "-R", "input, input, input"], b"a\nb\n"),
+        (
+            "raw no newline",
+            &["-n", "-R", "input, input, input"],
+            b"a\nb",
+        ),
+        ("slurp inputs", &["-n", "-s", "-c", "[inputs]"], b"1\n2\n"),
+        (
+            "slurp break",
+            &["-s", "-c", "[., try input catch .]"],
+            b"1\n2\n",
+        ),
+        ("slurp name", &["-s", "-c", "input_filename"], b"1\n2\n"),
+        ("null slurp name", &["-n", "-s", "input_filename"], b"1\n"),
+        ("raw slurp", &["-n", "-Rs", "-c", "input"], b"a\nb\n"),
+        ("exit empty", &["-n", "-e", "inputs"], b""),
+        ("exit break", &["-n", "-e", "input"], b""),
+        ("exit false", &["-n", "-e", "input"], b"false\n"),
+        ("loc", &["-n", "-c", "$__loc__"], b""),
+        ("loc line", &["-n", "-c", "1 |\n$__loc__"], b""),
+        ("loc def", &["-n", "-c", "def f:\n$__loc__;\nf"], b""),
+        ("loc string", &["-n", "-c", r#""\($__loc__)""#], b""),
+        ("loc field", &["-n", "-c", "{x: $__loc__}"], b""),
+        ("loc bind", &["-n", "-c", "$__loc__ as $l | $l.line"], b""),
+        (
+            "loc arg",
+            &["-n", "-c", "--arg", "__loc__", "hi", "$__loc__"],
+            b"",
+        ),
+        ("env same", &["-n", "-c", "$ENV == env"], b""),
+        ("env type", &["-n", "-c", "[($ENV|type), (env|type)]"], b""),
+        (
+            "env shadow",
+            &["-n", "-c", "1 as $ENV | [$ENV, (env|type)]"],
+            b"",
+        ),
+        (
+            "env arg",
+            &[
+                "-n",
+                "-c",
+                "--arg",
+                "ENV",
+                "hi",
+                "[($ENV|type), $ARGS.named.ENV]",
+            ],
+            b"",
+        ),
+        (
+            "env path",
+            &["-n", "-c", "--arg", "PATH", "nope", "$ENV.PATH == env.PATH"],
+            b"",
+        ),
+        ("env arity", &["-n", "env(1)"], b""),
+        (
+            "env def",
+            &["-n", "-c", "def env: 3; [env, ($ENV|type)]"],
+            b"",
+        ),
+        (
+            "args none",
+            &["-n", "-c", "--args", "$ARGS.positional"],
+            b"",
+        ),
+        (
+            "args two",
+            &["-n", "-c", "--args", "$ARGS.positional", "a", "b"],
+            b"",
+        ),
+        (
+            "args after",
+            &["-n", "-c", "$ARGS.positional", "--args", "a", "b"],
+            b"",
+        ),
+        (
+            "args option",
+            &["-n", "--args", "-c", "$ARGS.positional", "a"],
+            b"",
+        ),
+        (
+            "args full",
+            &["-n", "-c", "--arg", "b", "1", "--args", "$ARGS", "a", "c"],
+            b"",
+        ),
+        (
+            "json args",
+            &[
+                "-n",
+                "-c",
+                "--jsonargs",
+                "$ARGS.positional",
+                "1",
+                "true",
+                "null",
+            ],
+            b"",
+        ),
+        (
+            "json bad",
+            &["-n", "--jsonargs", "$ARGS.positional", "{"],
+            b"",
+        ),
+        (
+            "json two",
+            &["-n", "--jsonargs", "$ARGS.positional", "1 2"],
+            b"",
+        ),
+        (
+            "json blank",
+            &["-n", "--jsonargs", "$ARGS.positional", ""],
+            b"",
+        ),
+        (
+            "json space",
+            &["-n", "-c", "--jsonargs", "$ARGS.positional", "1 "],
+            b"",
+        ),
+        (
+            "json odd",
+            &[
+                "-n",
+                "-c",
+                "--jsonargs",
+                "$ARGS.positional",
+                "01",
+                ".5",
+                "nan",
+            ],
+            b"",
+        ),
+        (
+            "json last",
+            &["-n", "-c", "--args", "--jsonargs", "$ARGS.positional", "1"],
+            b"",
+        ),
+        (
+            "text last",
+            &["-n", "-c", "--jsonargs", "--args", "$ARGS.positional", "1"],
+            b"",
+        ),
+        (
+            "args empty text",
+            &["-n", "-c", "--args", "$ARGS.positional", ""],
+            b"",
+        ),
+        (
+            "pos and named",
+            &["-n", "-c", "--arg", "a", "z", "--jsonargs", "$ARGS", "true"],
+            b"",
+        ),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    compare_exact("files", &["-n", "-c", "[inputs]"], &[]);
+    compare_exact(
+        "file values",
+        &["-n", "-c", "[inputs | [., input_filename]]", &one, &two],
+        b"",
+    );
+    compare_exact("file dot", &["-c", "[., input_filename]", &one, &two], b"");
+    compare_exact("span", &["-n", "-c", "[inputs]", &spanned, &span_b], b"");
+    compare_exact(
+        "span name",
+        &["-n", "-c", "[inputs | input_filename]", &spanned, &span_b],
+        b"",
+    );
+    compare_exact(
+        "later file",
+        &[
+            "-n",
+            "-c",
+            "(try inputs catch .), inputs",
+            &early,
+            &later,
+            &after,
+        ],
+        b"",
+    );
+    compare_exact("bad file", &["-n", "input", &bad], b"");
+    compare_exact("partial file", &["-n", "input", &partial], b"");
+    compare_exact("missing", &["-n", "inputs", &missing], b"");
+    compare_exact("missing then", &["-n", "-c", "inputs", &missing, &one], b"");
+    compare_exact("missing input", &["-n", "input", &missing], b"");
+    compare_exact(
+        "empty then",
+        &["-n", "-c", "input, input", &empty, &one],
+        b"",
+    );
+    compare_exact("directory", &["-n", "input", &folder], b"");
+    compare_exact(
+        "directory then",
+        &["-n", "-c", "inputs", &folder, &one],
+        b"",
+    );
+    compare_exact(
+        "directory last",
+        &["-n", "-c", "inputs", &one, &folder],
+        b"",
+    );
+    compare_exact("directory slurp", &["-n", "-s", "inputs", &folder], b"");
+    compare_exact("raw files", &["-n", "-R", "-c", "[inputs]", &lines], b"");
+    compare_exact(
+        "raw missing",
+        &["-n", "-R", "-c", "[inputs]", &missing, &lines],
+        b"",
+    );
+    compare_exact("raw one", &["-R", "-c", ".", &missing, &lines], b"");
+    compare_exact(
+        "raw inside",
+        &["-R", "-c", "., input", &missing, &lines],
+        b"",
+    );
+    compare_exact("loc file", &["-n", "-c", "-f", &prog], b"");
+    compare_exact(
+        "slurpfile",
+        &["-n", "-c", "--slurpfile", "a", &slurp, "$a"],
+        b"",
+    );
+    compare_exact(
+        "slurp empty",
+        &["-n", "-c", "--slurpfile", "a", &empty, "$a"],
+        b"",
+    );
+    compare_exact("slurp bad", &["-n", "--slurpfile", "a", &bad, "$a"], b"");
+    compare_exact(
+        "slurp missing",
+        &["-n", "--slurpfile", "a", &missing, "$a"],
+        b"",
+    );
+    compare_exact("slurp dir", &["-n", "--slurpfile", "a", &folder, "$a"], b"");
+    compare_exact(
+        "slurp first",
+        &[
+            "-n",
+            "-c",
+            "--slurpfile",
+            "a",
+            &one,
+            "--slurpfile",
+            "a",
+            &bad,
+            "$a",
+        ],
+        b"",
+    );
+    compare_exact(
+        "slurp named",
+        &["-n", "-c", "--slurpfile", "a", &one, "$ARGS.named.a"],
+        b"",
+    );
+    compare_exact("rawfile", &["-n", "-c", "--rawfile", "t", &raw, "$t"], b"");
+    compare_exact(
+        "rawfile empty",
+        &["-n", "-c", "--rawfile", "t", &empty, "$t"],
+        b"",
+    );
+    compare_exact(
+        "rawfile missing",
+        &["-n", "--rawfile", "t", &missing, "$t"],
+        b"",
+    );
+    compare_exact("rawfile dir", &["-n", "--rawfile", "t", &folder, "$t"], b"");
+    compare_exact("slurp usage", &["--slurpfile"], b"");
+    compare_exact("raw usage", &["--rawfile", "t"], b"");
+    compare_exact(
+        "slurp keeps input",
+        &["-c", "--slurpfile", "t", &one, ".", &two],
+        b"",
+    );
+    compare_exact(
+        "args not files",
+        &["-n", "-c", "--args", "$ARGS.positional", &one],
+        b"",
+    );
+    compare_exact("file then args", &["-c", ".", &one, "--args", "z"], b"");
+}
+
+#[test]
 fn rejected_options_stay_ours() {
     require_jq();
     let unknown = [
@@ -4764,8 +5157,8 @@ fn rejected_options_stay_ours() {
         "--from-file=prog.jq",
         "--indent=4",
         "-fprog.jq",
-        "--slurpfile",
-        "--args",
+        "--slurpfile=a",
+        "--args=foo",
         "-eQ",
     ];
     for option in unknown {

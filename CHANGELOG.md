@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+`input` reads the next value from the input. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and the exit status is 5. `inputs` stops there. A value that is not valid JSON fails that read with jq's parse message. If that failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, one array is the whole input. With `-R`, each line is one string.
+
+`$__loc__` is `{"file":"<top-level>","line":N}`, and `N` is the line of that `$`. A program from `-f` still says `<top-level>`.
+
+`$ENV` is the process environment. `env` reads that same object. An `as` binding of `$ENV` hides it and leaves `env` alone. `--arg ENV` is stored on `$ARGS.named` and does not replace `$ENV`.
+
+`--args` fills `$ARGS.positional` with the later file arguments as strings. `--jsonargs` parses each one as JSON. A value that is not one JSON value exits 2 with `jq: invalid JSON text passed to --jsonargs`. The later of the two flags decides what follows it. `--slurpfile name path` binds `$name` to the JSON values in that file as one array. `--rawfile name path` binds the file's bytes as one string. Both names are fields of `$ARGS.named`. A missing file, a directory, or JSON that is not valid exits 2, and the message names the option, the name, and the path. The first binding of a name wins.
+
 `path(expr)` is the path from the input to each value `expr` reaches, as an array. A string is a field, a number is an index, and an object is a slice. `paths` lists every path inside the input except the empty path to the input itself. `paths(expr)` keeps a path once for each truthy value `expr` produces. `expr` is tried on the input first, so a failure there yields nothing else.
 
 `getpath(path)` reads the value at one path. `setpath(path; value)` writes it, and builds the missing objects and arrays along the way. The value runs outermost, and each path is tried again for every value. `delpaths(paths)` removes every path in one array. Indexes are the ones from before any path was removed. A path jq refuses, or a value of the wrong kind, fails the way jq fails, and the exit status is 5. `getpath` works on the left of an update.
@@ -22,7 +30,7 @@ A filter that does not call a user function runs at the speed it did before a fu
 
 `recurse` and `..` yield a value and then each value inside it. `recurse(f)` walks each value `f` yields, depth first. `recurse(f; cond)` walks such a value once for each truthy result of `cond`. `limit` and `first` stop that walk before a later value is produced. Used as a path, `recurse(f)` includes the current value and then each value `f` reaches by indexing, and `cond` decides whether that value is entered. A computed value is an invalid path. `walk(f)` rebuilds an array or object from the bottom and then runs `f`. An array keeps every value a child yields. An object keeps the first value of a field and does not run the rest of that field, and a field that yields nothing is left out. `to_entries` writes `{key, value}` pairs in stored order. An array's keys are numbers. `from_entries` reads `key`, then `Key`, then `name`, then `Name`, and skips null and false. `k` is not a key. The value is the `value` field when it is present, even if that value is null, otherwise `Value`, otherwise null. `with_entries(f)` runs `f` over those pairs and reads them back. `tojson` writes compact JSON, and a string is quoted. `add` folds with `+`, starting from null. An empty array or object is null. A value of the wrong kind fails the way jq fails, and the exit status is 5.
 
-Of the 447 programs in jq 1.7.1's test file, 293 come out the same.
+Of the 447 programs in jq 1.7.1's test file, 295 come out the same.
 
 ## 0.5.0
 

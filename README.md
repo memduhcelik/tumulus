@@ -18,7 +18,7 @@ chmod +x tumulus
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 293 come out the same on stdout, stderr, and the exit status.
+`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 295 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -70,6 +70,16 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `try expr` keeps every value `expr` produced before it failed, then stops. That is the same as `try expr catch empty`. `try expr catch handler` runs `handler` on the error value instead. A builtin failure is caught as its message. `error` raises the current input, and `error(expr)` raises the first value `expr` produces. When nothing catches the error, a string is printed as `jq: error (at ...): ` and that text. Any other value is printed as `jq: error (at ...) (not a string): ` and the compact JSON. The exit status is 5 when that input is the last one.
 
+`input` reads the next value. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and `inputs` stops. A value that is not valid JSON fails that read with jq's parse message. If the failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, the stream is one array of every value. With `-R`, each line is one string.
+
+`$__loc__` is an object `{"file":"<top-level>","line":N}`. `N` is the line of that `$`. A program read with `-f` still says `<top-level>`.
+
+`$ENV` is the process environment, with each value a string. `env` reads that same object. Binding `$ENV` again with `as` hides it for `$ENV` and leaves `env` alone. `--arg ENV` stores its text on `$ARGS.named` and does not replace `$ENV`.
+
+`--args` puts each later file argument into `$ARGS.positional` as a string. `--jsonargs` parses each one as one JSON value. A value that is not one JSON value exits 2 with `jq: invalid JSON text passed to --jsonargs`. When both are given, the later one decides what follows it. Arguments written before it are still files. The program itself is not a positional value.
+
+`--slurpfile name path` binds `$name` to every JSON value in that file, as one array. `--rawfile name path` binds `$name` to the bytes of that file as one string. The name is also a field of `$ARGS.named`. A missing file, a directory, or a value that is not valid JSON exits 2. The message names the option, the name, and the path. The first binding of a name wins, and a repeated name does not read its file. `-` is a file name here, not standard input.
+
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
 ## What does not work yet
@@ -82,9 +92,9 @@ Filters past the list above are rejected. A call to a name or a number of argume
 
 Options other than the ones above are rejected. `-s` exits 1 with `tumulus: unknown option: -s`. jq slurps with `-s`. An unknown long option exits 1 with `tumulus: unknown option: ...`. jq exits 2 and prints its usage text.
 
-A directory passed as a file exits 1 with `tumulus: cannot read ...: Is a directory (os error 21)`. jq exits 2 and prints nothing.
+A directory passed as a file exits 1 with `tumulus: cannot read ...: Is a directory (os error 21)`, unless the program calls `input`, `inputs`, or `input_filename`. jq exits 2. Without one of those calls, jq prints nothing for that directory.
 
-A value that runs past the end of one file does not continue into the next file. jq keeps parsing across that boundary. After a parse error, later files are not read.
+A value that runs past the end of one file does not continue into the next file, unless the program calls `input`, `inputs`, or `input_filename`. jq keeps parsing across that boundary. After a parse error, later files are not read, unless `input` or `inputs` caught the bad value and asked for another one.
 
 ## Time against jq
 

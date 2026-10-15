@@ -4,8 +4,9 @@ use std::io::{self, Read, Write};
 use std::process;
 
 use tumulus::{
-    compile_with, eval_with, parse_stream, render, Error, Failure, Filter, Indent, Layout,
-    ProgramError, Style, Value,
+    bind_source, compile_with, environ_now, eval_with, location, next_main, open_failed,
+    parse_stream, reads_input, render, set_environ, set_unknown, Error, Failure, Filter, Indent,
+    Layout, MainNext, ProgramError, Source, Style, Value,
 };
 
 fn main() {
@@ -66,10 +67,14 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
             return Ok(3);
         }
     };
-    let env = initial_env(&options.named);
+    let environ = environ_now();
+    set_environ(environ.clone());
+    let env = initial_env(&options.named, &options.positional, &environ);
     let mut run = Run::new();
-    // `-n` runs the filter once on null and does not read stdin or files.
-    if options.null_input {
+    // `input` reads the same stream the main loop walks.
+    if reads_input(&program) {
+        apply_shared(&options, &program, &env, &mut run, out)?;
+    } else if options.null_input {
         apply_null(options.style, &program, &env, &mut run, out)?;
     } else if options.raw_input && options.slurp {
         apply_raw_slurp(&options.files, options.style, &program, &env, &mut run, out)?;
@@ -205,6 +210,58 @@ fn apply(
         halt: false,
         clear_failure: !failed && !parsed.values.is_empty(),
     })
+}
+
+/// One stream for `.` and for `input`. `-n` does not take a value first.
+fn apply_shared(
+    options: &Options,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let _guard = bind_source(Source {
+        files: options.files.clone(),
+        raw: options.raw_input,
+        slurp: options.slurp,
+    });
+    let mut failed = false;
+    if options.null_input {
+        set_unknown();
+        failed = emit(
+            program,
+            &Value::Null,
+            env,
+            options.style,
+            "<unknown>",
+            0,
+            run,
+            out,
+        )?;
+    } else {
+        loop {
+            match next_main()? {
+                MainNext::Eof => break,
+                MainNext::Parse(message) => {
+                    eprintln!("jq: parse error: {message}");
+                    failed = true;
+                    break;
+                }
+                MainNext::Value(value) => {
+                    failed = emit(program, &value, env, options.style, "", 0, run, out)?;
+                }
+            }
+        }
+    }
+    // A file that could not be opened wins over a filter or parse failure.
+    run.status = if open_failed() {
+        2
+    } else if failed {
+        5
+    } else {
+        0
+    };
+    Ok(())
 }
 
 fn apply_null(
@@ -472,6 +529,7 @@ fn emit(
 }
 
 fn report_error(at: &str, failure: &Failure) {
+    let at = location().unwrap_or_else(|| at.to_string());
     match &failure.caught {
         Some(Value::String(text)) => {
             let shown = text.split('\0').next().unwrap_or("");
@@ -538,6 +596,14 @@ struct Options {
     program: Program,
     files: Vec<String>,
     named: Vec<(String, Value)>,
+    positional: Vec<Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    Files,
+    Text,
+    Json,
 }
 
 struct Flags {
@@ -560,13 +626,16 @@ fn options() -> Result<Options, Error> {
         from_file: false,
     };
     let mut named = Vec::new();
+    let mut positional = Vec::new();
     let mut operands = Vec::new();
+    let mut tail = Tail::Files;
+    let mut took = false;
     let mut end = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].clone();
         if end {
-            operands.push(arg);
+            push_operand(&mut operands, &mut positional, &mut took, tail, arg);
             index += 1;
             continue;
         }
@@ -613,6 +682,36 @@ fn options() -> Result<Options, Error> {
             named.push((name, value));
             continue;
         }
+        if arg == "--slurpfile" || arg == "--rawfile" {
+            let raw = arg == "--rawfile";
+            let usage = if raw {
+                "jq: --rawfile takes two parameters (e.g. --rawfile varname filename)"
+            } else {
+                "jq: --slurpfile takes two parameters (e.g. --slurpfile varname filename)"
+            };
+            let Some(name) = args.get(index + 1).cloned() else {
+                jq_usage(usage);
+            };
+            let Some(path) = args.get(index + 2).cloned() else {
+                jq_usage(usage);
+            };
+            index += 3;
+            if named.iter().any(|(have, _)| have == &name) {
+                continue;
+            }
+            named.push((name.clone(), file_binding(&arg, &name, &path)));
+            continue;
+        }
+        if arg == "--args" {
+            tail = Tail::Text;
+            index += 1;
+            continue;
+        }
+        if arg == "--jsonargs" {
+            tail = Tail::Json;
+            index += 1;
+            continue;
+        }
         match arg.as_str() {
             "-c" | "--compact-output" => flags.style.layout = Layout::Compact,
             "-n" | "--null-input" => flags.null_input = true,
@@ -629,7 +728,7 @@ fn options() -> Result<Options, Error> {
             "-R" | "--raw-input" => flags.raw_input = true,
             // The file name is the first operand, not the next argument.
             "-f" | "--from-file" => flags.from_file = true,
-            "-" => operands.push(arg),
+            "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
             other if other.starts_with("--") => {
                 return Err(Error::new(format!("unknown option: {other}")));
             }
@@ -638,7 +737,7 @@ fn options() -> Result<Options, Error> {
             other if is_option_cluster(other) => {
                 apply_short_cluster(&mut flags, other)?;
             }
-            _ => operands.push(arg),
+            _ => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
         }
         index += 1;
     }
@@ -664,7 +763,54 @@ fn options() -> Result<Options, Error> {
         program,
         files,
         named,
+        positional,
     })
+}
+
+fn push_operand(
+    operands: &mut Vec<String>,
+    positional: &mut Vec<Value>,
+    took: &mut bool,
+    tail: Tail,
+    arg: String,
+) {
+    // The program, or the file named by `-f`, is never a positional argument.
+    if !*took {
+        *took = true;
+        operands.push(arg);
+        return;
+    }
+    match tail {
+        Tail::Files => operands.push(arg),
+        Tail::Text => positional.push(Value::String(arg)),
+        Tail::Json => match one_json(&arg) {
+            Some(value) => positional.push(value),
+            None => jq_usage("jq: invalid JSON text passed to --jsonargs"),
+        },
+    }
+}
+
+fn file_binding(flag: &str, name: &str, path: &str) -> Value {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let reason = filter_reason(path, &err);
+            jq_die(&format!(
+                "jq: Bad JSON in {flag} {name} {path}: Could not open {path}: {reason}"
+            ));
+        }
+    };
+    if flag == "--rawfile" {
+        return Value::String(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let parsed = match parse_stream(&bytes) {
+        Ok(parsed) => parsed,
+        Err(err) => jq_die(&format!("jq: Bad JSON in {flag} {name} {path}: {err}")),
+    };
+    if let Some(message) = parsed.error {
+        jq_die(&format!("jq: Bad JSON in {flag} {name} {path}: {message}"));
+    }
+    Value::Array(parsed.values.into_iter().map(|item| item.value).collect())
 }
 
 fn is_option_cluster(arg: &str) -> bool {
@@ -705,28 +851,35 @@ fn one_json(text: &str) -> Option<Value> {
 /// Names a program can read. `$ARGS` is always one of them.
 /// A name that is not a `$name` spelling still lands in `$ARGS.named`.
 fn defined_names(named: &[(String, Value)]) -> Vec<String> {
-    let mut names = vec!["ARGS".to_string()];
+    let mut names = vec!["ARGS".to_string(), "ENV".to_string()];
     for (name, _) in named {
-        if name != "ARGS" && is_binding_name(name) {
+        // `$ENV` is the process environment. `--arg ENV` only fills `$ARGS.named`.
+        if name != "ARGS" && name != "ENV" && is_binding_name(name) {
             names.push(name.clone());
         }
     }
     names
 }
 
-fn initial_env(named: &[(String, Value)]) -> Vec<(String, Value)> {
+fn initial_env(
+    named: &[(String, Value)],
+    positional: &[Value],
+    environ: &Value,
+) -> Vec<(String, Value)> {
     let mut fields = Vec::new();
     let mut env = Vec::new();
     for (name, value) in named {
         fields.push((name.clone(), value.clone()));
-        if name != "ARGS" && is_binding_name(name) {
+        if name != "ARGS" && name != "ENV" && is_binding_name(name) {
             env.push((name.clone(), value.clone()));
         }
     }
     let args = Value::Object(vec![
-        ("positional".to_string(), Value::Array(Vec::new())),
+        ("positional".to_string(), Value::Array(positional.to_vec())),
         ("named".to_string(), Value::Object(fields)),
     ]);
+    // The first binding wins. `$ARGS` and `$ENV` sit in front of `--arg`.
+    env.insert(0, ("ENV".to_string(), environ.clone()));
     env.insert(0, ("ARGS".to_string(), args));
     env
 }
@@ -813,6 +966,11 @@ fn c_strtol(text: &str) -> i64 {
     } else {
         magnitude as i64
     }
+}
+
+fn jq_die(line: &str) -> ! {
+    eprintln!("{line}");
+    process::exit(2);
 }
 
 fn jq_usage(line: &str) -> ! {
