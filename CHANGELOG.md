@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+Released on 2026-10-16.
 
 Inside `reduce`, `. + [expr]` appends to an array, and `.[expr] = expr` sets a key or an index, without copying the whole value on every step. The result is unchanged.
 
