@@ -212,10 +212,18 @@ fn drive(
         Filter::Until(cond, next) => drive_until(cond, next, input, env, emit),
         Filter::While(cond, update) => drive_while(cond, update, input, env, emit),
         Filter::Repeat(expr) => drive_repeat(expr, input, env, emit),
-        other => {
-            let mut emit = |value| emit.call(value);
-            super::machine::run(other, input, env, &mut emit)
+        // A call runs on the heap so a function can call itself a million
+        // levels deep. Every other filter stays on the direct path. That path
+        // is what walks a large array.
+        Filter::Define { rest, .. } => drive(rest, input, env, emit),
+        Filter::Call { .. } | Filter::Param(_) => {
+            let mut forward = |value| emit.call(value);
+            super::machine::run(filter, input, env, &mut forward)
         }
+        Filter::Unresolved { name, arity, .. } => {
+            Err(fail(format!("{name}/{arity} is not defined")))
+        }
+        other => relay(eval::produce(other, input, env), emit),
     }
 }
 

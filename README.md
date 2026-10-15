@@ -108,9 +108,9 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 
 | run | `jq -c` | `tumulus -c` |
 | --- | ---: | ---: |
-| 1 | 2.77 | 4.47 |
-| 2 | 2.74 | 4.19 |
-| 3 | 2.73 | 4.11 |
+| 1 | 1.70 | 2.60 |
+| 2 | 1.70 | 2.62 |
+| 3 | 1.72 | 2.64 |
 
 Times are seconds.
 
