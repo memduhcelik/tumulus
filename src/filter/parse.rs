@@ -1977,11 +1977,8 @@ impl<'a> Parser<'a> {
         let mut toks = Vec::new();
         loop {
             self.skip_ws();
-            if self
-                .peek()
-                .is_some_and(|c| c == '-' || c == '.' || c.is_ascii_digit())
-            {
-                toks.push(BracketTok::Num(self.number_literal()?.to_string()));
+            if let Some(literal) = self.slice_bound_literal()? {
+                toks.push(BracketTok::Num(literal));
             }
             self.skip_ws();
             if self.eat(':') {
@@ -1999,6 +1996,52 @@ impl<'a> Parser<'a> {
             return Err(ProgramError::Syntax);
         }
         filter_from_brackets(toks)
+    }
+
+    /// A slice bound. `nan` and `infinite` are the same numbers as elsewhere.
+    /// The stored text is the sentinel arithmetic already uses, so the slice
+    /// and `path` agree on it.
+    fn slice_bound_literal(&mut self) -> Result<Option<String>, ProgramError> {
+        let negative = self.peek() == Some('-');
+        if negative {
+            if self.nonfinite_word(1).is_some() {
+                self.bump();
+                let word = self.nonfinite_word(0).expect("nonfinite");
+                self.index += word.len();
+                return Ok(Some(signed_nonfinite(true, word)));
+            }
+        } else if let Some(word) = self.nonfinite_word(0) {
+            self.index += word.len();
+            return Ok(Some(signed_nonfinite(false, word)));
+        }
+        if self
+            .peek()
+            .is_some_and(|c| c == '-' || c == '.' || c.is_ascii_digit())
+        {
+            return Ok(Some(self.number_literal()?.to_string()));
+        }
+        Ok(None)
+    }
+
+    /// `nan` or `infinite` after `skip` characters, when the word ends there.
+    fn nonfinite_word(&self, skip: usize) -> Option<&'static str> {
+        let mut index = self.index;
+        for _ in 0..skip {
+            let ch = self.src[index..].chars().next()?;
+            index += ch.len_utf8();
+        }
+        let rest = &self.src[index..];
+        for word in ["nan", "infinite"] {
+            if !rest.starts_with(word) {
+                continue;
+            }
+            let after = rest[word.len()..].chars().next();
+            if after.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+                return None;
+            }
+            return Some(word);
+        }
+        None
     }
 
     fn number_literal(&mut self) -> Result<&'a str, ProgramError> {
@@ -2509,6 +2552,20 @@ pub(super) fn at_key(base: Option<Filter>, key: Filter) -> Filter {
         base: Box::new(base.unwrap_or(Filter::Identity)),
         key: Box::new(key),
         optional: false,
+    }
+}
+
+fn signed_nonfinite(negative: bool, word: &str) -> String {
+    if word == "nan" {
+        if negative {
+            number::neg_nan_text()
+        } else {
+            number::nan_text()
+        }
+    } else if negative {
+        number::neg_inf()
+    } else {
+        number::pos_inf()
     }
 }
 

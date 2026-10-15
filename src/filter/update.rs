@@ -424,7 +424,7 @@ fn set_inplace(
             let shown = canonical_number(text);
             let Some(index) = array_index(&shown) else {
                 return match acc {
-                    Value::Null | Value::Array(_) => Err(fail("Array index too large".to_string())),
+                    Value::Null | Value::Array(_) => Err(fail(huge_index_error(&shown))),
                     other => Err(fail(format!(
                         "Cannot index {} with number",
                         other.type_name()
@@ -584,6 +584,8 @@ fn classify_step(container: &Value, key: &Value) -> Result<Step, String> {
                 return if matches!(container, Value::Null | Value::Array(_)) {
                     if matches!(crate::number::real(&shown), crate::number::Real::Nan) {
                         Err("Cannot set array element at NaN index".to_string())
+                    } else if negative_huge(&shown) {
+                        Ok(Step::Huge(shown))
                     } else {
                         Err(format!(
                             "Invalid path expression with result {}",
@@ -1588,7 +1590,7 @@ fn run_fixed_index(
                 return Err(bare(near_access(&Value::Null, input)));
             }
             if matches!(input, Value::Null | Value::Array(_)) {
-                Ok(vec![huge_out(path, text, line)])
+                Ok(vec![huge_out(path, text, line, ctx.next)])
             } else {
                 Err(bare(format!(
                     "Cannot index {} with number",
@@ -2139,7 +2141,7 @@ fn index_here(
         return Err(bare(near_access(key, input)));
     }
     match real_step(input, key).map_err(bare)? {
-        Real::Huge(text) => Ok(vec![huge_out(path, &text, line)]),
+        Real::Huge(text) => Ok(vec![huge_out(path, &text, line, ctx.next)]),
         Real::Done(step, child) => {
             let mut full = path.to_vec();
             full.push(step);
@@ -2153,7 +2155,7 @@ fn index_out(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
         return Err(near_access(key, &base.value));
     }
     match real_step(&base.value, key)? {
-        Real::Huge(text) => Ok(huge_out(&base.path, &text, &Cell::new(base.line))),
+        Real::Huge(text) => Ok(huge_out(&base.path, &text, &Cell::new(base.line), ctx.next)),
         Real::Done(step, child) => {
             let gen = alloc(ctx.next);
             let mut path = base.path.clone();
@@ -2170,9 +2172,24 @@ fn index_out(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
     }
 }
 
-fn huge_out(path: &[Step], text: &str, line: &Cell<u64>) -> POut {
+fn huge_out(path: &[Step], text: &str, line: &Cell<u64>, next: &Cell<u64>) -> POut {
     let mut full = path.to_vec();
     full.push(Step::Huge(text.to_string()));
+    // A negative value that does not fit is still an index, so a later
+    // `.a` or `[0]` extends it. Setting it is out of bounds. A positive
+    // one stays a broken path.
+    if negative_huge(text) {
+        let gen = alloc(next);
+        line.set(gen);
+        return POut {
+            value: Value::Null,
+            path: full,
+            value_gen: gen,
+            line: gen,
+            carrier: true,
+            force_broken: false,
+        };
+    }
     POut {
         value: Value::Null,
         path: full,
@@ -2180,6 +2197,24 @@ fn huge_out(path: &[Step], text: &str, line: &Cell<u64>) -> POut {
         line: line.get(),
         carrier: false,
         force_broken: true,
+    }
+}
+
+/// Negative, and not a number `array_index` can store. `nan` is not negative.
+fn negative_huge(text: &str) -> bool {
+    match crate::number::real(text) {
+        crate::number::Real::Num(number) => number.is_sign_negative(),
+        crate::number::Real::Nan => false,
+    }
+}
+
+fn huge_index_error(text: &str) -> String {
+    match crate::number::real(text) {
+        crate::number::Real::Nan => "Cannot set array element at NaN index".to_string(),
+        crate::number::Real::Num(number) if number.is_sign_negative() => {
+            "Out of bounds negative array index".to_string()
+        }
+        _ => "Array index too large".to_string(),
     }
 }
 
@@ -2659,7 +2694,13 @@ fn write_path(edit: &mut Edit, path: &[Step], write: &Write) -> Result<(), Strin
     match &path[0] {
         Step::Key(key) => write_key(edit, key, &path[1..], write),
         Step::Index { at, .. } => write_index(edit, *at, &path[1..], write),
-        Step::Huge(_) => Err("Array index too large".to_string()),
+        Step::Huge(text) => {
+            if negative_huge(text) && matches!(write, Write::Remove) {
+                Ok(())
+            } else {
+                Err(huge_index_error(text))
+            }
+        }
         Step::Raw(key) => write_raw(edit, key, &path[1..], write),
         Step::Slice { start, end } => write_slice(edit, start, end, &path[1..], write),
     }
@@ -2686,7 +2727,11 @@ fn write_raw(edit: &mut Edit, key: &Value, rest: &[Step], write: &Write) -> Resu
         _ => {
             let current = freeze(edit);
             match real_step(&current, key)? {
-                Real::Huge(_) => Err("Array index too large".to_string()),
+                Real::Huge(text) => {
+                    let mut steps = vec![Step::Huge(text)];
+                    steps.extend_from_slice(rest);
+                    write_path(edit, &steps, write)
+                }
                 Real::Done(step, _) => {
                     let mut steps = vec![step];
                     steps.extend_from_slice(rest);
@@ -2943,7 +2988,13 @@ fn read_edit(edit: &Edit, path: &[Step]) -> Result<Value, String> {
             Err("Cannot index object with number".to_string())
         }
         (Edit::Obj(_), Step::Slice { .. }) => Err("Cannot index object with object".to_string()),
-        (Edit::Arr(_), Step::Huge(_)) => Err("Array index too large".to_string()),
+        (Edit::Arr(_), Step::Huge(text)) => {
+            if negative_huge(text) {
+                read_edit(&Edit::Pure(Value::Null), &path[1..])
+            } else {
+                Err("Array index too large".to_string())
+            }
+        }
         (Edit::Arr(arr), Step::Index { at: index, .. }) => {
             let Some(position) = resolve_index(*index, arr.slots.len()) else {
                 return Err("Out of bounds negative array index".to_string());
@@ -3362,7 +3413,7 @@ fn set_value(value: &Value, path: &Value, new_value: &Value) -> Result<Value, St
     let mut cur = value.clone();
     for key in keys {
         match real_step(&cur, key)? {
-            Real::Huge(_) => return Err("Array index too large".to_string()),
+            Real::Huge(text) => return Err(huge_index_error(&text)),
             Real::Done(step, child) => {
                 steps.push(step);
                 cur = child;

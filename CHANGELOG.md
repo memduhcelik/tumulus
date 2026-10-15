@@ -4,6 +4,8 @@
 
 Inside `reduce`, `.[expr] |= expr` sets a key or an index, and `setpath` writes a path, without copying the whole value on every step. `foreach` appends with `. + [expr]` and updates with `.[expr] |= expr` the same way, and yields each step before it builds the next one. A step that is saved, as in `[foreach]`, is copied. A `foreach` inside a function is copied too, because the call hands back each step. The result is unchanged.
 
+`setpath([nan]; value)` on an array or null fails with `Cannot set array element at NaN index`. A slice bound may be `nan` or `infinite`. `nan` on the left of `:` is the start of the value, and on the right it is the end. `infinite` is the end and `-infinite` is the start. Setting `-infinite`, or another negative index that does not fit such as `-1e300`, fails with `Out of bounds negative array index`. Removing that index leaves the value as it is. Of the 447 programs in jq 1.7.1's test file, 304 come out the same.
+
 ## 0.6.0
 
 Released on 2026-10-16.

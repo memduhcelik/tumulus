@@ -482,7 +482,19 @@ pub fn array_index(literal: &str) -> Option<i64> {
 
 /// Bound for a slice. `end` rounds with ceil, the start with floor.
 /// A negative value counts back from `len`. The result is clamped to `0..=len`.
+/// `nan` is the start on the left of `:` and the length on the right.
+/// `infinite` is the length, and `-infinite` is the start.
 pub fn slice_bound(literal: &str, len: i64, end: bool) -> i64 {
+    let text = body(literal);
+    if text == NAN_TEXT || text == NEG_NAN_TEXT {
+        return if end { len } else { 0 };
+    }
+    if text == POS_INF {
+        return len;
+    }
+    if text == NEG_INF {
+        return 0;
+    }
     let Some((negative, digits, scale)) = decimal_parts(literal) else {
         return 0;
     };
