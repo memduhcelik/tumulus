@@ -105,6 +105,12 @@ pub enum Filter {
     InputFilename,
     /// `env`. The process environment, not the binding of `$ENV`.
     Environ,
+    /// `sort`, `unique`, `min`, `max`, and the `*_by` forms.
+    Order {
+        kind: SortKind,
+        /// The key filter. Absent for `sort`, `unique`, `min`, and `max`.
+        by: Option<Box<Filter>>,
+    },
     /// `expr as pattern | body`. `.` in the body is the input of this expression.
     Bind {
         expr: Box<Filter>,
@@ -316,6 +322,28 @@ pub enum ObjField {
     },
     /// `{"key"}` copies `.["key"]` for each string the key expression yields.
     Lookup(Box<Filter>),
+}
+
+/// Which ordering builtin is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKind {
+    Sort,
+    SortBy,
+    Group,
+    Unique,
+    UniqueBy,
+    Min,
+    Max,
+    MinBy,
+    MaxBy,
+}
+
+impl SortKind {
+    /// `min` and `max` name both values in the "iterated" message.
+    /// The `*_by` forms build a key array first.
+    pub(crate) fn pairs_input(self) -> bool {
+        matches!(self, SortKind::Min | SortKind::Max)
+    }
 }
 
 /// Why a program was rejected.

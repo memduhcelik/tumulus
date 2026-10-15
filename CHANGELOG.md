@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`sort` orders an array. The order is the comparison order: null, then false, then true, then numbers, strings, arrays, and objects. Equal values stay in the order they arrived. `sort_by(f)`, `group_by(f)`, `unique_by(f)`, `min_by(f)`, and `max_by(f)` take that one filter. `f` runs once on each element, from left to right, and every value it yields is part of the key. `sort_by(.a, .b)` compares `.a` and then `.b`. `group_by(f)` keeps each run of equal keys as an array, in the order the values arrived inside the run. `unique` and `unique_by(f)` keep the first value of each run. `min` and `min_by(f)` keep the earliest value when the keys compare equal. `max` and `max_by(f)` keep the latest. `min`, `max`, `min_by`, and `max_by` of an empty array are null. `nan` compares less than itself, so `sort` and `sort_by` leave those values in the order they arrived, `min` keeps the last `nan`, and `max` keeps the first. `unique` and `group_by` keep every `nan`. `sort`, `unique`, `min`, and `max` take no argument. A value of the wrong kind fails the way jq fails, and the exit status is 5.
+
 `input` reads the next value from the input. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and the exit status is 5. `inputs` stops there. A value that is not valid JSON fails that read with jq's parse message. If that failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, one array is the whole input. With `-R`, each line is one string.
 
 `$__loc__` is `{"file":"<top-level>","line":N}`, and `N` is the line of that `$`. A program from `-f` still says `<top-level>`.
@@ -30,7 +32,7 @@ A filter that does not call a user function runs at the speed it did before a fu
 
 `recurse` and `..` yield a value and then each value inside it. `recurse(f)` walks each value `f` yields, depth first. `recurse(f; cond)` walks such a value once for each truthy result of `cond`. `limit` and `first` stop that walk before a later value is produced. Used as a path, `recurse(f)` includes the current value and then each value `f` reaches by indexing, and `cond` decides whether that value is entered. A computed value is an invalid path. `walk(f)` rebuilds an array or object from the bottom and then runs `f`. An array keeps every value a child yields. An object keeps the first value of a field and does not run the rest of that field, and a field that yields nothing is left out. `to_entries` writes `{key, value}` pairs in stored order. An array's keys are numbers. `from_entries` reads `key`, then `Key`, then `name`, then `Name`, and skips null and false. `k` is not a key. The value is the `value` field when it is present, even if that value is null, otherwise `Value`, otherwise null. `with_entries(f)` runs `f` over those pairs and reads them back. `tojson` writes compact JSON, and a string is quoted. `add` folds with `+`, starting from null. An empty array or object is null. A value of the wrong kind fails the way jq fails, and the exit status is 5.
 
-Of the 447 programs in jq 1.7.1's test file, 295 come out the same.
+Of the 447 programs in jq 1.7.1's test file, 302 come out the same.
 
 ## 0.5.0
 

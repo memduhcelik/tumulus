@@ -62,6 +62,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Param(_)
             | Filter::Paths(None)
             | Filter::Unresolved { .. } => false,
+            Filter::Order { by, .. } => by.as_deref().is_some_and(|by| walk(by, seen)),
             Filter::Pipe(left, right)
             | Filter::Comma(left, right)
             | Filter::And(left, right)
@@ -234,6 +235,10 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Inputs
         | Filter::InputFilename
         | Filter::Environ => Ok(()),
+        Filter::Order { by, .. } => match by {
+            Some(by) => check_vars(by, scope),
+            None => Ok(()),
+        },
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -513,6 +518,11 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Environ
         | Filter::Param(_)
         | Filter::Paths(None) => {}
+        Filter::Order { by, .. } => {
+            if let Some(by) = by {
+                walk_defs(by, seen, errors);
+            }
+        }
         Filter::Pipe(left, right)
         | Filter::Comma(left, right)
         | Filter::And(left, right)
@@ -710,9 +720,9 @@ fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
         "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "tojson"
         | "todate" | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" | "add"
-        | "to_entries" | "from_entries" | "input" | "inputs" | "input_filename" | "env" => {
-            arity == 0
-        }
+        | "to_entries" | "from_entries" | "input" | "inputs" | "input_filename" | "env"
+        | "sort" | "unique" | "min" | "max" => arity == 0,
+        "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
         "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "strftime"
         | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat"
         | "walk" | "with_entries" => arity == 1,
@@ -722,6 +732,21 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         "range" => (1..=3).contains(&arity),
         "limit" | "until" | "while" | "setpath" => arity == 2,
         _ => math_arity(name, arity),
+    }
+}
+
+fn order_kind(name: &str) -> SortKind {
+    match name {
+        "sort" => SortKind::Sort,
+        "sort_by" => SortKind::SortBy,
+        "group_by" => SortKind::Group,
+        "unique" => SortKind::Unique,
+        "unique_by" => SortKind::UniqueBy,
+        "min" => SortKind::Min,
+        "max" => SortKind::Max,
+        "min_by" => SortKind::MinBy,
+        "max_by" => SortKind::MaxBy,
+        _ => unreachable!("order builtin"),
     }
 }
 
@@ -742,6 +767,11 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "inputs" => Filter::Inputs,
         "input_filename" => Filter::InputFilename,
         "env" => Filter::Environ,
+        "sort" | "unique" | "min" | "max" | "sort_by" | "group_by" | "unique_by" | "min_by"
+        | "max_by" => Filter::Order {
+            kind: order_kind(name),
+            by: args.next(),
+        },
         "empty" => Filter::Empty,
         "length" => Filter::Length,
         "keys" => Filter::Keys,
@@ -2649,6 +2679,7 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Until(_, _)
         | Filter::While(_, _)
         | Filter::Repeat(_)
+        | Filter::Order { .. }
         | Filter::Define { .. }
         | Filter::Call { .. }
         | Filter::Param(_)

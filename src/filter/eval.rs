@@ -81,6 +81,7 @@ pub(super) fn produce(
         Filter::Inputs => all_reads(),
         Filter::InputFilename => Ok(vec![crate::feed::input_filename()]),
         Filter::Environ => Ok(vec![crate::feed::environ()]),
+        Filter::Order { kind, by } => super::sort::eval_order(*kind, by.as_deref(), input, env),
         Filter::Bind {
             expr,
             pattern,

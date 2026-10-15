@@ -6,6 +6,7 @@ mod eval;
 mod func;
 mod machine;
 mod parse;
+mod sort;
 mod stream;
 mod update;
 mod value;
