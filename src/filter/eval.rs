@@ -21,6 +21,7 @@ pub fn eval_with(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    let _scope = super::func::root_scope();
     eval_in(filter, input, env)
 }
 
@@ -162,6 +163,12 @@ pub(super) fn produce(
         Filter::Until(cond, next) => super::stream::until_values(cond, next, input, env),
         Filter::While(cond, update) => super::stream::while_values(cond, update, input, env),
         Filter::Repeat(expr) => super::stream::repeat_values(expr, input, env),
+        Filter::Define { rest, .. } => eval_in(rest, input, env),
+        Filter::Call { func, args } => super::stream::call_values(func, args, input, env),
+        Filter::Param(name) => super::func::eval_param(name, input, env),
+        Filter::Unresolved { name, arity, .. } => {
+            Err(fail(format!("{name}/{arity} is not defined")))
+        }
     }
 }
 

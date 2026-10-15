@@ -1,5 +1,8 @@
 //! Filter expressions, patterns, and failures.
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use crate::math;
 use crate::value::Value;
 
@@ -199,6 +202,42 @@ pub enum Filter {
     While(Box<Filter>, Box<Filter>),
     /// `repeat(expr)`. `expr` is run on the original input each time.
     Repeat(Box<Filter>),
+    /// `def name: body; rest`. `func` owns the body. A call holds only a weak
+    /// pointer, so a function that calls itself does not keep a cycle.
+    Define {
+        func: Rc<FnCell>,
+        rest: Box<Filter>,
+    },
+    /// A call of one arity of a function defined in this program.
+    Call {
+        func: Weak<FnCell>,
+        args: Vec<Filter>,
+    },
+    /// A filter argument of the function that is running.
+    Param(String),
+    /// A name or an arity nobody defined. Reported when the call is reached.
+    Unresolved {
+        at: usize,
+        name: String,
+        arity: usize,
+        args: Vec<Filter>,
+    },
+}
+
+/// A parameter of a user function. `$name` is bound before the body runs.
+/// A bare name is a filter, re-run at each use.
+#[derive(Clone, Debug)]
+pub enum FnParam {
+    Filter(String),
+    Value(String),
+}
+
+/// One user function. The body is filled in after the name is in scope, so
+/// the function can call itself. `Rc` keeps that body shared with every call.
+#[derive(Debug)]
+pub struct FnCell {
+    pub params: Vec<FnParam>,
+    pub body: RefCell<Rc<Filter>>,
 }
 
 /// How an update writes. `Modify` is `|=`. `Alt` is `//=`.

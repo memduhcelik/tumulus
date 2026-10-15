@@ -453,8 +453,85 @@ fn run(
             expr: Some(expr),
         } => run_nth_gen(index, expr, input, path, line, input_gen, ctx),
         Filter::Limit(count, expr) => run_limit(count, expr, input, path, line, input_gen, ctx),
+        Filter::Define { rest, .. } => run(rest, input, path, line, input_gen, ctx),
+        Filter::Call { func, args } => run_call(func, args, input, path, line, input_gen, ctx),
+        Filter::Param(name) => run_param(name, input, path, line, input_gen, ctx),
+        Filter::Unresolved { name, arity, .. } => {
+            Err(bare(format!("{name}/{arity} is not defined")))
+        }
         other => run_fallback(other, input, path, line, ctx),
     }
+}
+
+fn run_call(
+    func: &std::rc::Weak<super::FnCell>,
+    args: &[Filter],
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let Some(cell) = func.upgrade() else {
+        return Err(bare("function is not defined".to_string()));
+    };
+    let body = std::rc::Rc::clone(&cell.body.borrow());
+    let saved = line.get();
+    let mut out = Vec::new();
+    let result = stream::each_binding(func, args, input, ctx.env, &mut |frame| {
+        let _guard = super::func::set_scope(std::rc::Rc::clone(&frame.scope));
+        let child = Ctx {
+            root: ctx.root,
+            next: ctx.next,
+            env: &frame.env,
+            pbinds: ctx.pbinds,
+        };
+        let branch = Cell::new(saved);
+        match run(&body, input, path, &branch, input_gen, &child) {
+            Ok(more) => {
+                out.extend(more);
+                Ok(false)
+            }
+            Err(err) => {
+                out.extend(err.partial);
+                Err(Failure {
+                    partial: Vec::new(),
+                    message: err.message,
+                    caught: err.caught,
+                })
+            }
+        }
+    });
+    match result {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(PathErr {
+            partial: out,
+            message: failure.message,
+            caught: failure.caught,
+        }),
+    }
+}
+
+fn run_param(
+    name: &str,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let Some(closure) = super::func::lookup(name) else {
+        return Err(bare(format!("{name} is not defined")));
+    };
+    let _guard = super::func::set_scope(std::rc::Rc::clone(&closure.scope));
+    let env = closure.env.clone();
+    let child = Ctx {
+        root: ctx.root,
+        next: ctx.next,
+        env: &env,
+        pbinds: ctx.pbinds,
+    };
+    run(&closure.expr, input, path, line, input_gen, &child)
 }
 
 /// The first `want` path outputs. A `comma` does not run its right side once

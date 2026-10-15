@@ -6,12 +6,14 @@
 //! going without holding the callback across the recursive call.
 
 use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
 use crate::number;
 use crate::value::Value;
 
 use super::ast::*;
 use super::eval::{self, fail, index_by};
+use super::func;
 use super::value::{add_values, cmp_value, sub_values};
 
 struct Emit<'a> {
@@ -210,8 +212,169 @@ fn drive(
         Filter::Until(cond, next) => drive_until(cond, next, input, env, emit),
         Filter::While(cond, update) => drive_while(cond, update, input, env, emit),
         Filter::Repeat(expr) => drive_repeat(expr, input, env, emit),
+        Filter::Define { rest, .. } => drive(rest, input, env, emit),
+        Filter::Call { func, args } => drive_call(func, args, input, env, emit),
+        Filter::Param(name) => drive_param(name, input, env, emit),
+        Filter::Unresolved { name, arity, .. } => {
+            Err(fail(format!("{name}/{arity} is not defined")))
+        }
         other => relay(eval::produce(other, input, env), emit),
     }
+}
+
+pub(super) fn call_values(
+    func: &Weak<FnCell>,
+    args: &[Filter],
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    streamed(input, env, |emit| drive_call(func, args, input, env, emit))
+}
+
+fn drive_call(
+    func: &Weak<FnCell>,
+    args: &[Filter],
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    let Some(cell) = func.upgrade() else {
+        return Err(fail("function is not defined".to_string()));
+    };
+    let body = Rc::clone(&cell.body.borrow());
+    each_binding(func, args, input, env, &mut |frame| {
+        let _guard = func::set_scope(Rc::clone(&frame.scope));
+        drive(&body, input, &frame.env, emit)
+    })
+}
+
+fn drive_param(
+    name: &str,
+    input: &Value,
+    _env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    let Some(closure) = func::lookup(name) else {
+        return Err(fail(format!("{name} is not defined")));
+    };
+    // The argument runs in the caller's scope. Values it yields are consumed
+    // by the caller, which still sees this function's parameters. Restore
+    // that scope before handing a value on, or `a | a` looks the name up in
+    // the caller's scope.
+    let here = func::current_scope();
+    let _guard = func::set_scope(Rc::clone(&closure.scope));
+    let mut forward = |value: Value| {
+        let _back = func::set_scope(Rc::clone(&here));
+        emit.call(value)
+    };
+    let forward = Emit {
+        f: RefCell::new(&mut forward),
+    };
+    drive(&closure.expr, input, &closure.env, &forward)
+}
+
+/// Every combination of the `$` arguments, leftmost outermost.
+/// A filter argument is not run here. An empty `$` argument runs nothing.
+/// A later value is not run once the body asks to stop or fails.
+pub(super) fn each_binding(
+    func: &Weak<FnCell>,
+    args: &[Filter],
+    input: &Value,
+    env: &[(String, Value)],
+    visit: &mut dyn FnMut(&func::Frame) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let Some(cell) = func.upgrade() else {
+        return Err(fail("function is not defined".to_string()));
+    };
+    let caller_scope = func::current_scope();
+    let slots = func::prepare(&cell.params, args, env, &caller_scope);
+    let filters: Vec<(String, Rc<func::Closure>)> = slots
+        .iter()
+        .filter_map(|slot| match slot {
+            func::Slot::Filter { name, closure } => Some((name.clone(), Rc::clone(closure))),
+            func::Slot::Value { .. } => None,
+        })
+        .collect();
+    bind_from(
+        &slots,
+        0,
+        &mut Vec::new(),
+        &filters,
+        input,
+        env,
+        &caller_scope,
+        visit,
+    )
+}
+
+fn bind_from(
+    slots: &[func::Slot],
+    index: usize,
+    values: &mut Vec<(String, Value)>,
+    filters: &[(String, Rc<func::Closure>)],
+    input: &Value,
+    caller_env: &[(String, Value)],
+    caller_scope: &Rc<func::ScopeNode>,
+    visit: &mut dyn FnMut(&func::Frame) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    if index == slots.len() {
+        let frame = func::frame(values, filters, caller_env, caller_scope);
+        return visit(&frame);
+    }
+    match &slots[index] {
+        func::Slot::Filter { .. } => bind_from(
+            slots,
+            index + 1,
+            values,
+            filters,
+            input,
+            caller_env,
+            caller_scope,
+            visit,
+        ),
+        func::Slot::Value { name, expr } => {
+            let name = name.clone();
+            for_each(expr, input, caller_env, |value| {
+                values.push((name.clone(), value));
+                let result = bind_from(
+                    slots,
+                    index + 1,
+                    values,
+                    filters,
+                    input,
+                    caller_env,
+                    caller_scope,
+                    visit,
+                );
+                values.pop();
+                result
+            })
+        }
+    }
+}
+
+fn for_each(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    mut on_value: impl FnMut(Value) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let mut on_one = |value: Value| match on_value(value) {
+        Ok(stop) => stop,
+        Err(err) => {
+            *failure.borrow_mut() = Some(err);
+            true
+        }
+    };
+    let emit = Emit {
+        f: RefCell::new(&mut on_one),
+    };
+    let result = drive(filter, input, env, &emit);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    result
 }
 
 fn relay(result: Result<Vec<Value>, Failure>, emit: &Emit) -> Result<bool, Failure> {

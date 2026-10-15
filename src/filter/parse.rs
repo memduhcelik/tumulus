@@ -1,5 +1,9 @@
 //! Reading a program into a filter.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+
 use crate::math::{self, Kind};
 use crate::number::{self, array_index};
 use crate::value::Value;
@@ -7,6 +11,10 @@ use crate::value::Value;
 use super::ast::*;
 use super::eval::shown;
 use super::value::{apply_op, put};
+
+thread_local! {
+    static REACHED: RefCell<Option<HashSet<usize>>> = RefCell::new(None);
+}
 
 pub fn compile(source: &str) -> Result<Filter, ProgramError> {
     compile_with(source, &[])
@@ -20,6 +28,10 @@ pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramErr
         reject_block: false,
         reject_try: false,
         suffix_question: false,
+        scopes: vec![PScope {
+            funcs: Vec::new(),
+            params: Vec::new(),
+        }],
     };
     parser.skip_ws();
     let filter = parser.parse_pipe()?;
@@ -27,6 +39,11 @@ pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramErr
     if !parser.eof() {
         return Err(ProgramError::Syntax);
     }
+    let (errors, reached) = undefined_calls(&filter);
+    if !errors.is_empty() {
+        return Err(report_calls(source, &errors));
+    }
+    let _reached = set_reached(reached);
     check_vars(&filter, scope)?;
     Ok(filter)
 }
@@ -151,6 +168,27 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         Filter::First(Some(inner)) | Filter::Last(Some(inner)) | Filter::Repeat(inner) => {
             check_vars(inner, scope)
         }
+        Filter::Param(_) => Ok(()),
+        Filter::Call { args, .. } | Filter::Unresolved { args, .. } => {
+            for arg in args {
+                check_vars(arg, scope)?;
+            }
+            Ok(())
+        }
+        Filter::Define { func, rest } => {
+            let ptr = Rc::as_ptr(func) as usize;
+            if body_reached(ptr) {
+                let mut inner = scope.to_vec();
+                for param in &func.params {
+                    if let FnParam::Value(name) = param {
+                        inner.push(name.clone());
+                    }
+                }
+                let body = Rc::clone(&func.body.borrow());
+                check_vars(&body, &inner)?;
+            }
+            check_vars(rest, scope)
+        }
         Filter::Nth { index, expr } => {
             check_vars(index, scope)?;
             if let Some(expr) = expr {
@@ -238,6 +276,360 @@ pub(super) fn check_pattern(pattern: &Pattern, scope: &[String]) -> Result<(), P
     }
 }
 
+fn body_reached(ptr: usize) -> bool {
+    REACHED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|reached| reached.contains(&ptr))
+    })
+}
+
+struct Reached;
+
+impl Drop for Reached {
+    fn drop(&mut self) {
+        REACHED.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+fn set_reached(reached: HashSet<usize>) -> Reached {
+    REACHED.with(|slot| *slot.borrow_mut() = Some(reached));
+    Reached
+}
+
+/// Calls that nobody defined, and the functions a call actually reaches.
+/// An argument of an undefined call is not itself reported: jq names the call.
+fn undefined_calls(filter: &Filter) -> (Vec<(usize, String)>, HashSet<usize>) {
+    let mut errors = Vec::new();
+    let mut seen = HashSet::new();
+    walk_defs(filter, &mut seen, &mut errors);
+    errors.sort_by_key(|(at, _)| *at);
+    (errors, seen)
+}
+
+fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize, String)>) {
+    match filter {
+        Filter::Identity
+        | Filter::Field(_)
+        | Filter::Index { .. }
+        | Filter::Slice { .. }
+        | Filter::Iterate
+        | Filter::Recurse
+        | Filter::Literal(_)
+        | Filter::Not
+        | Filter::Empty
+        | Filter::Length
+        | Filter::Keys
+        | Filter::Type
+        | Filter::ToNumber
+        | Filter::ToString
+        | Filter::ToDate
+        | Filter::FromDate
+        | Filter::GmTime
+        | Filter::LocalTime
+        | Filter::MkTime
+        | Filter::Now
+        | Filter::Math1(_)
+        | Filter::Abs
+        | Filter::Pow10
+        | Filter::Error
+        | Filter::First(None)
+        | Filter::Last(None)
+        | Filter::Var(_)
+        | Filter::Param(_)
+        | Filter::Paths(None) => {}
+        Filter::Pipe(left, right)
+        | Filter::Comma(left, right)
+        | Filter::And(left, right)
+        | Filter::Or(left, right)
+        | Filter::Alt(left, right)
+        | Filter::Bin { left, right, .. }
+        | Filter::Math2(_, left, right)
+        | Filter::Limit(left, right)
+        | Filter::Until(left, right)
+        | Filter::While(left, right) => {
+            walk_defs(left, seen, errors);
+            walk_defs(right, seen, errors);
+        }
+        Filter::Optional(inner)
+        | Filter::Collect(inner)
+        | Filter::Neg(inner)
+        | Filter::Has(inner)
+        | Filter::Select(inner)
+        | Filter::Map(inner)
+        | Filter::Join(inner)
+        | Filter::LTrim(inner)
+        | Filter::RTrim(inner)
+        | Filter::StrfTime(inner)
+        | Filter::StrfLocalTime(inner)
+        | Filter::StrpTime(inner)
+        | Filter::Raise(inner)
+        | Filter::PathOf(inner)
+        | Filter::GetPath(inner)
+        | Filter::DelPaths(inner)
+        | Filter::First(Some(inner))
+        | Filter::Last(Some(inner))
+        | Filter::Repeat(inner) => walk_defs(inner, seen, errors),
+        Filter::Paths(Some(inner)) => walk_defs(inner, seen, errors),
+        Filter::Try { body, handler } => {
+            walk_defs(body, seen, errors);
+            if let Some(handler) = handler {
+                walk_defs(handler, seen, errors);
+            }
+        }
+        Filter::Update { path, expr, .. } => {
+            walk_defs(path, seen, errors);
+            walk_defs(expr, seen, errors);
+        }
+        Filter::SetPath(path, value) => {
+            walk_defs(path, seen, errors);
+            walk_defs(value, seen, errors);
+        }
+        Filter::Interpolate(pieces) => {
+            for piece in pieces {
+                if let Piece::Interp(inner) = piece {
+                    walk_defs(inner, seen, errors);
+                }
+            }
+        }
+        Filter::Object(fields) => {
+            for field in fields {
+                match field {
+                    ObjField::Pair { key, value } => {
+                        walk_defs(key, seen, errors);
+                        walk_defs(value, seen, errors);
+                    }
+                    ObjField::Lookup(key) => walk_defs(key, seen, errors),
+                }
+            }
+        }
+        Filter::At { base, key, .. } => {
+            walk_defs(base, seen, errors);
+            walk_defs(key, seen, errors);
+        }
+        Filter::Math3(x, y, z) => {
+            walk_defs(x, seen, errors);
+            walk_defs(y, seen, errors);
+            walk_defs(z, seen, errors);
+        }
+        Filter::Nth { index, expr } => {
+            walk_defs(index, seen, errors);
+            if let Some(expr) = expr {
+                walk_defs(expr, seen, errors);
+            }
+        }
+        Filter::Range { from, to, step } => {
+            if let Some(from) = from {
+                walk_defs(from, seen, errors);
+            }
+            walk_defs(to, seen, errors);
+            if let Some(step) = step {
+                walk_defs(step, seen, errors);
+            }
+        }
+        Filter::If { cond, yes, no } => {
+            walk_defs(cond, seen, errors);
+            walk_defs(yes, seen, errors);
+            walk_defs(no, seen, errors);
+        }
+        Filter::Bind { expr, body, .. } => {
+            walk_defs(expr, seen, errors);
+            walk_defs(body, seen, errors);
+        }
+        Filter::Reduce {
+            stream,
+            init,
+            update,
+            ..
+        }
+        | Filter::Foreach {
+            stream,
+            init,
+            update,
+            ..
+        } => {
+            walk_defs(stream, seen, errors);
+            walk_defs(init, seen, errors);
+            walk_defs(update, seen, errors);
+            if let Filter::Foreach {
+                extract: Some(extract),
+                ..
+            } = filter
+            {
+                walk_defs(extract, seen, errors);
+            }
+        }
+        Filter::Define { rest, .. } => walk_defs(rest, seen, errors),
+        Filter::Call { func, args } => {
+            for arg in args {
+                walk_defs(arg, seen, errors);
+            }
+            let Some(cell) = func.upgrade() else {
+                return;
+            };
+            let ptr = Rc::as_ptr(&cell) as usize;
+            if seen.insert(ptr) {
+                let body = Rc::clone(&cell.body.borrow());
+                walk_defs(&body, seen, errors);
+            }
+        }
+        Filter::Unresolved {
+            at, name, arity, ..
+        } => errors.push((*at, format!("{name}/{arity} is not defined"))),
+    }
+}
+
+fn report_calls(source: &str, errors: &[(usize, String)]) -> ProgramError {
+    if errors.len() == 1 {
+        return report_at(source, errors[0].0, &errors[0].1);
+    }
+    let mut text = String::new();
+    for (at, message) in errors {
+        let (line_no, line, column) = line_at(source, *at);
+        text.push_str(&format!(
+            "jq: error: {message} at <top-level>, line {line_no}:\n{line}"
+        ));
+        text.push_str(&" ".repeat(column));
+        text.push('\n');
+    }
+    text.push_str(&format!("jq: {} compile errors\n", errors.len()));
+    ProgramError::Report(text)
+}
+
+fn reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "end"
+            | "and"
+            | "or"
+            | "def"
+            | "as"
+            | "reduce"
+            | "foreach"
+            | "try"
+            | "catch"
+            | "import"
+            | "include"
+            | "module"
+            | "break"
+            | "label"
+    )
+}
+
+fn unbox(args: Vec<Box<Filter>>) -> Vec<Filter> {
+    args.into_iter().map(|arg| *arg).collect()
+}
+
+fn is_builtin(name: &str, arity: usize) -> bool {
+    match name {
+        "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "todate"
+        | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" => arity == 0,
+        "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "strftime"
+        | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat" => {
+            arity == 1
+        }
+        "paths" | "first" | "last" | "error" => arity <= 1,
+        "nth" => arity == 1 || arity == 2,
+        "range" => (1..=3).contains(&arity),
+        "limit" | "until" | "while" | "setpath" => arity == 2,
+        _ => math_arity(name, arity),
+    }
+}
+
+fn math_arity(name: &str, arity: usize) -> bool {
+    match math::kind(name) {
+        Some(Kind::Unary(_) | Kind::Abs | Kind::Pow10) => arity == 0,
+        Some(Kind::Binary(_)) => arity == 2,
+        Some(Kind::Fma) => arity == 3,
+        None => false,
+    }
+}
+
+fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
+    let mut args = args.into_iter();
+    match name {
+        "not" => Filter::Not,
+        "empty" => Filter::Empty,
+        "length" => Filter::Length,
+        "keys" => Filter::Keys,
+        "type" => Filter::Type,
+        "tonumber" => Filter::ToNumber,
+        "tostring" => Filter::ToString,
+        "todate" => Filter::ToDate,
+        "fromdate" => Filter::FromDate,
+        "gmtime" => Filter::GmTime,
+        "localtime" => Filter::LocalTime,
+        "mktime" => Filter::MkTime,
+        "now" => Filter::Now,
+        "has" => Filter::Has(args.next().expect("arg")),
+        "select" => Filter::Select(args.next().expect("arg")),
+        "map" => Filter::Map(args.next().expect("arg")),
+        "join" => Filter::Join(args.next().expect("arg")),
+        "ltrimstr" => Filter::LTrim(args.next().expect("arg")),
+        "rtrimstr" => Filter::RTrim(args.next().expect("arg")),
+        "strftime" => Filter::StrfTime(args.next().expect("arg")),
+        "strflocaltime" => Filter::StrfLocalTime(args.next().expect("arg")),
+        "strptime" => Filter::StrpTime(args.next().expect("arg")),
+        "path" => Filter::PathOf(args.next().expect("arg")),
+        "getpath" => Filter::GetPath(args.next().expect("arg")),
+        "delpaths" => Filter::DelPaths(args.next().expect("arg")),
+        "del" => Filter::Update {
+            op: UpdateOp::Modify,
+            path: args.next().expect("path"),
+            expr: Box::new(Filter::Empty),
+        },
+        "repeat" => Filter::Repeat(args.next().expect("expr")),
+        "paths" => Filter::Paths(args.next()),
+        "first" => Filter::First(args.next()),
+        "last" => Filter::Last(args.next()),
+        "error" => match args.next() {
+            None => Filter::Error,
+            Some(arg) => Filter::Raise(arg),
+        },
+        "nth" => Filter::Nth {
+            index: args.next().expect("index"),
+            expr: args.next(),
+        },
+        "range" => match args.len() {
+            1 => Filter::Range {
+                from: None,
+                to: args.next().expect("to"),
+                step: None,
+            },
+            2 => Filter::Range {
+                from: Some(args.next().expect("from")),
+                to: args.next().expect("to"),
+                step: None,
+            },
+            _ => Filter::Range {
+                from: Some(args.next().expect("from")),
+                to: args.next().expect("to"),
+                step: Some(args.next().expect("step")),
+            },
+        },
+        "limit" => Filter::Limit(args.next().expect("count"), args.next().expect("expr")),
+        "until" => Filter::Until(args.next().expect("cond"), args.next().expect("next")),
+        "while" => Filter::While(args.next().expect("cond"), args.next().expect("update")),
+        "setpath" => Filter::SetPath(args.next().expect("path"), args.next().expect("value")),
+        _ => match math::kind(name).expect("math builtin") {
+            Kind::Unary(op) => Filter::Math1(op),
+            Kind::Abs => Filter::Abs,
+            Kind::Pow10 => Filter::Pow10,
+            Kind::Binary(op) => {
+                Filter::Math2(op, args.next().expect("x"), args.next().expect("y"))
+            }
+            Kind::Fma => Filter::Math3(
+                args.next().expect("x"),
+                args.next().expect("y"),
+                args.next().expect("z"),
+            ),
+        },
+    }
+}
+
 pub(super) fn pattern_names(pattern: &Pattern, out: &mut Vec<String>) {
     match pattern {
         Pattern::Var(name) => out.push(name.clone()),
@@ -267,6 +659,19 @@ pub(super) struct Parser<'a> {
     reject_try: bool,
     /// The leading minus of a `try` operand. `?` there marks only the last suffix.
     suffix_question: bool,
+    /// Inner scopes are at the back. Each `def` body gets its own scope.
+    scopes: Vec<PScope>,
+}
+
+struct PScope {
+    funcs: Vec<Sig>,
+    params: Vec<String>,
+}
+
+struct Sig {
+    name: String,
+    arity: usize,
+    func: Rc<FnCell>,
 }
 
 impl<'a> Parser<'a> {
@@ -531,246 +936,191 @@ impl<'a> Parser<'a> {
         if self.starts_ident() {
             let at = self.index;
             let name = self.ident()?;
-            if let Some(filter) = self.parse_math(at, &name)? {
-                return Ok(filter);
-            }
-            return match name.as_str() {
-                "true" => Ok(Filter::Literal(Value::Bool(true))),
-                "false" => Ok(Filter::Literal(Value::Bool(false))),
-                "null" => Ok(Filter::Literal(Value::Null)),
-                "nan" => Ok(Filter::Literal(Value::Number(number::nan_text()))),
-                "infinite" => Ok(Filter::Literal(Value::Number(number::pos_inf()))),
-                "not" => Ok(Filter::Not),
-                "empty" => Ok(Filter::Empty),
-                "length" => Ok(Filter::Length),
-                "keys" => Ok(Filter::Keys),
-                "has" => Ok(Filter::Has(self.parse_one_arg()?)),
-                "select" => Ok(Filter::Select(self.parse_one_arg()?)),
-                "map" => Ok(Filter::Map(self.parse_one_arg()?)),
-                "type" => Ok(Filter::Type),
-                "tonumber" => Ok(Filter::ToNumber),
-                "tostring" => Ok(Filter::ToString),
-                "join" => Ok(Filter::Join(self.parse_one_arg()?)),
-                "ltrimstr" => Ok(Filter::LTrim(self.parse_one_arg()?)),
-                "rtrimstr" => Ok(Filter::RTrim(self.parse_one_arg()?)),
-                "todate" => Ok(Filter::ToDate),
-                "fromdate" => Ok(Filter::FromDate),
-                "gmtime" => Ok(Filter::GmTime),
-                "localtime" => Ok(Filter::LocalTime),
-                "mktime" => Ok(Filter::MkTime),
-                "strftime" => Ok(Filter::StrfTime(self.parse_one_arg()?)),
-                "strflocaltime" => Ok(Filter::StrfLocalTime(self.parse_one_arg()?)),
-                "strptime" => Ok(Filter::StrpTime(self.parse_one_arg()?)),
-                "now" => Ok(Filter::Now),
-                "error" => self.parse_error(),
-                "try" if !self.reject_block && !self.reject_try => self.parse_try(),
-                "del" => Ok(Filter::Update {
-                    op: UpdateOp::Modify,
-                    path: self.parse_one_arg()?,
-                    expr: Box::new(Filter::Empty),
-                }),
-                "path" => self.parse_fixed_call(at, "path", 1, |args| {
-                    Filter::PathOf(args.into_iter().next().expect("one arg"))
-                }),
-                "paths" => self.parse_paths(at),
-                "getpath" => self.parse_fixed_call(at, "getpath", 1, |args| {
-                    Filter::GetPath(args.into_iter().next().expect("one arg"))
-                }),
-                "setpath" => self.parse_fixed_call(at, "setpath", 2, |args| {
-                    let mut args = args.into_iter();
-                    Filter::SetPath(args.next().expect("path"), args.next().expect("value"))
-                }),
-                "delpaths" => self.parse_fixed_call(at, "delpaths", 1, |args| {
-                    Filter::DelPaths(args.into_iter().next().expect("one arg"))
-                }),
-                "limit" => self.parse_limit(at),
-                "first" => self.parse_optional_call(at, "first", Filter::First),
-                "last" => self.parse_optional_call(at, "last", Filter::Last),
-                "nth" => self.parse_nth(at),
-                "range" => self.parse_range(at),
-                "until" => self.parse_pair(at, "until", Filter::Until),
-                "while" => self.parse_pair(at, "while", Filter::While),
-                "repeat" => self.parse_repeat(at),
-                "if" if !self.reject_block => self.parse_if(),
-                "reduce" if !self.reject_block => self.parse_fold(false),
-                "foreach" if !self.reject_block => self.parse_fold(true),
-                _ => Err(ProgramError::Syntax),
-            };
+            return self.parse_name(at, name);
         }
         Err(ProgramError::Syntax)
     }
 
-    /// A math name, when `name` is one. `pow` with no call is `pow/0`.
-    /// A call whose arguments parse, but not to the arity jq defined, is
-    /// `name/n is not defined`. A call that does not parse is a syntax error.
-    fn parse_math(&mut self, at: usize, name: &str) -> Result<Option<Filter>, ProgramError> {
-        let Some(kind) = math::kind(name) else {
-            return Ok(None);
+    /// A name after keywords that start a form have been set aside.
+    /// The first `(` is the call. A second `(` is juxtaposition, and
+    /// `forbids_call` rejects it.
+    fn parse_name(&mut self, at: usize, name: String) -> Result<Filter, ProgramError> {
+        match name.as_str() {
+            "def" if !self.reject_block => return self.parse_def(),
+            "if" if !self.reject_block => return self.parse_if(),
+            "reduce" if !self.reject_block => return self.parse_fold(false),
+            "foreach" if !self.reject_block => return self.parse_fold(true),
+            "try" if !self.reject_block && !self.reject_try => return self.parse_try(),
+            "true" => return Ok(Filter::Literal(Value::Bool(true))),
+            "false" => return Ok(Filter::Literal(Value::Bool(false))),
+            "null" => return Ok(Filter::Literal(Value::Null)),
+            _ => {}
+        }
+        if reserved(&name) {
+            return Err(ProgramError::Syntax);
+        }
+        self.skip_ws();
+        let args = if self.peek() == Some('(') {
+            self.parse_call_args()?
+        } else {
+            Vec::new()
         };
-        self.skip_ws();
-        if self.peek() != Some('(') {
-            return match kind {
-                Kind::Unary(op) => Ok(Some(Filter::Math1(op))),
-                Kind::Abs => Ok(Some(Filter::Abs)),
-                Kind::Pow10 => Ok(Some(Filter::Pow10)),
-                Kind::Binary(_) | Kind::Fma => Err(self.undefined(at, name, 0)),
-            };
-        }
-        let args = self.parse_call_args()?;
         let arity = args.len();
-        match kind {
-            Kind::Unary(_) | Kind::Abs | Kind::Pow10 => Err(self.undefined(at, name, arity)),
-            Kind::Binary(op) if arity == 2 => {
-                let mut args = args.into_iter();
-                Ok(Some(Filter::Math2(
-                    op,
-                    args.next().expect("two args"),
-                    args.next().expect("two args"),
-                )))
-            }
-            Kind::Binary(_) => Err(self.undefined(at, name, arity)),
-            Kind::Fma if arity == 3 => {
-                let mut args = args.into_iter();
-                Ok(Some(Filter::Math3(
-                    args.next().expect("three args"),
-                    args.next().expect("three args"),
-                    args.next().expect("three args"),
-                )))
-            }
-            Kind::Fma => Err(self.undefined(at, name, arity)),
+        // A filter parameter is only the bare name. `a(1)` is a call.
+        if arity == 0 && self.lookup_param(&name) {
+            return Ok(Filter::Param(name));
         }
-    }
-
-    fn undefined(&self, at: usize, name: &str, arity: usize) -> ProgramError {
-        report_at(self.src, at, &format!("{name}/{arity} is not defined"))
-    }
-
-    /// A call of exactly `arity` filters. No parentheses is `name/0`.
-    fn parse_fixed_call(
-        &mut self,
-        at: usize,
-        name: &str,
-        arity: usize,
-        build: impl FnOnce(Vec<Box<Filter>>) -> Filter,
-    ) -> Result<Filter, ProgramError> {
-        self.skip_ws();
-        if self.peek() != Some('(') {
-            return Err(self.undefined(at, name, 0));
+        if arity == 0
+            && matches!(name.as_str(), "nan" | "infinite")
+            && self.lookup_func(&name, 0).is_none()
+        {
+            let text = if name == "nan" {
+                number::nan_text()
+            } else {
+                number::pos_inf()
+            };
+            return Ok(Filter::Literal(Value::Number(text)));
         }
-        let args = self.parse_call_args()?;
-        if args.len() != arity {
-            return Err(self.undefined(at, name, args.len()));
+        if let Some(func) = self.lookup_func(&name, arity) {
+            return Ok(Filter::Call {
+                func: Rc::downgrade(&func),
+                args: unbox(args),
+            });
         }
-        Ok(build(args))
-    }
-
-    /// `limit(count; expr)`.
-    fn parse_limit(&mut self, at: usize) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, "limit", &[2])?;
-        let mut args = args.into_iter();
-        Ok(Filter::Limit(
-            args.next().expect("count"),
-            args.next().expect("expr"),
-        ))
-    }
-
-    /// `first` and `last` take no filter, or one.
-    fn parse_optional_call(
-        &mut self,
-        at: usize,
-        name: &str,
-        build: fn(Option<Box<Filter>>) -> Filter,
-    ) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, name, &[0, 1])?;
-        Ok(build(args.into_iter().next()))
-    }
-
-    fn parse_nth(&mut self, at: usize) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, "nth", &[1, 2])?;
-        let mut args = args.into_iter();
-        Ok(Filter::Nth {
-            index: args.next().expect("index"),
-            expr: args.next(),
+        if is_builtin(&name, arity) {
+            return Ok(build_builtin(&name, args));
+        }
+        Ok(Filter::Unresolved {
+            at,
+            name,
+            arity,
+            args: unbox(args),
         })
     }
 
-    fn parse_range(&mut self, at: usize) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, "range", &[1, 2, 3])?;
-        let mut args = args.into_iter();
-        Ok(match args.len() {
-            1 => Filter::Range {
-                from: None,
-                to: args.next().expect("to"),
-                step: None,
-            },
-            2 => Filter::Range {
-                from: Some(args.next().expect("from")),
-                to: args.next().expect("to"),
-                step: None,
-            },
-            _ => Filter::Range {
-                from: Some(args.next().expect("from")),
-                to: args.next().expect("to"),
-                step: Some(args.next().expect("step")),
-            },
+    /// `def name: body; rest` or `def name(params): body; rest`.
+    /// The name is visible in the body, so the function can call itself.
+    /// It is not visible in the argument expressions of that call.
+    fn parse_def(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        let name = self.ident()?;
+        if reserved(&name) {
+            return Err(ProgramError::Syntax);
+        }
+        self.skip_ws();
+        let params = if self.peek() == Some('(') {
+            self.parse_params()?
+        } else {
+            Vec::new()
+        };
+        if !self.eat(':') {
+            return Err(ProgramError::Syntax);
+        }
+        let func = Rc::new(FnCell {
+            params: params.clone(),
+            body: RefCell::new(Rc::new(Filter::Empty)),
+        });
+        // The name is visible in the body and the rest, then it drops out so
+        // a `def` inside parentheses does not shadow the code after them.
+        let slot = self.define(&name, Rc::clone(&func));
+        let filter_params = params
+            .iter()
+            .filter_map(|param| match param {
+                FnParam::Filter(name) => Some(name.clone()),
+                FnParam::Value(_) => None,
+            })
+            .collect();
+        self.scopes.push(PScope {
+            funcs: Vec::new(),
+            params: filter_params,
+        });
+        let body = self.parse_pipe();
+        self.scopes.pop();
+        let body = body?;
+        if !self.eat(';') {
+            return Err(ProgramError::Syntax);
+        }
+        *func.body.borrow_mut() = Rc::new(body);
+        let rest = self.parse_pipe();
+        self.scopes[slot.0].funcs.remove(slot.1);
+        let rest = rest?;
+        Ok(Filter::Define {
+            func,
+            rest: Box::new(rest),
         })
     }
 
-    fn parse_pair(
-        &mut self,
-        at: usize,
-        name: &str,
-        build: fn(Box<Filter>, Box<Filter>) -> Filter,
-    ) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, name, &[2])?;
-        let mut args = args.into_iter();
-        Ok(build(
-            args.next().expect("left"),
-            args.next().expect("right"),
-        ))
-    }
-
-    fn parse_repeat(&mut self, at: usize) -> Result<Filter, ProgramError> {
-        let args = self.parse_some_call(at, "repeat", &[1])?;
-        Ok(Filter::Repeat(args.into_iter().next().expect("expr")))
-    }
-
-    /// No parentheses is arity 0 when that arity exists. Otherwise it is
-    /// `name/0 is not defined`. A call whose filters parse, but not to an
-    /// arity jq defined, is `name/n is not defined`.
-    fn parse_some_call(
-        &mut self,
-        at: usize,
-        name: &str,
-        allowed: &[usize],
-    ) -> Result<Vec<Box<Filter>>, ProgramError> {
+    /// `(name; $name; ...)`. Empty `()` and a trailing `;` are syntax errors.
+    fn parse_params(&mut self) -> Result<Vec<FnParam>, ProgramError> {
+        if !self.eat('(') {
+            return Err(ProgramError::Syntax);
+        }
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if allowed.contains(&0) {
-                return Ok(Vec::new());
+        if self.peek() == Some(')') {
+            return Err(ProgramError::Syntax);
+        }
+        let mut params = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat('$') {
+                params.push(FnParam::Value(self.ident()?));
+            } else if self.starts_ident() {
+                let name = self.ident()?;
+                if reserved(&name) {
+                    return Err(ProgramError::Syntax);
+                }
+                params.push(FnParam::Filter(name));
+            } else {
+                return Err(ProgramError::Syntax);
             }
-            return Err(self.undefined(at, name, 0));
+            self.skip_ws();
+            if self.eat(';') {
+                self.skip_ws();
+                if self.peek() == Some(')') {
+                    return Err(ProgramError::Syntax);
+                }
+                continue;
+            }
+            if self.eat(')') {
+                break;
+            }
+            return Err(ProgramError::Syntax);
         }
-        let args = self.parse_call_args()?;
-        if !allowed.contains(&args.len()) {
-            return Err(self.undefined(at, name, args.len()));
-        }
-        Ok(args)
+        Ok(params)
     }
 
-    /// `paths` takes no parentheses. `paths(expr)` takes one filter.
-    fn parse_paths(&mut self, at: usize) -> Result<Filter, ProgramError> {
-        self.skip_ws();
-        if self.peek() != Some('(') {
-            return Ok(Filter::Paths(None));
+    fn define(&mut self, name: &str, func: Rc<FnCell>) -> (usize, usize) {
+        let arity = func.params.len();
+        let scope = self.scopes.len() - 1;
+        let funcs = &mut self.scopes[scope].funcs;
+        let index = funcs.len();
+        funcs.push(Sig {
+            name: name.to_string(),
+            arity,
+            func,
+        });
+        (scope, index)
+    }
+
+    fn lookup_func(&self, name: &str, arity: usize) -> Option<Rc<FnCell>> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(sig) = scope
+                .funcs
+                .iter()
+                .rev()
+                .find(|sig| sig.name == name && sig.arity == arity)
+            {
+                return Some(Rc::clone(&sig.func));
+            }
         }
-        let args = self.parse_call_args()?;
-        if args.len() != 1 {
-            return Err(self.undefined(at, "paths", args.len()));
-        }
-        Ok(Filter::Paths(Some(
-            args.into_iter().next().expect("one arg"),
-        )))
+        None
+    }
+
+    fn lookup_param(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.params.iter().rev().any(|param| param == name))
     }
 
     /// Arguments of one call, separated by `;`. The count is how many
@@ -798,31 +1148,6 @@ impl<'a> Parser<'a> {
             return Err(ProgramError::Syntax);
         }
         Ok(args)
-    }
-
-    /// One filter argument, as in `has(expr)`. A second argument, separated
-    /// by `;`, is rejected. `if`, `reduce`, and `foreach` are allowed inside.
-    fn parse_one_arg(&mut self) -> Result<Box<Filter>, ProgramError> {
-        self.skip_ws();
-        if !self.eat('(') {
-            return Err(ProgramError::Syntax);
-        }
-        let saved_block = self.reject_block;
-        let saved_try = self.reject_try;
-        self.reject_block = false;
-        self.reject_try = false;
-        let arg = self.parse_pipe();
-        self.reject_block = saved_block;
-        self.reject_try = saved_try;
-        let arg = arg?;
-        self.skip_ws();
-        if self.peek() == Some(';') {
-            return Err(ProgramError::Syntax);
-        }
-        if !self.eat(')') {
-            return Err(ProgramError::Syntax);
-        }
-        Ok(Box::new(arg))
     }
 
     /// One juxtaposition term. `if`, `reduce`, and `foreach` need parentheses.
@@ -1018,15 +1343,6 @@ impl<'a> Parser<'a> {
             filter = Filter::Pipe(Box::new(filter), Box::new(right));
         }
         Ok(filter)
-    }
-
-    fn parse_error(&mut self) -> Result<Filter, ProgramError> {
-        self.skip_ws();
-        if self.peek() == Some('(') {
-            Ok(Filter::Raise(self.parse_one_arg()?))
-        } else {
-            Ok(Filter::Error)
-        }
     }
 
     /// `try` and `catch` stop before `+`, `*`, `|`, and `,`.
@@ -2100,7 +2416,11 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Range { .. }
         | Filter::Until(_, _)
         | Filter::While(_, _)
-        | Filter::Repeat(_) => true,
+        | Filter::Repeat(_)
+        | Filter::Define { .. }
+        | Filter::Call { .. }
+        | Filter::Param(_)
+        | Filter::Unresolved { .. } => true,
         Filter::Optional(inner) => forbids_call(inner),
         Filter::Pipe(_, right) => call_blocked(right),
         _ => false,
