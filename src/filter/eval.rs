@@ -25,6 +25,22 @@ pub fn eval_with(
     eval_in(filter, input, env)
 }
 
+/// Run `filter` and hand each value to `on_value` before the next one is built.
+/// `on_value` returns `true` to stop. A value already handed over is not in
+/// the error's partial results.
+pub fn eval_stream(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    on_value: &mut dyn FnMut(&Value) -> bool,
+) -> Result<(), Failure> {
+    let _scope = super::func::root_scope();
+    match super::stream::feed(filter, input, env, on_value) {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(failure),
+    }
+}
+
 pub(super) fn eval_in(
     filter: &Filter,
     input: &Value,
@@ -494,11 +510,39 @@ pub(super) fn eval_fold(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    let mut out = Vec::new();
+    let mut sink = |value: &Value| {
+        out.push(value.clone());
+        false
+    };
+    match fold_into(
+        stream, pattern, init, update, extract, emit, input, env, &mut sink,
+    ) {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(with_partial(out, failure)),
+    }
+}
+
+/// `true` means a consumer asked to stop. Values already handed to `sink`
+/// are not repeated in an error. `sink` returns `true` to stop.
+pub(super) fn fold_into(
+    stream: &Filter,
+    pattern: &Pattern,
+    init: &Filter,
+    update: &Filter,
+    extract: Option<&Filter>,
+    emit: bool,
+    input: &Value,
+    env: &[(String, Value)],
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
     let (inits, init_err) = parts(eval_in(init, input, env));
     if inits.is_empty() {
-        return finish(Vec::new(), init_err);
+        return match init_err {
+            Some(failure) => Err(failure),
+            None => Ok(false),
+        };
     }
-    let mut out = Vec::new();
     for (index, init_value) in inits.iter().enumerate() {
         let null_input = Value::Null;
         let stream_input = if index == 0 { input } else { &null_input };
@@ -508,30 +552,65 @@ pub(super) fn eval_fold(
         // the value, and the next fast step builds the index again.
         let mut lookup = None;
         for item in &items {
+            let mut stop = false;
             let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
+                if stop {
+                    return Ok(());
+                }
                 let child = child_scope(frame, env);
-                // `foreach` emits every step, so it keeps the copying path.
-                if !emit {
+                // `foreach` can reuse the accumulator when the step it emits
+                // is that accumulator. The caller has to be finished with the
+                // value before the next step.
+                let accelerated = if !emit || super::update::foreach_can_accelerate(update) {
                     match super::update::accelerate_reduce(update, &mut acc, &child, &mut lookup) {
-                        Ok(true) => return Ok(()),
-                        Ok(false) => lookup = None,
+                        Ok(true) => true,
+                        Ok(false) => {
+                            lookup = None;
+                            false
+                        }
                         Err(failure) => return Err(failure),
                     }
+                } else {
+                    false
+                };
+                if accelerated {
+                    if emit && deliver(&acc, extract, &child, sink)? {
+                        stop = true;
+                    }
+                    return Ok(());
                 }
                 let (updates, update_err) = parts(eval_in(update, &acc, &child));
                 if emit {
                     if let Some(extract) = extract {
                         for value in &updates {
                             match eval_in(extract, value, &child) {
-                                Ok(more) => out.extend(more),
+                                Ok(more) => {
+                                    for one in &more {
+                                        if sink(one) {
+                                            stop = true;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
                                 Err(mut failure) => {
-                                    out.extend(std::mem::take(&mut failure.partial));
+                                    for one in &failure.partial {
+                                        if sink(one) {
+                                            stop = true;
+                                            return Ok(());
+                                        }
+                                    }
+                                    failure.partial.clear();
                                     return Err(failure);
                                 }
                             }
                         }
                     } else {
-                        out.extend(updates.iter().cloned());
+                        for value in &updates {
+                            if sink(value) {
+                                stop = true;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 if let Some(failure) = update_err {
@@ -541,20 +620,61 @@ pub(super) fn eval_fold(
                     Some(value) => value.clone(),
                     None => Value::Null,
                 };
+                lookup = None;
                 Ok(())
             });
             if let Err(failure) = stepped {
-                return Err(with_partial(out, failure));
+                return Err(failure);
+            }
+            if stop {
+                return Ok(true);
             }
         }
         if let Some(failure) = stream_err {
-            return Err(with_partial(out, failure));
+            return Err(failure);
         }
-        if !emit {
-            out.push(acc);
+        if !emit && sink(&acc) {
+            return Ok(true);
         }
     }
-    finish(out, init_err)
+    match init_err {
+        Some(failure) => Err(failure),
+        None => Ok(false),
+    }
+}
+
+/// Emit one accelerated `foreach` step. `true` means stop.
+fn deliver(
+    acc: &Value,
+    extract: Option<&Filter>,
+    env: &[(String, Value)],
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    // No extract, or `.`, emits the accumulator itself. Borrowing it keeps
+    // the next step from copying the array.
+    if extract.is_none_or(|extract| matches!(extract, Filter::Identity)) {
+        return Ok(sink(acc));
+    }
+    let extract = extract.expect("extract");
+    match eval_in(extract, acc, env) {
+        Ok(more) => {
+            for one in &more {
+                if sink(one) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(mut failure) => {
+            for one in &failure.partial {
+                if sink(one) {
+                    return Ok(true);
+                }
+            }
+            failure.partial.clear();
+            Err(failure)
+        }
+    }
 }
 
 /// A pattern is indexing. Array elements are stored right to left, object

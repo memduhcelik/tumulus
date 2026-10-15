@@ -145,27 +145,48 @@ pub(super) struct ObjIndex {
 }
 
 /// `true` when `reduce` can apply `update` without building a fresh copy of
-/// the accumulator. The shape is `. + [expr]`, or an assignment whose path
-/// starts at `.`.
+/// the accumulator. The shapes are `. + [expr]`, an assignment or `|=` whose
+/// path starts at `.`, and `setpath`.
 pub(super) fn reduce_can_accelerate(update: &Filter) -> bool {
     match update {
         Filter::Bin {
             op: Op::Add,
             left,
             right,
-        } if matches!(left.as_ref(), Filter::Identity) => {
-            matches!(
-                right.as_ref(),
-                Filter::Collect(_) | Filter::Literal(Value::Array(_))
-            )
-        }
+        } if matches!(left.as_ref(), Filter::Identity) => is_array_term(right),
         Filter::Update {
-            op: UpdateOp::Assign,
+            op: UpdateOp::Assign | UpdateOp::Modify,
+            path,
+            ..
+        } => assignment_root(path),
+        Filter::SetPath(_, _) => true,
+        _ => false,
+    }
+}
+
+/// `foreach` emits one value per step for these. That value is the updated
+/// accumulator, so the next step can continue from it.
+pub(super) fn foreach_can_accelerate(update: &Filter) -> bool {
+    match update {
+        Filter::Bin {
+            op: Op::Add,
+            left,
+            right,
+        } if matches!(left.as_ref(), Filter::Identity) => is_array_term(right),
+        Filter::Update {
+            op: UpdateOp::Modify,
             path,
             ..
         } => assignment_root(path),
         _ => false,
     }
+}
+
+fn is_array_term(filter: &Filter) -> bool {
+    matches!(
+        filter,
+        Filter::Collect(_) | Filter::Literal(Value::Array(_))
+    )
 }
 
 fn assignment_root(path: &Filter) -> bool {
@@ -216,6 +237,202 @@ pub(super) fn accelerate_reduce(
             expr,
         } if assignment_root(path) => {
             accelerate_assign(path, expr, acc, env, lookup)?;
+            Ok(true)
+        }
+        Filter::Update {
+            op: UpdateOp::Modify,
+            path,
+            expr,
+        } if assignment_root(path) => {
+            accelerate_modify(path, expr, acc, env, lookup)?;
+            Ok(true)
+        }
+        Filter::SetPath(path, value) => {
+            accelerate_setpath(path, value, acc, env, lookup)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `|=` reads the path first. The filter runs on the value at that path.
+/// No output removes the value. One output is written back. One key or index
+/// is written into the accumulator. Several places, or a slice, copy once.
+fn accelerate_modify(
+    path: &Filter,
+    expr: &Filter,
+    acc: &mut Value,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    let paths = root_paths(path, acc, env)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    if let [path] = paths.as_slice() {
+        if let [step] = path.as_slice() {
+            if matches!(step, Step::Key(_) | Step::Index { .. }) {
+                return modify_one(acc, step, expr, env, lookup);
+            }
+        }
+    }
+    let values = modify(&paths, expr, acc, env)?;
+    *acc = values.into_iter().next().unwrap_or(Value::Null);
+    *lookup = None;
+    Ok(())
+}
+
+fn modify_one(
+    acc: &mut Value,
+    step: &Step,
+    expr: &Filter,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    let path = vec![step.clone()];
+    let current = value_at(acc, &path).map_err(fail)?;
+    match eval_first(expr, &current, env)? {
+        None => remove_simple(acc, step, lookup),
+        Some(value) => write_simple(acc, &[path], value, lookup),
+    }
+}
+
+fn remove_simple(
+    acc: &mut Value,
+    step: &Step,
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    match step {
+        Step::Key(key) => match acc {
+            Value::Null => Ok(()),
+            Value::Object(pairs) => {
+                pairs.retain(|(name, _)| name != key);
+                *lookup = None;
+                Ok(())
+            }
+            Value::Array(_) => Err(fail(format!("Cannot index array with string \"{key}\""))),
+            other => Err(fail(format!(
+                "Cannot index {} with string \"{key}\"",
+                other.type_name()
+            ))),
+        },
+        Step::Index { at, .. } => match acc {
+            Value::Null => Ok(()),
+            Value::String(_) => Err(fail("Cannot index string with number".to_string())),
+            Value::Object(_) => Err(fail("Cannot index object with number".to_string())),
+            Value::Array(items) => {
+                if let Some(position) = resolve_index(*at, items.len()) {
+                    if position < items.len() {
+                        items.remove(position);
+                    }
+                }
+                Ok(())
+            }
+            other => Err(fail(format!(
+                "Cannot index {} with number",
+                other.type_name()
+            ))),
+        },
+        _ => unreachable!("simple path"),
+    }
+}
+
+/// `setpath` runs the value first, then the path, both on the original
+/// accumulator. `reduce` keeps the last write.
+fn accelerate_setpath(
+    path_f: &Filter,
+    value_f: &Filter,
+    acc: &mut Value,
+    env: &[(String, Value)],
+    lookup: &mut Option<ObjIndex>,
+) -> Result<(), Failure> {
+    let (values, value_err) = parts(eval_in(value_f, acc, env));
+    if values.is_empty() {
+        if let Some(failure) = value_err {
+            return Err(failure);
+        }
+        *acc = Value::Null;
+        *lookup = None;
+        return Ok(());
+    }
+    // Each value is applied to the original accumulator. `reduce` keeps the
+    // last one. A failure discards those writes, so the accumulator stays put
+    // until the whole update succeeds.
+    let keep = value_err.is_none();
+    let mut last: Option<Value> = None;
+    for (i, value) in values.iter().enumerate() {
+        let (paths, path_err) = parts(eval_in(path_f, acc, env));
+        let final_write = keep && i + 1 == values.len() && paths.len() == 1 && path_err.is_none();
+        if final_write && last.is_none() {
+            match set_inplace(acc, &paths[0], value, lookup) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(failure) => return Err(failure),
+            }
+        }
+        for path in &paths {
+            let written = set_value(acc, path, value).map_err(fail)?;
+            if keep {
+                last = Some(written);
+            }
+        }
+        if let Some(failure) = path_err {
+            return Err(failure);
+        }
+    }
+    if let Some(failure) = value_err {
+        return Err(failure);
+    }
+    match last {
+        Some(value) => {
+            *acc = value;
+            *lookup = None;
+        }
+        None => {
+            *acc = Value::Null;
+            *lookup = None;
+        }
+    }
+    Ok(())
+}
+
+/// One `setpath` write onto the accumulator. `Ok(false)` means the path is
+/// not a single key or index, and the accumulator was left as it was.
+fn set_inplace(
+    acc: &mut Value,
+    path: &Value,
+    value: &Value,
+    lookup: &mut Option<ObjIndex>,
+) -> Result<bool, Failure> {
+    let Value::Array(keys) = path else {
+        return Ok(false);
+    };
+    if keys.is_empty() {
+        *acc = value.clone();
+        *lookup = None;
+        return Ok(true);
+    }
+    if keys.len() != 1 {
+        return Ok(false);
+    }
+    match &keys[0] {
+        Value::String(name) => {
+            object_set(acc, name, value.clone(), lookup).map_err(fail)?;
+            Ok(true)
+        }
+        Value::Number(text) => {
+            let shown = canonical_number(text);
+            let Some(index) = array_index(&shown) else {
+                return match acc {
+                    Value::Null | Value::Array(_) => Err(fail("Array index too large".to_string())),
+                    other => Err(fail(format!(
+                        "Cannot index {} with number",
+                        other.type_name()
+                    ))),
+                };
+            };
+            array_set(acc, index, value.clone()).map_err(fail)?;
+            *lookup = None;
             Ok(true)
         }
         _ => Ok(false),
@@ -279,18 +496,7 @@ fn accelerate_assign(
         *lookup = None;
         return Ok(());
     }
-    let paths = match path {
-        Filter::Field(name) => vec![vec![Step::Key(name.clone())]],
-        Filter::Index {
-            at: ArrayIndex::At(index),
-            text,
-        } => vec![vec![Step::Index {
-            at: *index,
-            text: text.clone(),
-        }]],
-        Filter::At { key, .. } => assignment_paths(acc, key, env)?,
-        _ => unreachable!("assignment root"),
-    };
+    let paths = root_paths(path, acc, env)?;
     if let Some(failure) = rhs_err {
         return Err(failure);
     }
@@ -318,6 +524,26 @@ fn accelerate_assign(
         }
     }
     Ok(())
+}
+
+/// Places an assignment or `|=` writes, read before the write.
+fn root_paths(
+    path: &Filter,
+    acc: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Vec<Step>>, Failure> {
+    match path {
+        Filter::Field(name) => Ok(vec![vec![Step::Key(name.clone())]]),
+        Filter::Index {
+            at: ArrayIndex::At(index),
+            text,
+        } => Ok(vec![vec![Step::Index {
+            at: *index,
+            text: text.clone(),
+        }]]),
+        Filter::At { key, .. } => assignment_paths(acc, key, env),
+        _ => unreachable!("assignment root"),
+    }
 }
 
 /// Paths of `.[expr]`, read from the accumulator before any write.

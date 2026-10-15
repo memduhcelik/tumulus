@@ -17,13 +17,27 @@ use super::func;
 use super::value::{add_values, cmp_value, sub_values};
 
 struct Emit<'a> {
-    f: RefCell<&'a mut dyn FnMut(Value) -> bool>,
+    f: RefCell<&'a mut dyn FnMut(&Value) -> bool>,
 }
 
 impl Emit<'_> {
-    fn call(&self, value: Value) -> bool {
+    fn call(&self, value: &Value) -> bool {
         (self.f.borrow_mut())(value)
     }
+}
+
+/// Hand each value to `on_value` as it is produced. `on_value` returns `true`
+/// to stop. The error's partial results are values that were not handed over.
+pub(super) fn feed(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    on_value: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    let emit = Emit {
+        f: RefCell::new(on_value),
+    };
+    drive(filter, input, env, &emit)
 }
 
 pub(super) fn collect(
@@ -33,8 +47,8 @@ pub(super) fn collect(
 ) -> Result<Vec<Value>, Failure> {
     let mut out = Vec::new();
     let result = {
-        let mut emit = |value: Value| {
-            out.push(value);
+        let mut emit = |value: &Value| {
+            out.push(value.clone());
             false
         };
         let emit = Emit {
@@ -53,8 +67,8 @@ pub(super) fn pipe_values(
 ) -> Result<Vec<Value>, Failure> {
     let mut out = Vec::new();
     let result = {
-        let mut emit = |value: Value| {
-            out.push(value);
+        let mut emit = |value: &Value| {
+            out.push(value.clone());
             false
         };
         let emit = Emit {
@@ -73,8 +87,8 @@ pub(super) fn comma_values(
 ) -> Result<Vec<Value>, Failure> {
     let mut out = Vec::new();
     let result = {
-        let mut emit = |value: Value| {
-            out.push(value);
+        let mut emit = |value: &Value| {
+            out.push(value.clone());
             false
         };
         let emit = Emit {
@@ -169,8 +183,8 @@ fn streamed(
     let _ = (input, env);
     let mut out = Vec::new();
     let result = {
-        let mut emit = |value: Value| {
-            out.push(value);
+        let mut emit = |value: &Value| {
+            out.push(value.clone());
             false
         };
         let emit = Emit {
@@ -216,15 +230,32 @@ fn drive(
         Filter::Inputs => drive_inputs(emit),
         Filter::Recurse => drive_dots(input, emit),
         Filter::RecurseDown { .. } | Filter::Walk(_) => {
-            let mut forward = |value| emit.call(value);
+            let mut forward = |value| emit.call(&value);
             super::machine::run(filter, input, env, &mut forward)
         }
         // A call runs on the heap so a function can call itself a million
         // levels deep. Every other filter stays on the direct path. That path
         // is what walks a large array.
         Filter::Define { rest, .. } => drive(rest, input, env, emit),
+        Filter::Foreach {
+            stream,
+            pattern,
+            init,
+            update,
+            extract,
+        } => eval::fold_into(
+            stream,
+            pattern,
+            init,
+            update,
+            extract.as_deref(),
+            true,
+            input,
+            env,
+            &mut |value| emit.call(value),
+        ),
         Filter::Call { .. } | Filter::Param(_) => {
-            let mut forward = |value| emit.call(value);
+            let mut forward = |value| emit.call(&value);
             super::machine::run(filter, input, env, &mut forward)
         }
         Filter::Unresolved { name, arity, .. } => {
@@ -342,7 +373,7 @@ fn for_each(
     mut on_value: impl FnMut(Value) -> Result<bool, Failure>,
 ) -> Result<bool, Failure> {
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
-    let mut on_one = |value: Value| match on_value(value) {
+    let mut on_one = |value: &Value| match on_value(value.clone()) {
         Ok(stop) => stop,
         Err(err) => {
             *failure.borrow_mut() = Some(err);
@@ -365,7 +396,7 @@ fn relay(result: Result<Vec<Value>, Failure>, emit: &Emit) -> Result<bool, Failu
         Err(mut failure) => (std::mem::take(&mut failure.partial), Some(failure)),
     };
     for value in values {
-        if emit.call(value) {
+        if emit.call(&value) {
             return Ok(true);
         }
     }
@@ -385,11 +416,11 @@ fn drive_pipe(
 ) -> Result<bool, Failure> {
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let mut on_left = |value: Value| {
+    let mut on_left = |value: &Value| {
         if stopped.get() {
             return true;
         }
-        match drive(right, &value, env, emit) {
+        match drive(right, value, env, emit) {
             Ok(stop) => {
                 if stop {
                     stopped.set(true);
@@ -474,11 +505,11 @@ fn drive_limit(
 ) -> Result<bool, Failure> {
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let mut on_count = |count: Value| {
+    let mut on_count = |count: &Value| {
         if stopped.get() {
             return true;
         }
-        match take_count(&count, expr, input, env, emit) {
+        match take_count(count, expr, input, env, emit) {
             Ok(stop) => {
                 if stop {
                     stopped.set(true);
@@ -515,7 +546,7 @@ fn take_count(
         LimitHow::Count(need) => {
             let seen = Cell::new(0usize);
             let outer = Cell::new(false);
-            let mut on_value = |value: Value| {
+            let mut on_value = |value: &Value| {
                 let n = seen.get() + 1;
                 seen.set(n);
                 if emit.call(value) {
@@ -536,7 +567,7 @@ fn take_count(
             let one = Value::Number("1".to_string());
             let outer = Cell::new(false);
             let failure: RefCell<Option<Failure>> = RefCell::new(None);
-            let mut on_value = |value: Value| {
+            let mut on_value = |value: &Value| {
                 let next = match sub_values(&left.borrow(), &one) {
                     Ok(next) => next,
                     Err(message) => {
@@ -574,7 +605,7 @@ fn drive_first(
         return relay(index_by(input, &Value::Number("0".to_string())), emit);
     };
     let outer = Cell::new(false);
-    let mut on_value = |value: Value| {
+    let mut on_value = |value: &Value| {
         outer.set(emit.call(value));
         true
     };
@@ -595,8 +626,8 @@ fn drive_last(
         return relay(index_by(input, &Value::Number("-1".to_string())), emit);
     };
     let last: RefCell<Option<Value>> = RefCell::new(None);
-    let mut on_value = |value: Value| {
-        *last.borrow_mut() = Some(value);
+    let mut on_value = |value: &Value| {
+        *last.borrow_mut() = Some(value.clone());
         false
     };
     let on_value = Emit {
@@ -605,8 +636,8 @@ fn drive_last(
     // A failure drops every value. `last` only emits after the stream ends.
     drive(expr, input, env, &on_value)?;
     match last.into_inner() {
-        Some(value) => Ok(emit.call(value)),
-        None => Ok(emit.call(Value::Null)),
+        Some(value) => Ok(emit.call(&value)),
+        None => Ok(emit.call(&Value::Null)),
     }
 }
 
@@ -661,11 +692,11 @@ fn drive_nth(
     };
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let mut on_index = |index: Value| {
+    let mut on_index = |index: &Value| {
         if stopped.get() {
             return true;
         }
-        match take_nth(&index, expr, input, env, emit) {
+        match take_nth(index, expr, input, env, emit) {
             Ok(stop) => {
                 if stop {
                     stopped.set(true);
@@ -701,7 +732,7 @@ fn take_nth(
         NthSpan::Add(message) => Err(fail(message)),
         NthSpan::Take(0) => Ok(false),
         NthSpan::Never => {
-            let mut ignore = |_value: Value| false;
+            let mut ignore = |_value: &Value| false;
             let ignore = Emit {
                 f: RefCell::new(&mut ignore),
             };
@@ -711,7 +742,7 @@ fn take_nth(
         NthSpan::Take(need) => {
             let seen = Cell::new(0usize);
             let outer = Cell::new(false);
-            let mut on_value = |value: Value| {
+            let mut on_value = |value: &Value| {
                 let n = seen.get() + 1;
                 seen.set(n);
                 if n < need {
@@ -744,19 +775,19 @@ fn drive_range(
     let stopped = Cell::new(false);
     let zero = Value::Number("0".to_string());
     let one = Value::Number("1".to_string());
-    let mut on_from = |from_value: Value| {
+    let mut on_from = |from_value: &Value| {
         if stopped.get() {
             return true;
         }
-        let mut on_to = |to_value: Value| {
+        let mut on_to = |to_value: &Value| {
             if stopped.get() {
                 return true;
             }
-            let mut on_step = |step_value: Value| {
+            let mut on_step = |step_value: &Value| {
                 if stopped.get() {
                     return true;
                 }
-                match gen_range(&from_value, &to_value, &step_value, implicit, emit) {
+                match gen_range(from_value, to_value, step_value, implicit, emit) {
                     Ok(stop) => {
                         if stop {
                             stopped.set(true);
@@ -821,7 +852,7 @@ fn drive_fixed(
 ) -> Result<bool, Failure> {
     match filter {
         Some(filter) => drive(filter, input, env, emit),
-        None => Ok(emit.call(fixed.clone())),
+        None => Ok(emit.call(fixed)),
     }
 }
 
@@ -840,7 +871,7 @@ fn gen_range(
         if !keeps_going(&cur, to, step, implicit_unit) {
             return Ok(false);
         }
-        if emit.call(cur.clone()) {
+        if emit.call(&cur) {
             return Ok(true);
         }
         cur = add_values(&cur, step).map_err(fail)?;
@@ -877,21 +908,21 @@ fn drive_until(
     // next cond value, which is why `until(.>3, error("z"); .+1)` reaches 4.
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let mut on_flag = |flag: Value| {
+    let mut on_flag = |flag: &Value| {
         if stopped.get() {
             return true;
         }
-        if eval::truthy(&flag) {
-            if emit.call(input.clone()) {
+        if eval::truthy(flag) {
+            if emit.call(input) {
                 stopped.set(true);
             }
             return stopped.get();
         }
-        let mut on_next = |value: Value| {
+        let mut on_next = |value: &Value| {
             if stopped.get() {
                 return true;
             }
-            match drive_until(cond, next, &value, env, emit) {
+            match drive_until(cond, next, value, env, emit) {
                 Ok(stop) => {
                     if stop {
                         stopped.set(true);
@@ -942,22 +973,22 @@ fn drive_while(
     // output depth-first. A false cond value emits nothing.
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let mut on_flag = |flag: Value| {
+    let mut on_flag = |flag: &Value| {
         if stopped.get() {
             return true;
         }
-        if !eval::truthy(&flag) {
+        if !eval::truthy(flag) {
             return false;
         }
-        if emit.call(input.clone()) {
+        if emit.call(input) {
             stopped.set(true);
             return true;
         }
-        let mut on_update = |value: Value| {
+        let mut on_update = |value: &Value| {
             if stopped.get() {
                 return true;
             }
-            match drive_while(cond, update, &value, env, emit) {
+            match drive_while(cond, update, value, env, emit) {
                 Ok(stop) => {
                     if stop {
                         stopped.set(true);
@@ -1005,7 +1036,7 @@ fn drive_dots(input: &Value, emit: &Emit) -> Result<bool, Failure> {
             children.reverse();
             stack.extend(children);
         }
-        if emit.call(value) {
+        if emit.call(&value) {
             return Ok(true);
         }
     }
@@ -1026,7 +1057,7 @@ pub(super) fn recurse_values(
             },
             input,
             env,
-            &mut |value| emit.call(value),
+            &mut |value| emit.call(&value),
         )
     })
 }
@@ -1041,7 +1072,7 @@ pub(super) fn walk_values(
             &Filter::Walk(Box::new(update.clone())),
             input,
             env,
-            &mut |value| emit.call(value),
+            &mut |value| emit.call(&value),
         )
     })
 }
@@ -1056,9 +1087,9 @@ pub(super) fn nth_value(
 ) -> Result<Option<Value>, Failure> {
     let mut seen = 0usize;
     let mut found = None;
-    let mut on_value = |value: Value| {
+    let mut on_value = |value: &Value| {
         if seen == index {
-            found = Some(value);
+            found = Some(value.clone());
             return true;
         }
         seen += 1;
@@ -1084,8 +1115,8 @@ pub(super) fn nth_truthy(
 ) -> Result<bool, Failure> {
     let mut truths = 0usize;
     let mut hit = false;
-    let mut on_value = |value: Value| {
-        if !super::eval::truthy(&value) {
+    let mut on_value = |value: &Value| {
+        if !super::eval::truthy(value) {
             return false;
         }
         if truths == index {
@@ -1112,7 +1143,7 @@ fn drive_inputs(emit: &Emit) -> Result<bool, Failure> {
     loop {
         match crate::feed::read_one() {
             crate::feed::Read::Value(value) => {
-                if emit.call(value) {
+                if emit.call(&value) {
                     return Ok(true);
                 }
             }

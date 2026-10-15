@@ -12,7 +12,7 @@ mod update;
 mod value;
 
 pub use ast::*;
-pub use eval::{eval, eval_with};
+pub use eval::{eval, eval_stream, eval_with};
 pub use parse::{compile, compile_with, reads_input};
 
 use eval::*;

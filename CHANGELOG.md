@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+Inside `reduce`, `.[expr] |= expr` sets a key or an index, and `setpath` writes a path, without copying the whole value on every step. `foreach` appends with `. + [expr]` and updates with `.[expr] |= expr` the same way, and yields each step before it builds the next one. A step that is saved, as in `[foreach]`, is copied. A `foreach` inside a function is copied too, because the call hands back each step. The result is unchanged.
+
 ## 0.6.0
 
 Released on 2026-10-16.

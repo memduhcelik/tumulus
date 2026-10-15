@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::process;
 
 use tumulus::{
-    bind_source, compile_with, environ_now, eval_with, location, next_main, open_failed,
+    bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
     parse_stream, reads_input, render, set_environ, set_unknown, Error, Failure, Filter, Indent,
     Layout, MainNext, ProgramError, Source, Style, Value,
 };
@@ -185,11 +185,8 @@ fn apply(
     let parsed = parse_stream(bytes)?;
     let mut failed = false;
     for item in &parsed.values {
-        match eval_with(program, &item.value, env) {
-            Ok(values) => {
-                write_values(&values, style, run, out)?;
-                failed = false;
-            }
+        match run_program(program, &item.value, env, style, run, out)? {
+            Ok(()) => failed = false,
             Err(failure) => {
                 write_values(&failure.partial, style, run, out)?;
                 report_error(&format!("{source}:{}", item.line), &failure);
@@ -271,11 +268,8 @@ fn apply_null(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    match eval_with(program, &Value::Null, env) {
-        Ok(values) => {
-            write_values(&values, style, run, out)?;
-            run.status = 0;
-        }
+    match run_program(program, &Value::Null, env, style, run, out)? {
+        Ok(()) => run.status = 0,
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
             report_error("<unknown>", &failure);
@@ -515,17 +509,38 @@ fn emit(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<bool, Error> {
-    match eval_with(program, input, env) {
-        Ok(values) => {
-            write_values(&values, style, run, out)?;
-            Ok(false)
-        }
+    match run_program(program, input, env, style, run, out)? {
+        Ok(()) => Ok(false),
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
             report_error(&format!("{source}:{line}"), &failure);
             Ok(true)
         }
     }
+}
+
+/// Print each value as it is produced, then drop it. An error's partial
+/// results are the values that were not printed yet.
+fn run_program(
+    program: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    style: Style,
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<Result<(), Failure>, Error> {
+    let mut io_err = None;
+    let result = eval_stream(program, input, env, &mut |value| {
+        if let Err(err) = write_one(value, style, run, out) {
+            io_err = Some(err);
+            return true;
+        }
+        false
+    });
+    if let Some(err) = io_err {
+        return Err(err);
+    }
+    Ok(result)
 }
 
 fn report_error(at: &str, failure: &Failure) {
@@ -563,14 +578,19 @@ fn write_values(
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     for value in values {
-        let rendered = render(value, style);
-        out.write_all(rendered.as_bytes())?;
-        if !style.join {
-            out.write_all(b"\n")?;
-        }
-        run.produced = true;
-        run.last_false = matches!(value, Value::Null | Value::Bool(false));
+        write_one(value, style, run, out)?;
     }
+    Ok(())
+}
+
+fn write_one(value: &Value, style: Style, run: &mut Run, out: &mut dyn Write) -> Result<(), Error> {
+    let rendered = render(value, style);
+    out.write_all(rendered.as_bytes())?;
+    if !style.join {
+        out.write_all(b"\n")?;
+    }
+    run.produced = true;
+    run.last_false = matches!(value, Value::Null | Value::Bool(false));
     Ok(())
 }
 
