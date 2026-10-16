@@ -65,6 +65,15 @@ pub enum Filter {
     Literal(Value),
     /// Pieces of a string, with `\( )` between them.
     Interpolate(Vec<Piece>),
+    /// `@name`. The name is checked when a value is formatted.
+    Format(String),
+    /// `@name "text \(expr)"`. Literal text stays as written. Each
+    /// interpolation is formatted on its own. With no interpolation the
+    /// result is that text, and the name is not checked.
+    FormatString {
+        name: String,
+        pieces: Vec<Piece>,
+    },
     /// `[ expr ]` gathers every output of `expr` into one array.
     Collect(Box<Filter>),
     Object(Vec<ObjField>),

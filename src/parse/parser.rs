@@ -138,7 +138,7 @@ fn decode_at(src: &[u8], index: usize) -> Option<(char, usize)> {
 
 /// String contents after escapes. The slice ends where the string ends, so a
 /// lead with too few bytes left takes the whole tail, not only its continuations.
-pub(in crate::parse) fn sanitize_content(bytes: &[u8]) -> String {
+pub(crate) fn sanitize_content(bytes: &[u8]) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index < bytes.len() {

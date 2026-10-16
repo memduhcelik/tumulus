@@ -40,6 +40,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::ToNumber
             | Filter::ToString
             | Filter::ToJson
+            | Filter::Format(_)
             | Filter::AsciiDown
             | Filter::AsciiUp
             | Filter::Explode
@@ -120,10 +121,12 @@ pub fn reads_input(filter: &Filter) -> bool {
                         .is_some_and(|handler| walk(handler, seen))
             }
             Filter::Update { path, expr, .. } => walk(path, seen) || walk(expr, seen),
-            Filter::Interpolate(pieces) => pieces.iter().any(|piece| match piece {
-                Piece::Text(_) => false,
-                Piece::Interp(inner) => walk(inner, seen),
-            }),
+            Filter::Interpolate(pieces) | Filter::FormatString { pieces, .. } => {
+                pieces.iter().any(|piece| match piece {
+                    Piece::Text(_) => false,
+                    Piece::Interp(inner) => walk(inner, seen),
+                })
+            }
             Filter::Object(fields) => fields.iter().any(|field| match field {
                 ObjField::Pair { key, value } => walk(key, seen) || walk(value, seen),
                 ObjField::Lookup(key) => walk(key, seen),
@@ -228,6 +231,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::Format(_)
         | Filter::AsciiDown
         | Filter::AsciiUp
         | Filter::Explode
@@ -327,7 +331,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             check_vars(path, scope)?;
             check_vars(value, scope)
         }
-        Filter::Interpolate(pieces) => {
+        Filter::Interpolate(pieces) | Filter::FormatString { pieces, .. } => {
             for piece in pieces {
                 if let Piece::Interp(inner) = piece {
                     check_vars(inner, scope)?;
@@ -529,6 +533,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::Format(_)
         | Filter::AsciiDown
         | Filter::AsciiUp
         | Filter::Explode
@@ -633,7 +638,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
             walk_defs(path, seen, errors);
             walk_defs(value, seen, errors);
         }
-        Filter::Interpolate(pieces) => {
+        Filter::Interpolate(pieces) | Filter::FormatString { pieces, .. } => {
             for piece in pieces {
                 if let Piece::Interp(inner) = piece {
                     walk_defs(inner, seen, errors);
@@ -1230,6 +1235,9 @@ impl<'a> Parser<'a> {
         }
         if self.peek() == Some('{') {
             return self.parse_object();
+        }
+        if self.peek() == Some('@') {
+            return self.parse_format();
         }
         if self.peek() == Some('"') {
             return self.parse_string_expr();
@@ -2293,7 +2301,52 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// `@name` or `@name "text \(expr)"`. The name may start with a digit.
+    /// A space before the name is a syntax error. Space before the string is not.
+    fn parse_format(&mut self) -> Result<Filter, ProgramError> {
+        self.bump();
+        let name = self.format_name()?;
+        self.skip_ws();
+        if self.peek() == Some('"') {
+            let pieces = self.parse_string_pieces()?;
+            return Ok(Filter::FormatString { name, pieces });
+        }
+        Ok(Filter::Format(name))
+    }
+
+    fn format_name(&mut self) -> Result<String, ProgramError> {
+        let start = self.index;
+        let Some(ch) = self.peek() else {
+            return Err(ProgramError::Syntax);
+        };
+        if !ch.is_ascii_alphanumeric() && ch != '_' {
+            return Err(ProgramError::Syntax);
+        }
+        self.bump();
+        while self
+            .peek()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            self.bump();
+        }
+        Ok(self.src[start..self.index].to_string())
+    }
+
     fn parse_string_expr(&mut self) -> Result<Filter, ProgramError> {
+        let pieces = self.parse_string_pieces()?;
+        if pieces.iter().all(|piece| matches!(piece, Piece::Text(_))) {
+            let mut combined = String::new();
+            for piece in pieces {
+                if let Piece::Text(part) = piece {
+                    combined.push_str(&part);
+                }
+            }
+            return Ok(Filter::Literal(Value::String(combined)));
+        }
+        Ok(Filter::Interpolate(pieces))
+    }
+
+    fn parse_string_pieces(&mut self) -> Result<Vec<Piece>, ProgramError> {
         if !self.eat('"') {
             return Err(ProgramError::Syntax);
         }
@@ -2344,16 +2397,7 @@ impl<'a> Parser<'a> {
         if !text.is_empty() {
             pieces.push(Piece::Text(text));
         }
-        if pieces.iter().all(|piece| matches!(piece, Piece::Text(_))) {
-            let mut combined = String::new();
-            for piece in pieces {
-                if let Piece::Text(part) = piece {
-                    combined.push_str(&part);
-                }
-            }
-            return Ok(Filter::Literal(Value::String(combined)));
-        }
-        Ok(Filter::Interpolate(pieces))
+        Ok(pieces)
     }
 
     /// One or more jq escape chunks, starting at a backslash.
@@ -2587,6 +2631,8 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::Format(_)
+        | Filter::FormatString { .. }
         | Filter::AsciiDown
         | Filter::AsciiUp
         | Filter::Explode

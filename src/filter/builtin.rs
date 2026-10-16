@@ -1,5 +1,7 @@
 //! Builtins: length, keys, type, strings, math, dates, try, and error.
 
+use std::cell::RefCell;
+
 use crate::date;
 use crate::math;
 use crate::number;
@@ -786,4 +788,355 @@ fn byte_hits(text: &str, needle: &str) -> Vec<usize> {
 
 fn same(left: &Value, right: &Value) -> bool {
     cmp_value(left, right) == 0
+}
+
+pub(super) fn eval_named_format(name: &str, input: &Value) -> Result<Vec<Value>, Failure> {
+    Ok(vec![Value::String(apply_format(name, input)?)])
+}
+
+/// `@name "..."`. The rightmost piece is the outer loop, and everything to
+/// its left runs again for each of its values. That is how `+` orders them.
+pub(super) fn eval_format_string(
+    name: &str,
+    pieces: &[Piece],
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let out = RefCell::new(Vec::new());
+    match walk_format(name, pieces, input, env, &out) {
+        Ok(()) => Ok(out.into_inner()),
+        Err(failure) => Err(with_partial(out.into_inner(), failure)),
+    }
+}
+
+fn walk_format(
+    name: &str,
+    pieces: &[Piece],
+    input: &Value,
+    env: &[(String, Value)],
+    out: &RefCell<Vec<Value>>,
+) -> Result<(), Failure> {
+    if pieces.is_empty() {
+        out.borrow_mut().push(Value::String(String::new()));
+        return Ok(());
+    }
+    let last = pieces.len() - 1;
+    stream_format_piece(name, &pieces[last], &pieces[..last], input, env, out)
+}
+
+fn stream_format_piece(
+    name: &str,
+    piece: &Piece,
+    head: &[Piece],
+    input: &Value,
+    env: &[(String, Value)],
+    out: &RefCell<Vec<Value>>,
+) -> Result<(), Failure> {
+    match piece {
+        Piece::Text(text) => append_format(name, head, text, input, env, out),
+        Piece::Interp(filter) => {
+            let stop = RefCell::new(None);
+            let streamed = super::stream::feed(filter, input, env, &mut |value| {
+                if stop.borrow().is_some() {
+                    return true;
+                }
+                match apply_format(name, value) {
+                    Ok(text) => match append_format(name, head, &text, input, env, out) {
+                        Ok(()) => false,
+                        Err(err) => {
+                            *stop.borrow_mut() = Some(err);
+                            true
+                        }
+                    },
+                    Err(err) => {
+                        *stop.borrow_mut() = Some(err);
+                        true
+                    }
+                }
+            });
+            if let Some(failure) = stop.into_inner() {
+                return Err(failure);
+            }
+            match streamed {
+                Ok(_) => Ok(()),
+                Err(mut failure) => {
+                    for value in std::mem::take(&mut failure.partial) {
+                        let text = apply_format(name, &value)?;
+                        append_format(name, head, &text, input, env, out)?;
+                    }
+                    Err(failure)
+                }
+            }
+        }
+    }
+}
+
+fn append_format(
+    name: &str,
+    head: &[Piece],
+    right: &str,
+    input: &Value,
+    env: &[(String, Value)],
+    out: &RefCell<Vec<Value>>,
+) -> Result<(), Failure> {
+    let mark = out.borrow().len();
+    let walked = walk_format(name, head, input, env, out);
+    {
+        let mut buf = out.borrow_mut();
+        for item in &mut buf[mark..] {
+            if let Value::String(text) = item {
+                text.push_str(right);
+            }
+        }
+    }
+    walked
+}
+
+fn apply_format(name: &str, input: &Value) -> Result<String, Failure> {
+    match name {
+        "text" => Ok(jq_text(input)),
+        "json" => Ok(json_text(input)),
+        "html" => Ok(html_escape(&jq_text(input))),
+        "uri" => Ok(uri_escape(&jq_text(input))),
+        "base64" => Ok(base64_encode(&jq_text(input))),
+        "base64d" => base64_decode(&jq_text(input)),
+        "sh" => shell_escape(input),
+        "csv" => table_row(input, ",", "csv"),
+        "tsv" => table_row(input, "\t", "tsv"),
+        _ => Err(fail(format!("{name} is not a valid format"))),
+    }
+}
+
+fn json_text(input: &Value) -> String {
+    let style = crate::print::Style {
+        layout: crate::print::Layout::Compact,
+        ..crate::print::Style::default()
+    };
+    crate::print::render(input, style)
+}
+
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\0' => out.push_str("\\0"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn uri_escape(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::new();
+    for byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(*byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn shell_escape(input: &Value) -> Result<String, Failure> {
+    match input {
+        Value::Array(items) => {
+            let mut out = String::new();
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&shell_scalar(item)?);
+            }
+            Ok(out)
+        }
+        other => shell_scalar(other),
+    }
+}
+
+fn shell_scalar(input: &Value) -> Result<String, Failure> {
+    match input {
+        Value::String(text) => Ok(shell_quote(text)),
+        Value::Array(_) => Err(fail(format!(
+            "array ({}) can not be escaped for shell",
+            shown(input)
+        ))),
+        Value::Object(_) => Err(fail(format!(
+            "object ({}) can not be escaped for shell",
+            shown(input)
+        ))),
+        other => Ok(jq_text(other)),
+    }
+}
+
+fn shell_quote(text: &str) -> String {
+    let mut out = String::from("'");
+    for ch in text.chars() {
+        match ch {
+            '\0' => out.push_str("\\0"),
+            '\'' => out.push_str("'\\''"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn blank_field(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Number(text) => matches!(number::real(text), number::Real::Nan),
+        _ => false,
+    }
+}
+
+/// `kind` is `csv` or `tsv`. A bad element says `csv row` for both.
+fn table_row(input: &Value, sep: &str, kind: &str) -> Result<String, Failure> {
+    let Value::Array(items) = input else {
+        return Err(fail(format!(
+            "{} ({}) cannot be {kind}-formatted, only array",
+            input.type_name(),
+            shown(input)
+        )));
+    };
+    let mut out = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push_str(sep);
+        }
+        if blank_field(item) {
+            continue;
+        }
+        match item {
+            Value::Bool(_) | Value::Number(_) => out.push_str(&jq_text(item)),
+            Value::String(text) => out.push_str(&field_text(text, kind == "tsv")),
+            other => {
+                return Err(fail(format!(
+                    "{} ({}) is not valid in a csv row",
+                    other.type_name(),
+                    shown(other)
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn field_text(text: &str, tsv: bool) -> String {
+    if tsv {
+        let mut out = String::new();
+        for ch in text.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\0' => out.push_str("\\0"),
+                other => out.push(other),
+            }
+        }
+        return out;
+    }
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\"\""),
+            '\0' => out.push_str("\\0"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn base64_encode(text: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let n = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        index += 3;
+    }
+    let rest = &bytes[index..];
+    if rest.len() == 1 {
+        let n = u32::from(rest[0]) << 16;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest.len() == 2 {
+        let n = (u32::from(rest[0]) << 16) | (u32::from(rest[1]) << 8);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+/// Stop at the first `=`. One leftover sextet is the trailing-byte error.
+/// Any other count of leftover bits is padding and is dropped.
+fn base64_decode(text: &str) -> Result<String, Failure> {
+    let mut bytes = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in text.chars() {
+        if ch == '=' {
+            break;
+        }
+        let Some(digit) = base64_digit(ch) else {
+            return Err(base64_invalid(text));
+        };
+        acc = (acc << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= if bits == 0 { 0 } else { (1 << bits) - 1 };
+        }
+    }
+    if bits == 6 {
+        return Err(base64_trailing(text));
+    }
+    Ok(crate::parse::repair_utf8(&bytes))
+}
+
+fn base64_digit(ch: char) -> Option<u32> {
+    match ch {
+        'A'..='Z' => Some(u32::from(ch) - u32::from('A')),
+        'a'..='z' => Some(u32::from(ch) - u32::from('a') + 26),
+        '0'..='9' => Some(u32::from(ch) - u32::from('0') + 52),
+        '+' => Some(62),
+        '/' => Some(63),
+        _ => None,
+    }
+}
+
+fn base64_invalid(text: &str) -> Failure {
+    fail(format!(
+        "string ({}) is not valid base64 data",
+        shown(&Value::String(text.to_string()))
+    ))
+}
+
+fn base64_trailing(text: &str) -> Failure {
+    fail(format!(
+        "string ({}) trailing base64 byte found",
+        shown(&Value::String(text.to_string()))
+    ))
 }

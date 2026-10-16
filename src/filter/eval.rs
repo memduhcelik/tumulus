@@ -77,6 +77,10 @@ pub(super) fn produce(
         Filter::Comma(left, right) => super::stream::comma_values(left, right, input, env),
         Filter::Literal(value) => Ok(vec![value.clone()]),
         Filter::Interpolate(pieces) => eval_interpolate(pieces, input, env),
+        Filter::Format(name) => super::builtin::eval_named_format(name, input),
+        Filter::FormatString { name, pieces } => {
+            super::builtin::eval_format_string(name, pieces, input, env)
+        }
         Filter::Collect(inner) => match eval_in(inner, input, env) {
             Ok(items) => Ok(vec![Value::Array(items)]),
             Err(failure) => Err(bare_fail(failure)),

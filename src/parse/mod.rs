@@ -13,6 +13,11 @@ use crate::value::Value;
 
 use parser::Parser;
 
+/// Bytes that are not UTF-8 become U+FFFD, the way a JSON string does.
+pub(crate) fn repair_utf8(bytes: &[u8]) -> String {
+    parser::sanitize_content(bytes)
+}
+
 /// One JSON value and the line jq would name in a runtime error.
 pub struct LocatedValue {
     pub value: Value,
