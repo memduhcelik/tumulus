@@ -1834,6 +1834,25 @@ fn requests_match_jq() {
 }
 
 #[test]
+fn inputs_on_requests_match_jq() {
+    require_jq();
+    let path = fixture_path("requests-200.ndjson");
+    let file = path.as_str();
+    compare_exact("[inputs] | length", &["-n", "[inputs] | length", file], b"");
+    compare_exact(
+        "reduce inputs",
+        &["-n", "reduce inputs as $r (0; . + 1)", file],
+        b"",
+    );
+    compare_exact(
+        "raw [inputs] | length",
+        &["-R", "-n", "[inputs] | length", file],
+        b"",
+    );
+    compare_exact("input | .method", &["-n", "input | .method", file], b"");
+}
+
+#[test]
 fn variables_match_jq() {
     require_jq();
     let programs = [
