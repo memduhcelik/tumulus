@@ -11,9 +11,9 @@ use crate::value::Value;
 use super::stream::{self, LimitHow, NthSpan};
 use super::{
     add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
-    finish, fresh, mul_values, parts, rem_values, require_slice_index, shown, slice as slice_value,
-    slice_range, sub_values, truthy, walk_slice_pairs, with_partial, ArrayIndex, Failure, Filter,
-    Op, PatField, Pattern, UpdateOp,
+    finish, fresh, mul_values, parts, put, rem_values, require_slice_index, shown,
+    slice as slice_value, slice_range, sub_values, truthy, walk_slice_pairs, with_partial,
+    ArrayIndex, Failure, Filter, ObjField, Op, PatField, Pattern, UpdateOp,
 };
 
 enum Found {
@@ -194,7 +194,8 @@ pub(super) struct ObjIndex {
 
 /// `true` when `reduce` can apply `update` without building a fresh copy of
 /// the accumulator. The shapes are `. + [expr]`, an assignment or `|=` whose
-/// path starts at `.`, and `setpath`.
+/// path starts at `.`, `setpath`, and a nest of arrays and objects that holds
+/// the accumulator in one `.`.
 pub(super) fn reduce_can_accelerate(update: &Filter) -> bool {
     match update {
         Filter::Bin {
@@ -208,7 +209,7 @@ pub(super) fn reduce_can_accelerate(update: &Filter) -> bool {
             ..
         } => assignment_root(path),
         Filter::SetPath(_, _) => true,
-        _ => false,
+        other => single_hole_wrap(other).is_some(),
     }
 }
 
@@ -256,7 +257,7 @@ fn assignment_root(path: &Filter) -> bool {
 /// Apply one `reduce` step in place. `Ok(false)` means the update is not one
 /// of the shapes above, and nothing was run. The accumulator is the only
 /// owner of its array or object, so appending and writing one key or index
-/// reuse that buffer.
+/// reuse that buffer. A nest with one `.` moves that accumulator into place.
 pub(super) fn accelerate_reduce(
     update: &Filter,
     acc: &mut Value,
@@ -307,7 +308,99 @@ pub(super) fn accelerate_reduce(
             *lookup = None;
             Ok(true)
         }
-        _ => Ok(false),
+        // `{a:.}`, `[., 1]`, and `[[.]]` are the same move into a larger shell.
+        // A second `.` stays here as `Ok(false)`, because that copy is real.
+        other => match single_hole_wrap(other) {
+            Some(shell) => {
+                let mut carried = std::mem::replace(acc, Value::Null);
+                *acc = fill_shell(&shell, &mut carried);
+                *lookup = None;
+                Ok(true)
+            }
+            None => Ok(false),
+        },
+    }
+}
+
+/// Arrays and objects around the one `.` in a `reduce` update.
+/// A field, a lookup, a variable, a second `.`, or anything that can fail
+/// stays out, so the copying evaluator still runs those.
+enum Shell<'a> {
+    Hole,
+    Lit(&'a Value),
+    Arr(Vec<Shell<'a>>),
+    Obj(Vec<(&'a str, Shell<'a>)>),
+}
+
+fn single_hole_wrap(filter: &Filter) -> Option<Shell<'_>> {
+    let mut holes = 0;
+    let shell = compile_slot(filter, &mut holes)?;
+    if holes == 1 {
+        Some(shell)
+    } else {
+        None
+    }
+}
+
+fn compile_slot<'a>(filter: &'a Filter, holes: &mut usize) -> Option<Shell<'a>> {
+    match filter {
+        Filter::Identity => {
+            *holes += 1;
+            if *holes > 1 {
+                None
+            } else {
+                Some(Shell::Hole)
+            }
+        }
+        Filter::Literal(value) => Some(Shell::Lit(value)),
+        Filter::Collect(inner) => Some(Shell::Arr(compile_stream(inner, holes)?)),
+        Filter::Object(fields) => {
+            let mut pairs = Vec::with_capacity(fields.len());
+            for field in fields {
+                let ObjField::Pair { key, value } = field else {
+                    return None;
+                };
+                let Filter::Literal(Value::String(name)) = key.as_ref() else {
+                    return None;
+                };
+                pairs.push((name.as_str(), compile_slot(value, holes)?));
+            }
+            Some(Shell::Obj(pairs))
+        }
+        _ => None,
+    }
+}
+
+/// The values inside `[ ]`, in order. A comma runs the left side, then the right.
+fn compile_stream<'a>(filter: &'a Filter, holes: &mut usize) -> Option<Vec<Shell<'a>>> {
+    match filter {
+        Filter::Comma(left, right) => {
+            let mut items = compile_stream(left, holes)?;
+            items.extend(compile_stream(right, holes)?);
+            Some(items)
+        }
+        other => Some(vec![compile_slot(other, holes)?]),
+    }
+}
+
+fn fill_shell(shell: &Shell, hole: &mut Value) -> Value {
+    match shell {
+        Shell::Hole => std::mem::replace(hole, Value::Null),
+        Shell::Lit(value) => (*value).clone(),
+        Shell::Arr(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(fill_shell(item, hole));
+            }
+            Value::Array(out)
+        }
+        Shell::Obj(fields) => {
+            let mut pairs = Vec::with_capacity(fields.len());
+            for (name, slot) in fields {
+                put(&mut pairs, (*name).to_string(), fill_shell(slot, hole));
+            }
+            Value::Object(pairs)
+        }
     }
 }
 
