@@ -120,6 +120,12 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Paths(inner)
             | Filter::Flatten(inner) => inner.as_deref().is_some_and(|inner| walk(inner, seen)),
             Filter::Quant { stream, cond, .. } => walk(stream, seen) || walk(cond, seen),
+            Filter::In { src, stream } => {
+                src.as_deref().is_some_and(|src| walk(src, seen)) || walk(stream, seen)
+            }
+            Filter::IndexBy { stream, key } => {
+                stream.as_deref().is_some_and(|stream| walk(stream, seen)) || walk(key, seen)
+            }
             Filter::RecurseDown { step, cond } => {
                 walk(step, seen) || cond.as_deref().is_some_and(|cond| walk(cond, seen))
             }
@@ -335,6 +341,18 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         Filter::Quant { stream, cond, .. } => {
             check_vars(stream, scope)?;
             check_vars(cond, scope)
+        }
+        Filter::In { src, stream } => {
+            if let Some(src) = src {
+                check_vars(src, scope)?;
+            }
+            check_vars(stream, scope)
+        }
+        Filter::IndexBy { stream, key } => {
+            if let Some(stream) = stream {
+                check_vars(stream, scope)?;
+            }
+            check_vars(key, scope)
         }
         Filter::Try { body, handler } => {
             check_vars(body, scope)?;
@@ -654,6 +672,18 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
             walk_defs(stream, seen, errors);
             walk_defs(cond, seen, errors);
         }
+        Filter::In { src, stream } => {
+            if let Some(src) = src {
+                walk_defs(src, seen, errors);
+            }
+            walk_defs(stream, seen, errors);
+        }
+        Filter::IndexBy { stream, key } => {
+            if let Some(stream) = stream {
+                walk_defs(stream, seen, errors);
+            }
+            walk_defs(key, seen, errors);
+        }
         Filter::RecurseDown { step, cond } => {
             walk_defs(step, seen, errors);
             if let Some(cond) = cond {
@@ -819,7 +849,10 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "tostring" | "tojson" | "fromjson" | "ascii_downcase" | "ascii_upcase" | "explode"
         | "implode" | "utf8bytelength" | "todate" | "fromdate" | "gmtime" | "localtime"
         | "mktime" | "now" | "add" | "to_entries" | "from_entries" | "input" | "inputs"
-        | "input_filename" | "env" | "sort" | "unique" | "min" | "max" => arity == 0,
+        | "input_filename" | "env" | "sort" | "unique" | "min" | "max" | "values" | "nulls"
+        | "booleans" | "numbers" | "strings" | "arrays" | "objects" | "iterables" | "scalars" => {
+            arity == 0
+        }
         "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
         "has" | "select" | "map" | "map_values" | "join" | "ltrimstr" | "rtrimstr"
         | "startswith" | "endswith" | "index" | "rindex" | "indices" | "split" | "contains"
@@ -827,6 +860,7 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "delpaths" | "del" | "repeat" | "walk" | "with_entries" => arity == 1,
         "paths" | "first" | "last" | "error" | "flatten" => arity <= 1,
         "any" | "all" => arity <= 2,
+        "IN" | "INDEX" => arity == 1 || arity == 2,
         "recurse" => arity <= 2,
         "nth" => arity == 1 || arity == 2,
         "range" => (1..=3).contains(&arity),
@@ -856,6 +890,34 @@ fn math_arity(name: &str, arity: usize) -> bool {
         Some(Kind::Binary(_)) => arity == 2,
         Some(Kind::Fma) => arity == 3,
         None => false,
+    }
+}
+
+fn keep_null(equal: bool) -> Filter {
+    Filter::Select(Box::new(Filter::Bin {
+        op: if equal { Op::Eq } else { Op::Ne },
+        left: Box::new(Filter::Identity),
+        right: Box::new(Filter::Literal(Value::Null)),
+    }))
+}
+
+fn keep_type(kind: &str) -> Filter {
+    Filter::Select(Box::new(type_is(kind)))
+}
+
+fn type_is(kind: &str) -> Filter {
+    Filter::Bin {
+        op: Op::Eq,
+        left: Box::new(Filter::Type),
+        right: Box::new(Filter::Literal(Value::String(kind.to_string()))),
+    }
+}
+
+fn type_is_not(kind: &str) -> Filter {
+    Filter::Bin {
+        op: Op::Ne,
+        left: Box::new(Filter::Type),
+        right: Box::new(Filter::Literal(Value::String(kind.to_string()))),
     }
 }
 
@@ -911,6 +973,47 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "contains" => Filter::Contains(args.next().expect("arg")),
         "inside" => Filter::Inside(args.next().expect("arg")),
         "isempty" => Filter::IsEmpty(args.next().expect("arg")),
+        "values" => keep_null(false),
+        "nulls" => keep_null(true),
+        "booleans" => keep_type("boolean"),
+        "numbers" => keep_type("number"),
+        "strings" => keep_type("string"),
+        "arrays" => keep_type("array"),
+        "objects" => keep_type("object"),
+        "iterables" => Filter::Select(Box::new(Filter::Or(
+            Box::new(type_is("array")),
+            Box::new(type_is("object")),
+        ))),
+        "scalars" => Filter::Select(Box::new(Filter::And(
+            Box::new(type_is_not("array")),
+            Box::new(type_is_not("object")),
+        ))),
+        "IN" => {
+            let first = args.next().expect("in");
+            match args.next() {
+                None => Filter::In {
+                    src: None,
+                    stream: first,
+                },
+                Some(stream) => Filter::In {
+                    src: Some(first),
+                    stream,
+                },
+            }
+        }
+        "INDEX" => {
+            let first = args.next().expect("index");
+            match args.next() {
+                None => Filter::IndexBy {
+                    stream: None,
+                    key: first,
+                },
+                Some(key) => Filter::IndexBy {
+                    stream: Some(first),
+                    key,
+                },
+            }
+        }
         "flatten" => Filter::Flatten(args.next()),
         "any" | "all" => {
             let all_form = name == "all";
@@ -2697,6 +2800,8 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Flatten(_)
         | Filter::Quant { .. }
         | Filter::IsEmpty(_)
+        | Filter::In { .. }
+        | Filter::IndexBy { .. }
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString

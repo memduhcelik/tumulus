@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+`values` keeps a value other than null. `nulls` keeps null. `booleans`, `numbers`, `strings`, `arrays`, and `objects` keep a value of that type. `iterables` keeps an array or an object. `scalars` keeps every other value, including null. `IN(expr)` is true when the input equals a value `expr` yields. `IN(src; expr)` is true when a value of `src` equals a value of `expr`. The second filter is the outer loop, and the first match stops the rest. `INDEX(idx)` builds an object from the values inside the input. `INDEX(stream; idx)` builds it from that stream. `idx` runs on each value. A string is the key as written, and any other value's key is its compact JSON. A repeated key stays where it first appeared and takes the later value. A value that yields no key is left out. A value that cannot be iterated fails the way jq fails, and the exit status is 5.
+
+Of the 447 programs in jq 1.7.1's test file, 382 come out the same. The 14 new ones are `[.[]|arrays]`, `[.[]|objects]`, `[.[]|iterables]`, `[.[]|scalars]`, `[.[]|values]`, `[.[]|booleans]`, `[.[]|nulls]`, `INDEX(range(5)|[., "foo\(.)"]; .[0])`, `range(5;10)|IN(range(10))`, `range(5;13)|IN(range(0;10;3))`, `range(10;12)|IN(range(10))`, `IN(range(10;20); range(10))`, `IN(range(5;20); range(10))`, and `walk(select(IN({}, []) | not))`. No previously matching program was lost.
+
 `input` and `inputs` read a long file without counting its lines again for every value. `-R` does the same for raw lines. The values, the messages, and the exit status are unchanged.
 
 `split(sep)` splits a string on a string. An empty separator splits it into Unicode code points, and an empty string becomes `[]`. The input and the separator have to be strings, or the error is `split input and separator must be strings`. `fromjson` reads one JSON value from a string. `nan` and `NaN` are `nan`, in any letter case, with an optional leading sign. On macOS, digits may follow `nan`, so `nan1234` is `nan`. On Linux, only zeros may follow, so `nan0` is `nan` and `nan1234` fails with `Invalid numeric literal`. `Infinity`, `Inf`, and `infinity` are infinite, with an optional leading sign. A value that is not a string fails with `only strings can be parsed`. A bad string fails with jq's parse message and `(while parsing '...')`.
@@ -10,7 +14,7 @@
 
 `flatten` pulls nested arrays out, and an object contributes its values. `flatten(n)` pulls `n` levels for an integer `n` that is at least 0. `infinite`, and a positive number that is not an integer, pull every level. `nan`, `null`, a boolean, or a negative number fails with `flatten depth must not be negative`. Another depth is subtracted from when a nested array is entered. `any` and `all` take no filter, one filter, or a generator and a condition. With fewer than two, the generator is `.[]`. The first answer stops the rest. `all` of nothing is true, and `any` of nothing is false. `isempty(expr)` is true when `expr` yields nothing. `map_values(expr)` keeps the first value of `expr` for each element or object value, and removes the place when there is none. `keys_unsorted` lists array indexes, or object keys in stored order. The wrong kind of value fails the way jq fails, and the exit status is 5.
 
-Of the 447 programs in jq 1.7.1's test file, 368 come out the same. The 43 new ones use `split`, `fromjson`, `contains`, `flatten`, `any`, `all`, `isempty`, or `map_values`. No previously matching program was lost. `split` with two filters is still rejected. That is a regular expression split in jq.
+Those filters made 368 of the 447 programs in jq 1.7.1's test file come out the same. The 43 new ones use `split`, `fromjson`, `contains`, `flatten`, `any`, `all`, `isempty`, or `map_values`. No previously matching program was lost. `split` with two filters is still rejected. That is a regular expression split in jq.
 
 ## 0.7.0
 

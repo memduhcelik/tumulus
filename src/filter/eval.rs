@@ -148,6 +148,12 @@ pub(super) fn produce(
             all, stream, cond, ..
         } => super::builtin::eval_quant(*all, stream, cond, input, env),
         Filter::IsEmpty(expr) => super::builtin::eval_isempty(expr, input, env),
+        Filter::In { src, stream } => {
+            super::builtin::eval_member(src.as_deref(), stream, input, env)
+        }
+        Filter::IndexBy { stream, key } => {
+            super::builtin::eval_index_by(stream.as_deref(), key, input, env)
+        }
         Filter::MapValues(expr) => super::builtin::eval_map_values(expr, input, env),
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),

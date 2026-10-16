@@ -1561,3 +1561,102 @@ pub(super) fn expand_isempty(expr: &Filter) -> Filter {
         Box::new(Filter::Literal(Value::Bool(true))),
     ))))
 }
+
+/// `IN(stream)` compares the input with each value of `stream`.
+/// `IN(src; stream)` compares each value of `src` with each value of `stream`.
+/// `stream` runs on the outside. A match stops both, and a failure in the
+/// value being compared stops before the next value of `stream`.
+pub(super) fn eval_member(
+    src: Option<&Filter>,
+    stream: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let found = if let Some(src) = src {
+        any_equal(stream, src, input, env)?
+    } else {
+        any_equal(&Filter::Identity, stream, input, env)?
+    };
+    Ok(vec![Value::Bool(found)])
+}
+
+/// The right-hand filter is the outer loop. The left-hand filter runs again
+/// for each of its values, in the caller's scope.
+fn any_equal(
+    outer: &Filter,
+    inner: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<bool, Failure> {
+    let found = std::cell::Cell::new(false);
+    let failure = RefCell::new(None);
+    let ran = super::stream::feed(outer, input, env, &mut |right| {
+        let right = right.clone();
+        let mut halt = false;
+        let left = super::stream::feed(inner, input, env, &mut |left| {
+            if cmp_value(left, &right) == 0 {
+                found.set(true);
+                halt = true;
+                return true;
+            }
+            false
+        });
+        if let Err(err) = left {
+            *failure.borrow_mut() = Some(err);
+            return true;
+        }
+        halt
+    });
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    ran?;
+    Ok(found.get())
+}
+
+/// One object. The key filter runs on each value, with the caller's
+/// variables. A string is the key. Anything else uses its compact JSON.
+/// No key skips that value. A later value replaces an earlier one and
+/// leaves the key where it first appeared.
+pub(super) fn eval_index_by(
+    stream: Option<&Filter>,
+    key: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let iterate = Filter::Iterate;
+    let stream = stream.unwrap_or(&iterate);
+    let pairs = RefCell::new(Vec::new());
+    let failure = RefCell::new(None);
+    let ran = super::stream::feed(stream, input, env, &mut |row| {
+        let row = row.clone();
+        let keyed = super::stream::feed(key, &row, env, &mut |item| {
+            let name = index_key(item);
+            put(&mut pairs.borrow_mut(), name, row.clone());
+            false
+        });
+        if let Err(err) = keyed {
+            *failure.borrow_mut() = Some(err);
+            return true;
+        }
+        false
+    });
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    ran?;
+    Ok(vec![Value::object(pairs.into_inner())])
+}
+
+fn index_key(value: &Value) -> String {
+    if let Value::String(text) = value {
+        return text.clone();
+    }
+    match eval_tojson(value) {
+        Ok(items) => match items.first() {
+            Some(Value::String(text)) => text.clone(),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    }
+}

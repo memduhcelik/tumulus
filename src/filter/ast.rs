@@ -170,6 +170,19 @@ pub enum Filter {
     },
     /// `isempty(expr)`.
     IsEmpty(Box<Filter>),
+    /// `IN(stream)` asks whether the input equals a value `stream` yields.
+    /// `IN(src; stream)` asks whether a value of `src` does. `stream` is the
+    /// outer loop, and the first match stops the rest.
+    In {
+        src: Option<Box<Filter>>,
+        stream: Box<Filter>,
+    },
+    /// `INDEX(key)` indexes `.[]`. `INDEX(stream; key)` indexes that stream.
+    /// A string key stays as written. Any other key is its compact JSON.
+    IndexBy {
+        stream: Option<Box<Filter>>,
+        key: Box<Filter>,
+    },
     /// `map_values(expr)`. The first value `expr` yields replaces the
     /// element. No value removes it. A later value is not run.
     MapValues(Box<Filter>),
