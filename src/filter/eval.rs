@@ -60,7 +60,13 @@ pub(super) fn produce(
         Filter::Identity => Ok(vec![input.clone()]),
         Filter::Field(key) => index_string(input, key),
         Filter::Index { at, .. } => index_number(input, at),
-        Filter::Slice { start, end } => slice(input, start.as_deref(), end.as_deref()),
+        Filter::Slice { base, start, end } => eval_slice(
+            base.as_deref(),
+            start.as_deref(),
+            end.as_deref(),
+            input,
+            env,
+        ),
         Filter::Iterate => iterate(input),
         Filter::Recurse => Ok(recurse(input)),
         Filter::Optional(inner) => match eval_in(inner, input, env) {
@@ -288,6 +294,109 @@ pub(super) fn slice(
             "Cannot index {} with object",
             other.type_name()
         ))),
+    }
+}
+
+/// One output per start, and for each start one output per end. The end
+/// runs again for every start. A failure stops the side that produced it
+/// and does not run whatever follows it.
+pub(super) fn walk_slice_pairs(
+    start: Option<&Filter>,
+    end: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+    mut on_pair: impl FnMut(&Value, &Value) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    walk_bound(start, input, env, &mut |start_value| {
+        walk_bound(end, input, env, &mut |end_value| {
+            on_pair(start_value, end_value)
+        })
+    })
+}
+
+fn walk_bound(
+    bound: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+    on_value: &mut dyn FnMut(&Value) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let Some(bound) = bound else {
+        return on_value(&Value::Null);
+    };
+    let mut stop = None;
+    let result = super::stream::feed(bound, input, env, &mut |value| match on_value(value) {
+        Ok(()) => false,
+        Err(failure) => {
+            stop = Some(failure);
+            true
+        }
+    });
+    if let Some(failure) = stop {
+        return Err(failure);
+    }
+    result.map(|_| ())
+}
+
+fn eval_slice(
+    base: Option<&Filter>,
+    start: Option<&Filter>,
+    end: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let identity = Filter::Identity;
+    let base = base.unwrap_or(&identity);
+    let mut out = Vec::new();
+    // Bounds are the outer stream. The base runs again for every pair, on
+    // the value the brackets were applied to, not on the base's own output.
+    let walked = walk_slice_pairs(start, end, input, env, |start_value, end_value| {
+        let (bases, base_err) = parts(eval_in(base, input, env));
+        for base_value in &bases {
+            match base_value {
+                Value::Null => out.push(Value::Null),
+                Value::Array(_) | Value::String(_) => {
+                    require_slice_index(start_value)?;
+                    require_slice_index(end_value)?;
+                    let start_text = number_text(start_value);
+                    let end_text = number_text(end_value);
+                    out.extend(slice(
+                        base_value,
+                        start_text.as_deref(),
+                        end_text.as_deref(),
+                    )?);
+                }
+                other => {
+                    return Err(fail(format!(
+                        "Cannot index {} with object",
+                        other.type_name()
+                    )));
+                }
+            }
+        }
+        match base_err {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    });
+    match walked {
+        Ok(()) => Ok(out),
+        Err(failure) => Err(with_partial(out, failure)),
+    }
+}
+
+pub(super) fn require_slice_index(value: &Value) -> Result<(), Failure> {
+    match value {
+        Value::Null | Value::Number(_) => Ok(()),
+        _ => Err(fail(
+            "Array/string slice indices must be integers".to_string(),
+        )),
+    }
+}
+
+fn number_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(text) => Some(text.clone()),
+        _ => None,
     }
 }
 

@@ -30,10 +30,13 @@ pub enum Filter {
         at: ArrayIndex,
         text: String,
     },
-    /// `.[start:end]`. `None` means that side was left off.
+    /// `.[start:end]`, or `base[start:end]`. `None` means that side was left off.
+    /// Bounds run on the value the brackets were applied to, and `base` runs
+    /// again for every pair of bounds. A missing `base` is that value itself.
     Slice {
-        start: Option<String>,
-        end: Option<String>,
+        base: Option<Box<Filter>>,
+        start: Option<Box<Filter>>,
+        end: Option<Box<Filter>>,
     },
     Iterate,
     /// `..` and `recurse` with no arguments. The value, then every value inside it.

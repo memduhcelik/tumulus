@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::math::{self, Kind};
-use crate::number::{self, array_index};
+use crate::number;
 use crate::value::Value;
 
 use super::ast::*;
@@ -29,7 +29,6 @@ pub fn reads_input(filter: &Filter) -> bool {
             Filter::Identity
             | Filter::Field(_)
             | Filter::Index { .. }
-            | Filter::Slice { .. }
             | Filter::Iterate
             | Filter::Recurse
             | Filter::Literal(_)
@@ -79,6 +78,11 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Until(left, right)
             | Filter::While(left, right)
             | Filter::SetPath(left, right) => walk(left, seen) || walk(right, seen),
+            Filter::Slice { base, start, end } => {
+                base.as_deref().is_some_and(|base| walk(base, seen))
+                    || start.as_deref().is_some_and(|start| walk(start, seen))
+                    || end.as_deref().is_some_and(|end| walk(end, seen))
+            }
             Filter::Optional(inner)
             | Filter::Collect(inner)
             | Filter::Neg(inner)
@@ -213,7 +217,6 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Field(_)
         | Filter::Index { .. }
         | Filter::Paths(None)
-        | Filter::Slice { .. }
         | Filter::Iterate
         | Filter::Recurse
         | Filter::Literal(_)
@@ -254,6 +257,18 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             Some(by) => check_vars(by, scope),
             None => Ok(()),
         },
+        Filter::Slice { base, start, end } => {
+            if let Some(base) = base {
+                check_vars(base, scope)?;
+            }
+            if let Some(start) = start {
+                check_vars(start, scope)?;
+            }
+            if let Some(end) = end {
+                check_vars(end, scope)?;
+            }
+            Ok(())
+        }
         Filter::Var(name) => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
@@ -503,7 +518,6 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         Filter::Identity
         | Filter::Field(_)
         | Filter::Index { .. }
-        | Filter::Slice { .. }
         | Filter::Iterate
         | Filter::Recurse
         | Filter::Literal(_)
@@ -543,6 +557,17 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Environ
         | Filter::Param(_)
         | Filter::Paths(None) => {}
+        Filter::Slice { base, start, end } => {
+            if let Some(base) = base {
+                walk_defs(base, seen, errors);
+            }
+            if let Some(start) = start {
+                walk_defs(start, seen, errors);
+            }
+            if let Some(end) = end {
+                walk_defs(end, seen, errors);
+            }
+        }
         Filter::Order { by, .. } => {
             if let Some(by) = by {
                 walk_defs(by, seen, errors);
@@ -1960,7 +1985,7 @@ impl<'a> Parser<'a> {
         self.parse_string_expr()
     }
 
-    /// `[` has not been consumed. Slice forms stay on the old path.
+    /// `[` has not been consumed. A colon in the body is a slice.
     fn parse_index(&mut self, base: Option<Filter>) -> Result<Filter, ProgramError> {
         if !self.eat('[') {
             return Err(ProgramError::Syntax);
@@ -1970,8 +1995,11 @@ impl<'a> Parser<'a> {
             return Ok(chain(base, Filter::Iterate));
         }
         if self.bracket_has_slice() {
-            let segment = self.parse_slice_body()?;
-            return Ok(chain(base, segment));
+            let mut segment = self.parse_slice_body()?;
+            if let Filter::Slice { base: slot, .. } = &mut segment {
+                *slot = base.map(Box::new);
+            }
+            return Ok(segment);
         }
         let key = self.parse_pipe()?;
         self.skip_ws();
@@ -2014,115 +2042,39 @@ impl<'a> Parser<'a> {
     }
 
     /// The opening `[` is already consumed, and the body contains a `:`.
+    /// Each side is an expression. A comma yields several bounds. An empty
+    /// side is left off. Both sides empty is not a slice.
     fn parse_slice_body(&mut self) -> Result<Filter, ProgramError> {
-        let mut toks = Vec::new();
-        loop {
-            self.skip_ws();
-            if let Some(literal) = self.slice_bound_literal()? {
-                toks.push(BracketTok::Num(literal));
-            }
-            self.skip_ws();
-            if self.eat(':') {
-                toks.push(BracketTok::Colon);
-                continue;
-            }
-            if self.peek() == Some(',') {
-                self.bump();
-                toks.push(BracketTok::Comma);
-                continue;
-            }
-            if self.eat(']') {
-                break;
-            }
-            return Err(ProgramError::Syntax);
-        }
-        filter_from_brackets(toks)
-    }
-
-    /// A slice bound. `nan` and `infinite` are the same numbers as elsewhere.
-    /// The stored text is the sentinel arithmetic already uses, so the slice
-    /// and `path` agree on it.
-    fn slice_bound_literal(&mut self) -> Result<Option<String>, ProgramError> {
-        let negative = self.peek() == Some('-');
-        if negative {
-            if self.nonfinite_word(1).is_some() {
-                self.bump();
-                let word = self.nonfinite_word(0).expect("nonfinite");
-                self.index += word.len();
-                return Ok(Some(signed_nonfinite(true, word)));
-            }
-        } else if let Some(word) = self.nonfinite_word(0) {
-            self.index += word.len();
-            return Ok(Some(signed_nonfinite(false, word)));
-        }
-        if self
-            .peek()
-            .is_some_and(|c| c == '-' || c == '.' || c.is_ascii_digit())
-        {
-            return Ok(Some(self.number_literal()?.to_string()));
-        }
-        Ok(None)
-    }
-
-    /// `nan` or `infinite` after `skip` characters, when the word ends there.
-    fn nonfinite_word(&self, skip: usize) -> Option<&'static str> {
-        let mut index = self.index;
-        for _ in 0..skip {
-            let ch = self.src[index..].chars().next()?;
-            index += ch.len_utf8();
-        }
-        let rest = &self.src[index..];
-        for word in ["nan", "infinite"] {
-            if !rest.starts_with(word) {
-                continue;
-            }
-            let after = rest[word.len()..].chars().next();
-            if after.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-                return None;
-            }
-            return Some(word);
-        }
-        None
-    }
-
-    fn number_literal(&mut self) -> Result<&'a str, ProgramError> {
-        let start = self.index;
-        if self.peek() == Some('-') {
-            self.bump();
-        }
-        if self.peek() == Some('.') {
-            self.bump();
-            if !self.take_digits() {
-                return Err(ProgramError::Syntax);
-            }
-        } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.take_digits();
-            if self.peek() == Some('.') {
-                self.bump();
-                self.take_digits();
-            }
+        self.skip_ws();
+        let start = if self.peek() == Some(':') {
+            None
         } else {
+            let start = self.parse_pipe()?;
+            self.skip_ws();
+            Some(Box::new(start))
+        };
+        if !self.eat(':') {
             return Err(ProgramError::Syntax);
         }
-        if matches!(self.peek(), Some('e' | 'E')) {
-            self.bump();
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.bump();
-            }
-            if !self.take_digits() {
-                return Err(ProgramError::Syntax);
-            }
+        self.skip_ws();
+        let end = if self.peek() == Some(']') {
+            None
+        } else {
+            let end = self.parse_pipe()?;
+            self.skip_ws();
+            Some(Box::new(end))
+        };
+        if start.is_none() && end.is_none() {
+            return Err(ProgramError::Syntax);
         }
-        Ok(&self.src[start..self.index])
-    }
-
-    fn take_digits(&mut self) -> bool {
-        let mut any = false;
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            any = true;
-            self.bump();
+        if !self.eat(']') {
+            return Err(ProgramError::Syntax);
         }
-        any
+        Ok(Filter::Slice {
+            base: None,
+            start,
+            end,
+        })
     }
 
     fn ident(&mut self) -> Result<String, ProgramError> {
@@ -2457,95 +2409,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub(super) enum BracketTok {
-    Num(String),
-    Colon,
-    Comma,
-}
-
-pub(super) fn filter_from_brackets(toks: Vec<BracketTok>) -> Result<Filter, ProgramError> {
-    let colons = toks
-        .iter()
-        .filter(|tok| matches!(tok, BracketTok::Colon))
-        .count();
-    if colons > 1 {
-        return Err(ProgramError::Syntax);
-    }
-    if colons == 1 {
-        let at = toks
-            .iter()
-            .position(|tok| matches!(tok, BracketTok::Colon))
-            .expect("colon");
-        let starts = bracket_side(&toks[..at])?;
-        let ends = bracket_side(&toks[at + 1..])?;
-        if starts.iter().all(Option::is_none) && ends.iter().all(Option::is_none) {
-            return Err(ProgramError::Syntax);
-        }
-        let mut filters = Vec::new();
-        for start in &starts {
-            for end in &ends {
-                filters.push(Filter::Slice {
-                    start: start.clone(),
-                    end: end.clone(),
-                });
-            }
-        }
-        return Ok(combine_commas(filters));
-    }
-    let mut items = Vec::new();
-    let mut expect_value = true;
-    for tok in toks {
-        match tok {
-            BracketTok::Comma if !expect_value => expect_value = true,
-            BracketTok::Num(literal) if expect_value => {
-                let text = canonical_number(&literal);
-                let at = match array_index(&text) {
-                    Some(index) => ArrayIndex::At(index),
-                    None => ArrayIndex::OutOfRange,
-                };
-                items.push(Filter::Index { at, text });
-                expect_value = false;
-            }
-            _ => return Err(ProgramError::Syntax),
-        }
-    }
-    if expect_value || items.is_empty() {
-        return Err(ProgramError::Syntax);
-    }
-    Ok(combine_commas(items))
-}
-
-pub(super) fn bracket_side(toks: &[BracketTok]) -> Result<Vec<Option<String>>, ProgramError> {
-    if toks.is_empty() {
-        return Ok(vec![None]);
-    }
-    let mut bounds = Vec::new();
-    let mut expect_value = true;
-    for tok in toks {
-        match tok {
-            BracketTok::Comma if !expect_value => expect_value = true,
-            BracketTok::Num(literal) if expect_value => {
-                bounds.push(Some(literal.clone()));
-                expect_value = false;
-            }
-            _ => return Err(ProgramError::Syntax),
-        }
-    }
-    if expect_value || bounds.is_empty() {
-        return Err(ProgramError::Syntax);
-    }
-    Ok(bounds)
-}
-
-pub(super) fn combine_commas(items: Vec<Filter>) -> Filter {
-    let mut items = items.into_iter();
-    let mut filter = items.next().expect("one bracket term");
-    for item in items {
-        filter = Filter::Comma(Box::new(filter), Box::new(item));
-    }
-    filter
-}
-
 pub(super) fn chain(left: Option<Filter>, right: Filter) -> Filter {
     match left {
         Some(left) => Filter::Pipe(Box::new(left), Box::new(right)),
@@ -2593,20 +2456,6 @@ pub(super) fn at_key(base: Option<Filter>, key: Filter) -> Filter {
         base: Box::new(base.unwrap_or(Filter::Identity)),
         key: Box::new(key),
         optional: false,
-    }
-}
-
-fn signed_nonfinite(negative: bool, word: &str) -> String {
-    if word == "nan" {
-        if negative {
-            number::neg_nan_text()
-        } else {
-            number::nan_text()
-        }
-    } else if negative {
-        number::neg_inf()
-    } else {
-        number::pos_inf()
     }
 }
 

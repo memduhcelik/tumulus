@@ -495,7 +495,9 @@ pub fn slice_bound(literal: &str, len: i64, end: bool) -> i64 {
     if text == NEG_INF {
         return 0;
     }
-    let Some((negative, digits, scale)) = decimal_parts(literal) else {
+    // A computed bound carries a mark in front of the digits. The mark is not
+    // part of the number.
+    let Some((negative, digits, scale)) = decimal_parts(text) else {
         return 0;
     };
     // `-0` is zero. A tiny fraction uses `scale == i32::MIN` and must stay signed.

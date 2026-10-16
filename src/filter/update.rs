@@ -11,8 +11,9 @@ use crate::value::Value;
 use super::stream::{self, LimitHow, NthSpan};
 use super::{
     add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
-    finish, fresh, mul_values, parts, rem_values, shown, slice as slice_value, slice_range,
-    sub_values, truthy, with_partial, ArrayIndex, Failure, Filter, Op, PatField, Pattern, UpdateOp,
+    finish, fresh, mul_values, parts, rem_values, require_slice_index, shown, slice as slice_value,
+    slice_range, sub_values, truthy, walk_slice_pairs, with_partial, ArrayIndex, Failure, Filter,
+    Op, PatField, Pattern, UpdateOp,
 };
 
 enum Found {
@@ -37,9 +38,12 @@ enum Step {
     Huge(String),
     /// A `getpath` component printed as itself. An array or a slice object.
     Raw(Value),
+    /// `start` and `end` are the values the bounds produced. Null is an
+    /// omitted side or a null bound. A number is an index. Anything else is
+    /// kept only while the value being sliced is null.
     Slice {
-        start: Option<String>,
-        end: Option<String>,
+        start: Value,
+        end: Value,
     },
 }
 
@@ -63,8 +67,6 @@ struct Elem {
 enum Body {
     Live(Edit),
     Gone,
-    /// A slice wrote these values in place of this original slot.
-    Run(Vec<Edit>),
 }
 
 enum Write {
@@ -80,12 +82,15 @@ pub fn eval_update(
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
     if op == UpdateOp::Modify {
-        let paths = collect(path, input, env)?;
-        if paths.is_empty() {
+        let found = gather(path, input, env)?;
+        if let Some(failure) = found.failure {
+            return prefer_modify(&found.paths, expr, input, env, failure);
+        }
+        if found.paths.is_empty() {
             // Nothing was reached, so the filter is not run.
             return Ok(vec![input.clone()]);
         }
-        return modify(&paths, expr, input, env);
+        return modify(&found.paths, expr, input, env);
     }
     // `=` and the arithmetic updates run the right-hand side first. An empty
     // stream yields nothing and does not look at the path. A failure while
@@ -94,18 +99,24 @@ pub fn eval_update(
     if rhs.is_empty() {
         return finish(Vec::new(), rhs_err);
     }
-    let paths = collect(path, input, env)?;
-    if paths.is_empty() {
+    let found = gather(path, input, env)?;
+    if let Some(failure) = found.failure {
+        if let Some(value) = rhs.first() {
+            if let Err(message) = apply_update(op, &found.paths, input, value.clone()) {
+                // The first value cannot be written through the slices found
+                // so far. That failure wins over a later bound error.
+                return Err(fail(message));
+            }
+        }
+        return Err(failure);
+    }
+    if found.paths.is_empty() {
         let outs = vec![input.clone(); rhs.len()];
         return finish(outs, rhs_err);
     }
     let mut outs = Vec::new();
     for value in rhs {
-        let produced = match op {
-            UpdateOp::Assign => assign_one(&paths, input, value),
-            _ => combine_one(op, &paths, input, value),
-        };
-        match produced {
+        match apply_update(op, &found.paths, input, value) {
             Ok(value) => outs.push(value),
             Err(message) => return Err(fresh(outs, message)),
         }
@@ -113,14 +124,16 @@ pub fn eval_update(
     finish(outs, rhs_err)
 }
 
-fn collect(
-    path: &Filter,
-    input: &Value,
-    env: &[(String, Value)],
-) -> Result<Vec<Vec<Step>>, Failure> {
+struct Gathered {
+    paths: Vec<Vec<Step>>,
+    failure: Option<Failure>,
+}
+
+fn gather(path: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Gathered, Failure> {
+    let (outs, failure) = locate_outs(path, input, env)?;
     let mut paths = Vec::new();
-    for item in locate(path, input, env)? {
-        match item {
+    for out in outs {
+        match classify_one(input, out) {
             Found::Broken(value) => {
                 return Err(fail(format!(
                     "Invalid path expression with result {}",
@@ -133,7 +146,42 @@ fn collect(
             Found::Path(steps) => paths.push(steps),
         }
     }
-    Ok(paths)
+    Ok(Gathered { paths, failure })
+}
+
+/// `|=` and `del` run on the slices found before a bound failed. Deleting
+/// from a string reports the bound error. Any other failure of the update
+/// is reported instead.
+fn prefer_modify(
+    paths: &[Vec<Step>],
+    expr: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    failure: Failure,
+) -> Result<Vec<Value>, Failure> {
+    if paths.is_empty() {
+        return Err(failure);
+    }
+    match modify(paths, expr, input, env) {
+        Err(err) if err.message == "Cannot delete fields from string" && err.caught.is_none() => {
+            Err(failure)
+        }
+        Err(err) => Err(err),
+        Ok(_) => Err(failure),
+    }
+}
+
+fn apply_update(
+    op: UpdateOp,
+    paths: &[Vec<Step>],
+    input: &Value,
+    value: Value,
+) -> Result<Value, String> {
+    match op {
+        UpdateOp::Assign => assign_one(paths, input, value),
+        UpdateOp::Modify => unreachable!("modify"),
+        _ => combine_one(op, paths, input, value),
+    }
 }
 
 /// Where the keys of one object live, so a `reduce` can set the next key
@@ -915,7 +963,11 @@ enum Real {
     Huge(String),
 }
 
-fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec<Found>, Failure> {
+fn locate_outs(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<(Vec<POut>, Option<Failure>), Failure> {
     let next = Cell::new(2);
     let line = Cell::new(1);
     let ctx = Ctx {
@@ -925,30 +977,10 @@ fn locate(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Vec
         pbinds: &[],
     };
     match run(filter, input, &[], &line, 1, &ctx) {
-        Ok(outs) => Ok(outs
-            .into_iter()
-            .map(|out| classify_one(input, out))
-            .collect()),
+        Ok(outs) => Ok((outs, None)),
         Err(err) => {
-            for out in err.partial {
-                match classify_one(input, out) {
-                    Found::Broken(value) => {
-                        return Err(fail(format!(
-                            "Invalid path expression with result {}",
-                            clipped(&value, 29)
-                        )));
-                    }
-                    Found::NanIndex => {
-                        return Err(fail("Cannot set array element at NaN index".to_string()));
-                    }
-                    Found::Path(_) => {}
-                }
-            }
-            Err(Failure {
-                partial: Vec::new(),
-                message: err.message,
-                caught: err.caught,
-            })
+            let (partial, failure) = split_err(err);
+            Ok((partial, Some(failure)))
         }
     }
 }
@@ -997,7 +1029,9 @@ fn run(
         Filter::Field(key) => run_field(key, input, path, line, input_gen, ctx),
         Filter::Index { at, text } => run_fixed_index(at, text, input, path, line, input_gen, ctx),
         Filter::GetPath(arg) => run_getpath(arg, input, path, line, input_gen, ctx),
-        Filter::Slice { start, end } => run_slice(start, end, input, path, line, input_gen, ctx),
+        Filter::Slice { base, start, end } => {
+            run_slice(base, start, end, input, path, line, input_gen, ctx)
+        }
         Filter::Iterate => run_iterate(input, path, line, input_gen, ctx),
         Filter::Recurse => run_recurse(input, path, line, input_gen, ctx),
         Filter::RecurseDown { step, cond } => {
@@ -1531,18 +1565,11 @@ fn near_iter(value: &Value) -> String {
     )
 }
 
-fn slice_element(start: &Option<String>, end: &Option<String>) -> Value {
+fn shown_slice(start: &Value, end: &Value) -> Value {
     Value::Object(vec![
-        ("start".to_string(), bound_value(start)),
-        ("end".to_string(), bound_value(end)),
+        ("start".to_string(), render_bound(start)),
+        ("end".to_string(), render_bound(end)),
     ])
-}
-
-fn bound_value(bound: &Option<String>) -> Value {
-    match bound {
-        Some(text) => Value::Number(text.clone()),
-        None => Value::Null,
-    }
 }
 
 fn run_field(
@@ -1602,33 +1629,74 @@ fn run_fixed_index(
 }
 
 fn run_slice(
-    start: &Option<String>,
-    end: &Option<String>,
+    base: &Option<Box<Filter>>,
+    start: &Option<Box<Filter>>,
+    end: &Option<Box<Filter>>,
     input: &Value,
     path: &[Step],
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
-    if !carrier_now(line, input_gen) {
-        let elem = slice_element(start, end);
-        return Err(bare(near_access(&elem, input)));
-    }
-    match input {
-        Value::Null | Value::Array(_) | Value::String(_) => {
-            let step = Step::Slice {
-                start: start.clone(),
-                end: end.clone(),
+    let identity = Filter::Identity;
+    let base = base.as_deref().unwrap_or(&identity);
+    let saved = line.get();
+    let mut outs = Vec::new();
+    let walked = walk_slice_pairs(
+        start.as_deref(),
+        end.as_deref(),
+        input,
+        ctx.env,
+        |start_value, end_value| {
+            line.set(saved);
+            let base_run = run(base, input, path, line, input_gen, ctx);
+            let (base_outs, base_err) = match base_run {
+                Ok(outs) => (outs, None),
+                Err(err) => {
+                    let (partial, failure) = split_err(err);
+                    (partial, Some(failure))
+                }
             };
-            let child = child_at(input, &step).map_err(bare)?;
-            let mut full = path.to_vec();
-            full.push(step);
-            Ok(vec![taken(child, full, line, ctx.next)])
-        }
-        other => Err(bare(format!(
-            "Cannot index {} with object",
-            other.type_name()
-        ))),
+            for base_out in base_outs {
+                if !base_out.carrier {
+                    let elem = shown_slice(start_value, end_value);
+                    return Err(fail(near_access(&elem, &base_out.value)));
+                }
+                match &base_out.value {
+                    Value::Array(_) | Value::String(_) => {
+                        require_slice_index(start_value)?;
+                        require_slice_index(end_value)?;
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(fail(format!(
+                            "Cannot index {} with object",
+                            other.type_name()
+                        )));
+                    }
+                }
+                let step = Step::Slice {
+                    start: start_value.clone(),
+                    end: end_value.clone(),
+                };
+                let child = child_at(&base_out.value, &step).map_err(fail)?;
+                let mut full = base_out.path;
+                full.push(step);
+                outs.push(taken(child, full, line, ctx.next));
+            }
+            match base_err {
+                Some(failure) => Err(failure),
+                None => Ok(()),
+            }
+        },
+    );
+    match walked {
+        Ok(()) => Ok(outs),
+        Err(failure) => Err(PathErr {
+            partial: outs,
+            message: failure.message,
+            caught: failure.caught,
+        }),
     }
 }
 
@@ -2259,7 +2327,10 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
         Value::Object(fields) => match container {
             Value::Null | Value::Array(_) | Value::String(_) => {
                 let (start, end) = slice_from_object(fields)?;
-                let step = Step::Slice { start, end };
+                let step = Step::Slice {
+                    start: as_bound(start),
+                    end: as_bound(end),
+                };
                 let child = child_at(container, &step)?;
                 Ok(Real::Done(step, child))
             }
@@ -2292,6 +2363,13 @@ fn bound_text(value: &Value) -> Result<Option<String>, String> {
         Value::Null => Ok(None),
         Value::Number(text) => Ok(Some(text.strip_prefix('\u{1}').unwrap_or(text).to_string())),
         _ => Err("Array/string slice indices must be integers".to_string()),
+    }
+}
+
+fn as_bound(bound: Option<String>) -> Value {
+    match bound {
+        Some(text) => Value::Number(text),
+        None => Value::Null,
     }
 }
 
@@ -2648,11 +2726,15 @@ fn value_at(value: &Value, path: &[Step]) -> Result<Value, String> {
             return Err(format!("Cannot index {} with number", other.type_name()));
         }
         (Step::Slice { start, end }, _) => {
-            let sliced = match super::slice(value, start.as_deref(), end.as_deref()) {
-                Ok(values) => values,
-                Err(failure) => return Err(failure.message),
+            let one = if matches!(value, Value::Null) {
+                Value::Null
+            } else {
+                let start = bound_text(start)?;
+                let end = bound_text(end)?;
+                let sliced = slice_value(value, start.as_deref(), end.as_deref())
+                    .map_err(|failure| failure.message)?;
+                sliced.into_iter().next().unwrap_or(Value::Null)
             };
-            let one = sliced.into_iter().next().unwrap_or(Value::Null);
             return if path.len() == 1 {
                 Ok(one)
             } else {
@@ -2722,6 +2804,8 @@ fn write_raw(edit: &mut Edit, key: &Value, rest: &[Step], write: &Write) -> Resu
                 return Err(format!("Cannot index {} with object", current.type_name()));
             }
             let (start, end) = slice_from_object(fields)?;
+            let start = as_bound(start);
+            let end = as_bound(end);
             write_slice(edit, &start, &end, rest, write)
         }
         _ => {
@@ -2845,9 +2929,6 @@ fn write_index(edit: &mut Edit, index: i64, rest: &[Step], write: &Write) -> Res
         }
         arr.slots[position].body = Body::Live(Edit::Pure(Value::Null));
     }
-    if matches!(arr.slots[position].body, Body::Run(_)) {
-        return Err("Cannot index array with number".to_string());
-    }
     let Body::Live(child) = &mut arr.slots[position].body else {
         return Ok(());
     };
@@ -2856,12 +2937,14 @@ fn write_index(edit: &mut Edit, index: i64, rest: &[Step], write: &Write) -> Res
 
 fn write_slice(
     edit: &mut Edit,
-    start: &Option<String>,
-    end: &Option<String>,
+    start: &Value,
+    end: &Value,
     rest: &[Step],
     write: &Write,
 ) -> Result<(), String> {
     if let Edit::Pure(Value::String(_)) = edit {
+        bound_text(start)?;
+        bound_text(end)?;
         return Err(match write {
             Write::Remove => "Cannot delete fields from string".to_string(),
             Write::Put(_) => "Cannot update string slices".to_string(),
@@ -2878,6 +2961,8 @@ fn write_slice(
             return Err(format!("Cannot index {} with object", other.type_name()));
         }
     }
+    let start_text = bound_text(start)?;
+    let end_text = bound_text(end)?;
     if !rest.is_empty() {
         let current = read_edit(
             edit,
@@ -2891,10 +2976,13 @@ fn write_slice(
         let value = freeze(&temp);
         return write_slice(edit, start, end, &[], &Write::Put(value));
     }
-    let arr = force_array(edit)?;
-    let (from, to) = slice_range(start.as_deref(), end.as_deref(), arr.slots.len());
     match write {
         Write::Remove => {
+            // Deletion keeps the original slots, so a later index is not moved
+            // by an earlier removal.
+            let arr = force_array(edit)?;
+            let (from, to) =
+                slice_range(start_text.as_deref(), end_text.as_deref(), arr.slots.len());
             if from >= to {
                 return Ok(());
             }
@@ -2906,23 +2994,23 @@ fn write_slice(
             Ok(())
         }
         Write::Put(value) => {
+            // Assignment sees the array as it is now, after earlier slices.
             let Value::Array(items) = value else {
                 return Err("A slice of an array can only be assigned another array".to_string());
             };
-            let run: Vec<Edit> = items.iter().cloned().map(Edit::Pure).collect();
-            if from == to {
-                if from >= arr.slots.len() {
-                    arr.tail.extend(run);
-                } else {
-                    arr.slots[from].before.extend(run);
+            let cur = match freeze(edit) {
+                Value::Array(items) => items,
+                Value::Null => Vec::new(),
+                other => {
+                    return Err(format!("Cannot index {} with object", other.type_name()));
                 }
-                return Ok(());
-            }
-            arr.slots[from].body = Body::Run(run);
-            for slot in &mut arr.slots[from + 1..to] {
-                slot.before.clear();
-                slot.body = Body::Gone;
-            }
+            };
+            let (from, to) = slice_range(start_text.as_deref(), end_text.as_deref(), cur.len());
+            let mut new = Vec::with_capacity(from + items.len() + cur.len().saturating_sub(to));
+            new.extend_from_slice(&cur[..from]);
+            new.extend(items.iter().cloned());
+            new.extend_from_slice(&cur[to..]);
+            *edit = Edit::Pure(Value::Array(new));
             Ok(())
         }
     }
@@ -3005,13 +3093,11 @@ fn read_edit(edit: &Edit, path: &[Step]) -> Result<Value, String> {
             match &arr.slots[position].body {
                 Body::Live(child) => read_edit(child, &path[1..]),
                 Body::Gone => read_edit(&Edit::Pure(Value::Null), &path[1..]),
-                Body::Run(items) => {
-                    let value = Value::Array(items.iter().map(freeze).collect());
-                    read_edit(&Edit::Pure(value), &path[1..])
-                }
             }
         }
         (Edit::Arr(arr), Step::Slice { start, end }) => {
+            let start = bound_text(start)?;
+            let end = bound_text(end)?;
             let (from, to) = slice_range(start.as_deref(), end.as_deref(), arr.slots.len());
             let value = Value::Array(slice_slots(arr, from, to));
             if path.len() == 1 {
@@ -3040,7 +3126,6 @@ fn body_values(body: &Body) -> Vec<Value> {
     match body {
         Body::Live(edit) => vec![freeze(edit)],
         Body::Gone => Vec::new(),
-        Body::Run(items) => items.iter().map(freeze).collect(),
     }
 }
 
@@ -3242,17 +3327,14 @@ fn render_step(step: &Step) -> Value {
         Step::Key(key) => Value::String(key.clone()),
         Step::Index { text, .. } | Step::Huge(text) => Value::Number(text.clone()),
         Step::Raw(value) => value.clone(),
-        Step::Slice { start, end } => Value::Object(vec![
-            ("start".to_string(), render_bound(start)),
-            ("end".to_string(), render_bound(end)),
-        ]),
+        Step::Slice { start, end } => shown_slice(start, end),
     }
 }
 
-fn render_bound(bound: &Option<String>) -> Value {
+fn render_bound(bound: &Value) -> Value {
     match bound {
-        None => Value::Null,
-        Some(text) => Value::Number(canonical_number(text)),
+        Value::Number(text) => Value::Number(canonical_number(text)),
+        other => other.clone(),
     }
 }
 
@@ -3508,7 +3590,10 @@ fn delete_leaf(value: &Value, key: &Value) -> Result<Leaf, String> {
             }
             Value::Object(fields) => {
                 let (start, end) = slice_from_object(fields)?;
-                Ok(Leaf::Step(Step::Slice { start, end }))
+                Ok(Leaf::Step(Step::Slice {
+                    start: as_bound(start),
+                    end: as_bound(end),
+                }))
             }
             other => Err(format!(
                 "Cannot delete {} element of array",
@@ -3569,8 +3654,8 @@ fn read_step(value: &Value, key: &Value) -> Result<(Step, Value), String> {
             }
             let (start, end) = slice_from_object(fields)?;
             let step = Step::Slice {
-                start: start.clone(),
-                end: end.clone(),
+                start: as_bound(start.clone()),
+                end: as_bound(end.clone()),
             };
             let child = if matches!(value, Value::Null) {
                 Value::Null
