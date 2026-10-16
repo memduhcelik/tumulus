@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
+
+Released on 2026-10-17.
 
 `values` keeps a value other than null. `nulls` keeps null. `booleans`, `numbers`, `strings`, `arrays`, and `objects` keep a value of that type. `iterables` keeps an array or an object. `scalars` keeps every other value, including null. `IN(expr)` is true when the input equals a value `expr` yields. `IN(src; expr)` is true when a value of `src` equals a value of `expr`. The second filter is the outer loop, and the first match stops the rest. `INDEX(idx)` builds an object from the values inside the input. `INDEX(stream; idx)` builds it from that stream. `idx` runs on each value. A string is the key as written, and any other value's key is its compact JSON. A repeated key stays where it first appeared and takes the later value. A value that yields no key is left out. A value that cannot be iterated fails the way jq fails, and the exit status is 5.
 
