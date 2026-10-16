@@ -64,21 +64,32 @@ impl<'a> Parser<'a> {
         self.parse_nan()
     }
 
-    /// `nan`, any letter case, then digits. `nan1234` is one number.
-    /// A letter after `nan` is not a number. `Infinity` takes no digits.
+    /// `nan` in any letter case. jq 1.7.1 on macOS then allows any digits,
+    /// so `nan1234` is one number. jq 1.7 on Linux allows only zeros, so
+    /// `nan0` is a number and `nan1234` is not. A letter after `nan` is
+    /// not a number on either. `Infinity` takes no digits.
     fn parse_nan(&mut self) -> Result<Value, ()> {
         let rest = &self.src[self.index..];
         if rest.len() < 3 || !rest[..3].eq_ignore_ascii_case(b"nan") {
             return Err(());
         }
         self.index += 3;
-        while matches!(self.peek(), Some('0'..='9')) {
+        while self.nan_payload() {
             self.index += 1;
         }
         if !self.token_boundary_ok() {
             return Err(());
         }
         Ok(Value::Number(number::nan_text()))
+    }
+
+    fn nan_payload(&self) -> bool {
+        match self.peek() {
+            Some('0') => true,
+            #[cfg(target_os = "macos")]
+            Some('1'..='9') => true,
+            _ => false,
+        }
     }
 
     fn parse_infinity(&mut self, negative: bool) -> Result<Value, ()> {
