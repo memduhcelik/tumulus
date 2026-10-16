@@ -155,6 +155,26 @@ pub enum Filter {
     LTrim(Box<Filter>),
     /// `rtrimstr(expr)`
     RTrim(Box<Filter>),
+    /// `ascii_downcase`. Only ASCII `A`–`Z` change.
+    AsciiDown,
+    /// `ascii_upcase`. Only ASCII `a`–`z` change.
+    AsciiUp,
+    /// `explode`. A string becomes its code points.
+    Explode,
+    /// `implode`. Code points become a string.
+    Implode,
+    /// `utf8bytelength`
+    Utf8ByteLength,
+    /// `startswith(expr)`
+    StartsWith(Box<Filter>),
+    /// `endswith(expr)`
+    EndsWith(Box<Filter>),
+    /// `index(expr)`
+    IndexOf(Box<Filter>),
+    /// `rindex(expr)`
+    RIndexOf(Box<Filter>),
+    /// `indices(expr)`
+    IndicesOf(Box<Filter>),
     /// `todate`
     ToDate,
     /// `fromdate`

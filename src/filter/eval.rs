@@ -146,6 +146,22 @@ pub(super) fn produce(
         Filter::Join(arg) => eval_join(arg, input, env),
         Filter::LTrim(arg) => eval_trim(arg, input, env, true),
         Filter::RTrim(arg) => eval_trim(arg, input, env, false),
+        Filter::AsciiDown => super::builtin::eval_ascii_case(input, false),
+        Filter::AsciiUp => super::builtin::eval_ascii_case(input, true),
+        Filter::Explode => super::builtin::eval_explode(input),
+        Filter::Implode => super::builtin::eval_implode(input),
+        Filter::Utf8ByteLength => super::builtin::eval_utf8_byte_length(input),
+        Filter::StartsWith(arg) => super::builtin::eval_affix(arg, input, env, false),
+        Filter::EndsWith(arg) => super::builtin::eval_affix(arg, input, env, true),
+        Filter::IndexOf(arg) => {
+            super::builtin::eval_find(arg, input, env, super::builtin::Find::Index)
+        }
+        Filter::RIndexOf(arg) => {
+            super::builtin::eval_find(arg, input, env, super::builtin::Find::RIndex)
+        }
+        Filter::IndicesOf(arg) => {
+            super::builtin::eval_find(arg, input, env, super::builtin::Find::Indices)
+        }
         Filter::ToDate => one(date::todate(input)),
         Filter::FromDate => one(date::fromdate(input)),
         Filter::GmTime => one(date::gmtime(input)),

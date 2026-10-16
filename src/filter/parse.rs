@@ -41,6 +41,11 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::ToNumber
             | Filter::ToString
             | Filter::ToJson
+            | Filter::AsciiDown
+            | Filter::AsciiUp
+            | Filter::Explode
+            | Filter::Implode
+            | Filter::Utf8ByteLength
             | Filter::Add
             | Filter::ToEntries
             | Filter::FromEntries
@@ -85,6 +90,11 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Join(inner)
             | Filter::LTrim(inner)
             | Filter::RTrim(inner)
+            | Filter::StartsWith(inner)
+            | Filter::EndsWith(inner)
+            | Filter::IndexOf(inner)
+            | Filter::RIndexOf(inner)
+            | Filter::IndicesOf(inner)
             | Filter::StrfTime(inner)
             | Filter::StrfLocalTime(inner)
             | Filter::StrpTime(inner)
@@ -215,6 +225,11 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::AsciiDown
+        | Filter::AsciiUp
+        | Filter::Explode
+        | Filter::Implode
+        | Filter::Utf8ByteLength
         | Filter::Add
         | Filter::ToEntries
         | Filter::FromEntries
@@ -269,6 +284,11 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Join(inner)
         | Filter::LTrim(inner)
         | Filter::RTrim(inner)
+        | Filter::StartsWith(inner)
+        | Filter::EndsWith(inner)
+        | Filter::IndexOf(inner)
+        | Filter::RIndexOf(inner)
+        | Filter::IndicesOf(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
@@ -495,6 +515,11 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::AsciiDown
+        | Filter::AsciiUp
+        | Filter::Explode
+        | Filter::Implode
+        | Filter::Utf8ByteLength
         | Filter::Add
         | Filter::ToEntries
         | Filter::FromEntries
@@ -547,6 +572,11 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Join(inner)
         | Filter::LTrim(inner)
         | Filter::RTrim(inner)
+        | Filter::StartsWith(inner)
+        | Filter::EndsWith(inner)
+        | Filter::IndexOf(inner)
+        | Filter::RIndexOf(inner)
+        | Filter::IndicesOf(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
@@ -719,13 +749,14 @@ fn unbox(args: Vec<Box<Filter>>) -> Vec<Filter> {
 fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
         "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "tojson"
+        | "ascii_downcase" | "ascii_upcase" | "explode" | "implode" | "utf8bytelength"
         | "todate" | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" | "add"
         | "to_entries" | "from_entries" | "input" | "inputs" | "input_filename" | "env"
         | "sort" | "unique" | "min" | "max" => arity == 0,
         "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
-        "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "strftime"
-        | "strflocaltime" | "strptime" | "path" | "getpath" | "delpaths" | "del" | "repeat"
-        | "walk" | "with_entries" => arity == 1,
+        "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "startswith" | "endswith"
+        | "index" | "rindex" | "indices" | "strftime" | "strflocaltime" | "strptime" | "path"
+        | "getpath" | "delpaths" | "del" | "repeat" | "walk" | "with_entries" => arity == 1,
         "paths" | "first" | "last" | "error" => arity <= 1,
         "recurse" => arity <= 2,
         "nth" => arity == 1 || arity == 2,
@@ -807,6 +838,16 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "join" => Filter::Join(args.next().expect("arg")),
         "ltrimstr" => Filter::LTrim(args.next().expect("arg")),
         "rtrimstr" => Filter::RTrim(args.next().expect("arg")),
+        "ascii_downcase" => Filter::AsciiDown,
+        "ascii_upcase" => Filter::AsciiUp,
+        "explode" => Filter::Explode,
+        "implode" => Filter::Implode,
+        "utf8bytelength" => Filter::Utf8ByteLength,
+        "startswith" => Filter::StartsWith(args.next().expect("arg")),
+        "endswith" => Filter::EndsWith(args.next().expect("arg")),
+        "index" => Filter::IndexOf(args.next().expect("arg")),
+        "rindex" => Filter::RIndexOf(args.next().expect("arg")),
+        "indices" => Filter::IndicesOf(args.next().expect("arg")),
         "strftime" => Filter::StrfTime(args.next().expect("arg")),
         "strflocaltime" => Filter::StrfLocalTime(args.next().expect("arg")),
         "strptime" => Filter::StrpTime(args.next().expect("arg")),
@@ -2697,6 +2738,11 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::ToNumber
         | Filter::ToString
         | Filter::ToJson
+        | Filter::AsciiDown
+        | Filter::AsciiUp
+        | Filter::Explode
+        | Filter::Implode
+        | Filter::Utf8ByteLength
         | Filter::Add
         | Filter::ToEntries
         | Filter::FromEntries
@@ -2706,6 +2752,11 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Join(_)
         | Filter::LTrim(_)
         | Filter::RTrim(_)
+        | Filter::StartsWith(_)
+        | Filter::EndsWith(_)
+        | Filter::IndexOf(_)
+        | Filter::RIndexOf(_)
+        | Filter::IndicesOf(_)
         | Filter::ToDate
         | Filter::FromDate
         | Filter::GmTime

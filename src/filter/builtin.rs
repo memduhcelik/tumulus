@@ -547,3 +547,243 @@ pub(super) fn trim_once(input: &Value, affix: &Value, left: bool) -> Value {
     };
     Value::String(trimmed.unwrap_or(text).to_string())
 }
+
+/// Which occurrence `index`, `rindex`, or `indices` keeps.
+pub(super) enum Find {
+    Index,
+    RIndex,
+    Indices,
+}
+
+/// Only ASCII letters move. Anything else fails the way `explode` fails.
+pub(super) fn eval_ascii_case(input: &Value, up: bool) -> Result<Vec<Value>, Failure> {
+    let Value::String(text) = input else {
+        return Err(fail("explode input must be a string".to_string()));
+    };
+    let mapped: String = text
+        .chars()
+        .map(|ch| {
+            if up {
+                ch.to_ascii_uppercase()
+            } else {
+                ch.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    Ok(vec![Value::String(mapped)])
+}
+
+pub(super) fn eval_explode(input: &Value) -> Result<Vec<Value>, Failure> {
+    let Value::String(text) = input else {
+        return Err(fail("explode input must be a string".to_string()));
+    };
+    let points = text
+        .chars()
+        .map(|ch| Value::Number((ch as u32).to_string()))
+        .collect();
+    Ok(vec![Value::Array(points)])
+}
+
+pub(super) fn eval_implode(input: &Value) -> Result<Vec<Value>, Failure> {
+    let Value::Array(items) = input else {
+        return Err(fail("implode input must be an array".to_string()));
+    };
+    let mut text = String::new();
+    for item in items {
+        text.push(implode_point(item)?);
+    }
+    Ok(vec![Value::String(text)])
+}
+
+fn implode_point(item: &Value) -> Result<char, Failure> {
+    let Value::Number(raw) = item else {
+        return Err(fail(format!(
+            "{} ({}) can't be imploded, unicode codepoint needs to be numeric",
+            item.type_name(),
+            shown(item)
+        )));
+    };
+    let number = number::f64_of(raw);
+    if number.is_nan() {
+        return Err(fail(format!(
+            "number ({}) can't be imploded, unicode codepoint needs to be numeric",
+            shown(item)
+        )));
+    }
+    Ok(codepoint(number))
+}
+
+/// Truncate toward zero. Out of range and UTF-16 surrogates become U+FFFD.
+fn codepoint(number: f64) -> char {
+    if !number.is_finite() {
+        return '\u{FFFD}';
+    }
+    let truncated = number.trunc();
+    if truncated < 0.0 || truncated > f64::from(0x10_FFFF) {
+        return '\u{FFFD}';
+    }
+    char::from_u32(truncated as u32).unwrap_or('\u{FFFD}')
+}
+
+pub(super) fn eval_utf8_byte_length(input: &Value) -> Result<Vec<Value>, Failure> {
+    let Value::String(text) = input else {
+        return Err(fail(format!(
+            "{} ({}) only strings have UTF-8 byte length",
+            input.type_name(),
+            shown(input)
+        )));
+    };
+    Ok(vec![Value::Number(text.len().to_string())])
+}
+
+/// `end` chooses `endswith`. Both values have to be strings.
+pub(super) fn eval_affix(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    end: bool,
+) -> Result<Vec<Value>, Failure> {
+    let (needles, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for needle in &needles {
+        match affix(input, needle, end) {
+            Ok(flag) => out.push(Value::Bool(flag)),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+fn affix(input: &Value, needle: &Value, end: bool) -> Result<bool, String> {
+    let name = if end { "endswith" } else { "startswith" };
+    let (Value::String(text), Value::String(edge)) = (input, needle) else {
+        return Err(format!("{name}() requires string inputs"));
+    };
+    Ok(if end {
+        text.ends_with(edge.as_str())
+    } else {
+        text.starts_with(edge.as_str())
+    })
+}
+
+pub(super) fn eval_find(
+    arg: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    kind: Find,
+) -> Result<Vec<Value>, Failure> {
+    let (needles, err) = parts(eval_in(arg, input, env));
+    let mut out = Vec::new();
+    for needle in &needles {
+        match locate(input, needle) {
+            Ok(found) => match kind {
+                Find::Indices => out.extend(found),
+                Find::Index => out.extend(pick_first(&found)?),
+                Find::RIndex => out.extend(pick_last(&found)?),
+            },
+            Err(failure) => return Err(with_partial(out, failure)),
+        }
+    }
+    finish(out, err)
+}
+
+/// Positions in a string or array, or the values of `.[needle]` otherwise.
+fn locate(input: &Value, needle: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Array(items) => Ok(vec![positions(array_hits(items, needle))]),
+        Value::String(text) => match needle {
+            Value::String(edge) => Ok(vec![positions(byte_hits(text, edge))]),
+            _ => at_key(input, needle),
+        },
+        _ => at_key(input, needle),
+    }
+}
+
+fn positions(hits: Vec<usize>) -> Value {
+    Value::Array(
+        hits.into_iter()
+            .map(|hit| Value::Number(hit.to_string()))
+            .collect(),
+    )
+}
+
+/// `indices` yields these values. `index` keeps `.[0]` of each. `rindex`
+/// keeps `.[-1:][0]` of each.
+fn pick_first(values: &[Value]) -> Result<Vec<Value>, Failure> {
+    let mut out = Vec::new();
+    for value in values {
+        out.extend(index_number(value, &ArrayIndex::At(0))?);
+    }
+    Ok(out)
+}
+
+fn pick_last(values: &[Value]) -> Result<Vec<Value>, Failure> {
+    let mut out = Vec::new();
+    for value in values {
+        let sliced = slice(value, Some("-1"), None)?;
+        for piece in sliced {
+            out.extend(index_number(&piece, &ArrayIndex::At(0))?);
+        }
+    }
+    Ok(out)
+}
+
+/// Object keys keep the last copy, which is what `.[name]` does in jq.
+fn at_key(input: &Value, key: &Value) -> Result<Vec<Value>, Failure> {
+    if let (Value::Object(items), Value::String(name)) = (input, key) {
+        let found = items
+            .iter()
+            .rev()
+            .find(|(item, _)| item == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or(Value::Null);
+        return Ok(vec![found]);
+    }
+    index_by(input, key)
+}
+
+fn array_hits(items: &[Value], needle: &Value) -> Vec<usize> {
+    let Value::Array(seq) = needle else {
+        return items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| same(item, needle))
+            .map(|(index, _)| index)
+            .collect();
+    };
+    if seq.is_empty() || seq.len() > items.len() {
+        return Vec::new();
+    }
+    let last = items.len() - seq.len();
+    let mut hits = Vec::new();
+    for index in 0..=last {
+        if items[index..index + seq.len()]
+            .iter()
+            .zip(seq.iter())
+            .all(|(item, want)| same(item, want))
+        {
+            hits.push(index);
+        }
+    }
+    hits
+}
+
+fn byte_hits(text: &str, needle: &str) -> Vec<usize> {
+    let hay = text.as_bytes();
+    let want = needle.as_bytes();
+    if want.is_empty() || want.len() > hay.len() {
+        return Vec::new();
+    }
+    let last = hay.len() - want.len();
+    let mut hits = Vec::new();
+    for index in 0..=last {
+        if &hay[index..index + want.len()] == want {
+            hits.push(index);
+        }
+    }
+    hits
+}
+
+fn same(left: &Value, right: &Value) -> bool {
+    cmp_value(left, right) == 0
+}
