@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`input` and `inputs` read a long file without counting its lines again for every value. `-R` does the same for raw lines. The values, the messages, and the exit status are unchanged.
+
 `split(sep)` splits a string on a string. An empty separator splits it into Unicode code points, and an empty string becomes `[]`. The input and the separator have to be strings, or the error is `split input and separator must be strings`. `fromjson` reads one JSON value from a string. `nan` and `NaN` are `nan`, in any letter case, with an optional leading sign. On macOS, digits may follow `nan`, so `nan1234` is `nan`. On Linux, only zeros may follow, so `nan0` is `nan` and `nan1234` fails with `Invalid numeric literal`. `Infinity`, `Inf`, and `infinity` are infinite, with an optional leading sign. A value that is not a string fails with `only strings can be parsed`. A bad string fails with jq's parse message and `(while parsing '...')`.
 
 `contains(value)` tests a substring, an array subset, or an object subset. Numbers use `==`. The same boolean and `null` match. A different type, or the other boolean, fails with `cannot have their containment checked`. Inside an array or object that mismatch is false. `inside(value)` asks whether `value` contains the input.

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self};
 
-use crate::parse::{scan_input, stream_line};
+use crate::parse::{scan_input, stream_line, LineCursor};
 use crate::value::Value;
 use crate::Error;
 
@@ -151,6 +151,8 @@ struct Chunk {
     raw: Vec<u8>,
     /// Bytes skipped at the start of `raw` before they were parsed.
     bom: usize,
+    /// Newlines already counted in `raw`. Later values continue from here.
+    lines: LineCursor,
 }
 
 struct Item {
@@ -329,59 +331,34 @@ impl Session {
 
     fn pull_raw(&mut self) -> Result<Pulled, String> {
         let mut pending = Vec::new();
-        let mut name = String::new();
         loop {
-            match self.next_byte()? {
-                Some((byte, at_name)) => {
-                    name = at_name;
-                    if byte == b'\n' {
-                        let line = self.line_through(self.raw_at);
-                        let text = decode(&pending);
-                        self.note(&name, line);
-                        return Ok(Pulled::Value(Value::String(text)));
-                    }
-                    pending.push(byte);
-                }
-                None => {
+            if self.raw_at >= self.buf.len() {
+                if self.append()? == More::Eof {
                     if pending.is_empty() {
                         return Ok(Pulled::End);
                     }
                     let line = self.cur.as_ref().map(|cur| cur.line).unwrap_or(0);
-                    if name.is_empty() {
-                        name = self
-                            .cur
-                            .as_ref()
-                            .map(|cur| cur.name.clone())
-                            .unwrap_or_else(|| "<stdin>".to_string());
-                    }
+                    let name = self.name_at(self.raw_at);
                     self.note(&name, line);
                     return Ok(Pulled::Value(Value::String(decode(&pending))));
                 }
+                continue;
             }
+            let cut = self.buf[self.raw_at..]
+                .iter()
+                .position(|byte| *byte == b'\n');
+            let Some(cut) = cut else {
+                pending.extend_from_slice(&self.buf[self.raw_at..]);
+                self.raw_at = self.buf.len();
+                continue;
+            };
+            pending.extend_from_slice(&self.buf[self.raw_at..self.raw_at + cut]);
+            self.raw_at += cut + 1;
+            let (name, line) = self.place(self.raw_at, false);
+            let text = decode(&pending);
+            self.note(&name, line);
+            return Ok(Pulled::Value(Value::String(text)));
         }
-    }
-
-    fn next_byte(&mut self) -> Result<Option<(u8, String)>, String> {
-        loop {
-            if self.raw_at < self.buf.len() {
-                let byte = self.buf[self.raw_at];
-                self.raw_at += 1;
-                let name = self.place(self.raw_at, false).0;
-                return Ok(Some((byte, name)));
-            }
-            if self.append()? == More::Eof {
-                return Ok(None);
-            }
-        }
-    }
-
-    /// Newlines in the current file up to `raw_at`, which has just moved past one.
-    fn line_through(&self, raw_at: usize) -> usize {
-        let Some(chunk) = self.chunk_at(raw_at) else {
-            return 0;
-        };
-        let offset = chunk.bom + raw_at.saturating_sub(chunk.parse_start);
-        stream_line(&chunk.raw, offset, false)
     }
 
     fn pull_slurp(&mut self, from_input: bool) -> Result<Pulled, String> {
@@ -453,6 +430,7 @@ impl Session {
                         parse_start,
                         raw: bytes,
                         bom,
+                        lines: LineCursor::default(),
                     });
                     return Ok(More::Added);
                 }
@@ -507,21 +485,44 @@ impl Session {
         });
     }
 
-    fn place(&self, end: usize, atom: bool) -> (String, usize) {
-        let Some(chunk) = self.chunk_at(end) else {
+    fn place(&mut self, end: usize, atom: bool) -> (String, usize) {
+        let Some(index) = self.chunk_index(end) else {
             return ("<stdin>".to_string(), 0);
         };
-        let offset = end.saturating_sub(chunk.parse_start);
-        let raw_end = chunk.bom + offset;
-        (chunk.name.clone(), stream_line(&chunk.raw, raw_end, atom))
+        let chunk = &mut self.chunks[index];
+        let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
+        let line = chunk.lines.line_at(&chunk.raw, raw_end, atom);
+        (chunk.name.clone(), line)
     }
 
-    fn chunk_at(&self, end: usize) -> Option<&Chunk> {
-        self.chunks
+    fn name_at(&self, end: usize) -> String {
+        let name = match self.chunk_index(end) {
+            Some(index) => self.chunks[index].name.clone(),
+            None => "<stdin>".to_string(),
+        };
+        // An empty path leaves this byte with no name. Use the file this
+        // read already recorded.
+        if !name.is_empty() {
+            return name;
+        }
+        self.cur
+            .as_ref()
+            .map(|cur| cur.name.clone())
+            .unwrap_or_else(|| "<stdin>".to_string())
+    }
+
+    fn chunk_index(&self, end: usize) -> Option<usize> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        let found = self
+            .chunks
             .iter()
+            .enumerate()
             .rev()
-            .find(|chunk| end > chunk.parse_start && end <= chunk.parse_start + chunk.stored())
-            .or_else(|| self.chunks.last())
+            .find(|(_, chunk)| end > chunk.parse_start && end <= chunk.parse_start + chunk.stored())
+            .map(|(index, _)| index);
+        Some(found.unwrap_or(self.chunks.len() - 1))
     }
 
     fn note(&mut self, name: &str, line: usize) {

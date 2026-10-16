@@ -211,22 +211,44 @@ fn skip_rest_of_line(text: &[u8], mut index: usize, mut line: usize) -> (usize, 
 /// until that next byte has been read. One read is at most 4095 bytes and
 /// stops at a newline, so a newline later in that chunk still counts.
 pub fn stream_line(text: &[u8], end: usize, atom: bool) -> usize {
-    let need = if atom && end < text.len() {
-        end
-    } else {
-        end.saturating_sub(1)
-    };
-    let mut line = 0usize;
-    let mut filled = 0usize;
-    while filled <= need && filled < text.len() {
-        let next = read_chunk(text, filled);
-        line += newline_count(&text[filled..next]);
-        if next == filled {
-            break;
+    LineCursor::default().line_at(text, end, atom)
+}
+
+/// Running total of newlines jq's reader has consumed.
+///
+/// A later request continues from the last read when the byte it needs is
+/// not before that read. A request that finishes earlier starts over, so a
+/// newline that belongs only to a later read is not kept.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LineCursor {
+    filled: usize,
+    line: usize,
+    /// Start of the last read included in `line`.
+    last_start: usize,
+}
+
+impl LineCursor {
+    pub(crate) fn line_at(&mut self, text: &[u8], end: usize, atom: bool) -> usize {
+        let need = if atom && end < text.len() {
+            end
+        } else {
+            end.saturating_sub(1)
+        };
+        if self.filled > 0 && need < self.last_start {
+            *self = Self::default();
         }
-        filled = next;
+        while self.filled <= need && self.filled < text.len() {
+            let start = self.filled;
+            let next = read_chunk(text, start);
+            self.line += newline_count(&text[start..next]);
+            if next == start {
+                break;
+            }
+            self.last_start = start;
+            self.filled = next;
+        }
+        self.line
     }
-    line
 }
 
 /// Decode one JSON string token, or jq's message for a bad escape.
@@ -246,26 +268,12 @@ pub(crate) fn decode_string_token(text: &str) -> Result<String, String> {
 const FGETS_MAX: usize = 4095;
 
 fn locate(text: &[u8], bom: usize, parsed: Vec<(Value, usize)>) -> Vec<LocatedValue> {
-    let mut line = 0usize;
-    let mut filled = 0usize;
+    let mut cursor = LineCursor::default();
     let mut out = Vec::with_capacity(parsed.len());
     for (value, end) in parsed {
-        let end = end + bom;
-        // `end` is the next byte. Atoms have not consumed it; other
-        // values finish on the byte just before it.
-        let need = if is_atom(&value) && end < text.len() {
-            end
-        } else {
-            end.saturating_sub(1)
-        };
-        while filled <= need && filled < text.len() {
-            let next = read_chunk(text, filled);
-            line += newline_count(&text[filled..next]);
-            if next == filled {
-                break;
-            }
-            filled = next;
-        }
+        // `end` is the next byte in the text that was parsed. The reader
+        // also counts the leading BOM, which that text skipped.
+        let line = cursor.line_at(text, end + bom, is_atom(&value));
         out.push(LocatedValue { value, line });
     }
     out
@@ -297,4 +305,75 @@ fn split_bom(bytes: &[u8]) -> (usize, &[u8]) {
 
 fn is_atom(value: &Value) -> bool {
     matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stream_line, LineCursor};
+
+    fn bytes(len: usize, newline_every: usize) -> Vec<u8> {
+        let mut text = vec![b'a'; len];
+        if newline_every > 0 {
+            let mut at = newline_every - 1;
+            while at < text.len() {
+                text[at] = b'\n';
+                at += newline_every;
+            }
+        }
+        text
+    }
+
+    fn ends_for(len: usize) -> Vec<usize> {
+        let step = (len / 40).max(1);
+        let mut ends: Vec<usize> = (0..=len).step_by(step).collect();
+        for mark in [0, 1, 4094, 4095, 4096, 8190, 8191, len] {
+            if mark <= len {
+                ends.push(mark);
+            }
+        }
+        ends.sort_unstable();
+        ends.dedup();
+        ends
+    }
+
+    #[test]
+    fn cursor_matches_a_fresh_count() {
+        let mut texts = vec![
+            bytes(0, 1),
+            bytes(1, 1),
+            bytes(10, 1),
+            bytes(4095, 10),
+            bytes(4096, 4095),
+            bytes(8190, 100),
+            bytes(9000, 4095),
+            bytes(12000, 3),
+            b"\n\n\n".to_vec(),
+            b"no-newline".to_vec(),
+            vec![0xEF, 0xBB, 0xBF, b'1', b'\n'],
+        ];
+        // A newline on the first byte of a later read, then a request that
+        // stops before that read starts.
+        let mut boundary = vec![b'x'; 4095];
+        boundary.push(b'\n');
+        boundary.extend(std::iter::repeat(b'y').take(20));
+        texts.push(boundary);
+
+        for text in &texts {
+            for atom in [false, true] {
+                let mut cursor = LineCursor::default();
+                for end in ends_for(text.len()) {
+                    let got = cursor.line_at(text, end, atom);
+                    let fresh = stream_line(text, end, atom);
+                    assert_eq!(got, fresh, "end {end} atom {atom} len {}", text.len());
+                    assert_eq!(cursor.line_at(text, end, atom), fresh);
+                }
+                if text.len() > 4096 {
+                    let back = cursor.line_at(text, 10, !atom);
+                    assert_eq!(back, stream_line(text, 10, !atom));
+                    let again = cursor.line_at(text, text.len(), atom);
+                    assert_eq!(again, stream_line(text, text.len(), atom));
+                }
+            }
+        }
+    }
 }
