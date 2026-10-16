@@ -3308,6 +3308,12 @@ pub(super) fn eval_paths(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    // `paths` with no filter is every path `..` reaches except the value
+    // itself. A direct walk records those paths. The filtered form still
+    // goes through `path`, because the condition can fail part way.
+    if pred.is_none() {
+        return Ok(gather_paths(input));
+    }
     let walked = walk_paths(&Filter::Recurse, input, env);
     let mut out = Vec::new();
     for steps in walked.steps {
@@ -3449,6 +3455,68 @@ fn path_steps(root: &Value, out: POut) -> Result<Vec<Step>, Value> {
         }
     }
     Err(out.value)
+}
+
+/// Paths of every value inside `input`, in the order `..` visits them.
+/// The path of `input` itself is left out.
+fn gather_paths(input: &Value) -> Vec<Value> {
+    struct Frame {
+        value: Value,
+        next: usize,
+        /// Length of `path` before this value's own component was pushed.
+        base: usize,
+        seen: bool,
+        emit: bool,
+    }
+    let mut out = Vec::new();
+    let mut path: Vec<Value> = Vec::new();
+    let mut stack = vec![Frame {
+        value: input.clone(),
+        next: 0,
+        base: 0,
+        seen: false,
+        emit: false,
+    }];
+    while let Some(frame) = stack.last_mut() {
+        if !frame.seen {
+            frame.seen = true;
+            if frame.emit {
+                out.push(Value::array(path.clone()));
+            }
+        }
+        let next = frame.next;
+        if let Some((child, component)) = path_child(&frame.value, next) {
+            frame.next = next + 1;
+            let base = path.len();
+            path.push(component);
+            stack.push(Frame {
+                value: child,
+                next: 0,
+                base,
+                seen: false,
+                emit: true,
+            });
+        } else {
+            path.truncate(frame.base);
+            stack.pop();
+        }
+    }
+    out
+}
+
+/// The child at `index`, and the path component that names it.
+fn path_child(value: &Value, index: usize) -> Option<(Value, Value)> {
+    match value {
+        Value::Array(items) => {
+            let child = items.get(index)?.clone();
+            Some((child, Value::Number(index.to_string())))
+        }
+        Value::Object(items) => {
+            let (key, child) = items.get(index)?;
+            Some((child.clone(), Value::String(key.clone())))
+        }
+        _ => None,
+    }
 }
 
 fn render_steps(steps: &[Step]) -> Value {

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+`paths` records each path while it walks the value. Comparing two numbers uses the digits already in the text. `sort_by` and `[paths]` keep the same values.
+
 ## 0.8.0
 
 Released on 2026-10-17.

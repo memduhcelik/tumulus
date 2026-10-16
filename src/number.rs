@@ -191,39 +191,37 @@ fn cmp_real(left: Real, right: Real) -> i8 {
 }
 
 fn cmp_decimal(left: &str, right: &str) -> i8 {
-    let Some((left_neg, left_digits, left_scale)) = decimal_parts(left) else {
+    let Some(left_num) = scan_decimal(left) else {
         return cmp_real(real(left), real(right));
     };
-    let Some((right_neg, right_digits, right_scale)) = decimal_parts(right) else {
+    let Some(right_num) = scan_decimal(right) else {
         return cmp_real(real(left), real(right));
     };
-    let left_mag = canonical_mag(left_digits, left_scale);
-    let right_mag = canonical_mag(right_digits, right_scale);
-    match (&left_mag, &right_mag) {
+    match (left_num.sig(), right_num.sig()) {
         (None, None) => 0,
         (None, Some(_)) => {
-            if right_neg {
+            if right_num.negative {
                 1
             } else {
                 -1
             }
         }
         (Some(_), None) => {
-            if left_neg {
+            if left_num.negative {
                 -1
             } else {
                 1
             }
         }
-        (Some((ld, ls)), Some((rd, rs))) => {
-            let mag = cmp_mag(ld, *ls, rd, *rs);
-            if left_neg == right_neg {
-                if left_neg {
+        (Some(left_sig), Some(right_sig)) => {
+            let mag = cmp_sig(&left_num, left_sig, &right_num, right_sig);
+            if left_num.negative == right_num.negative {
+                if left_num.negative {
                     -mag
                 } else {
                     mag
                 }
-            } else if left_neg {
+            } else if left_num.negative {
                 -1
             } else {
                 1
@@ -232,8 +230,186 @@ fn cmp_decimal(left: &str, right: &str) -> i8 {
     }
 }
 
+/// A literal split into the slices `decimal_parts` would copy.
+struct Scanned<'a> {
+    negative: bool,
+    int_digits: &'a [u8],
+    frac_digits: &'a [u8],
+    /// `None` is a scale that does not fit in `i32`.
+    scale: Option<i32>,
+    /// Huge positive exponent: magnitude `1 × 10^10000`.
+    huge: bool,
+}
+
+/// First and last significant digit, as indexes into integer-then-fraction.
+#[derive(Clone, Copy)]
+struct Sig {
+    first: usize,
+    last: usize,
+}
+
+impl Scanned<'_> {
+    fn total(&self) -> usize {
+        self.int_digits.len() + self.frac_digits.len()
+    }
+
+    fn digit(&self, index: usize) -> u8 {
+        if index < self.int_digits.len() {
+            self.int_digits[index]
+        } else {
+            self.frac_digits[index - self.int_digits.len()]
+        }
+    }
+
+    /// `None` is zero, including a coefficient of only zeros and a huge
+    /// negative exponent.
+    fn sig(&self) -> Option<Sig> {
+        if self.huge {
+            return Some(Sig { first: 0, last: 0 });
+        }
+        if self.scale.is_none() {
+            return None;
+        }
+        let total = self.total();
+        let mut first = 0;
+        while first < total && self.digit(first) == b'0' {
+            first += 1;
+        }
+        if first == total {
+            return None;
+        }
+        let mut last = total - 1;
+        while last > first && self.digit(last) == b'0' {
+            last -= 1;
+        }
+        Some(Sig { first, last })
+    }
+
+    /// Power of ten of the first significant digit.
+    fn leading_exp(&self, sig: Sig) -> i64 {
+        if self.huge {
+            return 10_000;
+        }
+        let scale = i64::from(self.scale.unwrap_or(0));
+        scale + self.total() as i64 - sig.first as i64 - 1
+    }
+}
+
+fn cmp_sig(left: &Scanned<'_>, left_sig: Sig, right: &Scanned<'_>, right_sig: Sig) -> i8 {
+    let left_exp = left.leading_exp(left_sig);
+    let right_exp = right.leading_exp(right_sig);
+    if left_exp != right_exp {
+        return if left_exp < right_exp { -1 } else { 1 };
+    }
+    let left_len = left_sig.last - left_sig.first + 1;
+    let right_len = right_sig.last - right_sig.first + 1;
+    let shared = left_len.min(right_len);
+    for offset in 0..shared {
+        let a = left.digit(left_sig.first + offset);
+        let b = right.digit(right_sig.first + offset);
+        if a != b {
+            return if a < b { -1 } else { 1 };
+        }
+    }
+    ord_len(left_len, right_len)
+}
+
+fn ord_len(left: usize, right: usize) -> i8 {
+    match left.cmp(&right) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// The same split as `decimal_parts`, without copying the digits.
+fn scan_decimal(literal: &str) -> Option<Scanned<'_>> {
+    let bytes = literal.as_bytes();
+    let mut index = 0;
+    let negative = if bytes.first() == Some(&b'-') {
+        index = 1;
+        true
+    } else {
+        false
+    };
+    let int_at = index;
+    let (int_end, frac_at, frac_end) = if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let frac_at = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        (int_at, frac_at, index)
+    } else {
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let int_end = index;
+        if bytes.get(index) == Some(&b'.') {
+            index += 1;
+            let frac_at = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            (int_end, frac_at, index)
+        } else {
+            (int_end, index, index)
+        }
+    };
+    let fraction = frac_end - frac_at;
+    let exponent = if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
+        index += 1;
+        let exp_negative = if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-')
+        {
+            let neg = bytes[index] == b'-';
+            index += 1;
+            neg
+        } else {
+            false
+        };
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let exp_digits = &literal[start..index];
+        let trimmed = exp_digits.trim_start_matches('0');
+        if trimmed.len() > 9 {
+            return Some(Scanned {
+                negative,
+                int_digits: if exp_negative { &[] } else { b"1" },
+                frac_digits: &[],
+                scale: if exp_negative { None } else { Some(10_000) },
+                huge: !exp_negative,
+            });
+        }
+        let value: i32 = if trimmed.is_empty() {
+            0
+        } else {
+            trimmed.parse().unwrap_or(0)
+        };
+        if exp_negative {
+            -value
+        } else {
+            value
+        }
+    } else {
+        0
+    };
+    let Some(scale) = exponent.checked_sub(fraction as i32) else {
+        return None;
+    };
+    Some(Scanned {
+        negative,
+        int_digits: &bytes[int_at..int_end],
+        frac_digits: &bytes[frac_at..frac_end],
+        scale: Some(scale),
+        huge: false,
+    })
+}
+
 /// Digits without leading or trailing zeros, and the power of ten of the
 /// last digit. `None` is zero.
+#[cfg(test)]
 fn canonical_mag(digits: String, scale: i32) -> Option<(String, i64)> {
     let lead = digits.chars().take_while(|ch| *ch == '0').count();
     if lead == digits.len() {
@@ -252,6 +428,7 @@ fn canonical_mag(digits: String, scale: i32) -> Option<(String, i64)> {
     Some((digits, scale))
 }
 
+#[cfg(test)]
 fn cmp_mag(left: &str, left_scale: i64, right: &str, right_scale: i64) -> i8 {
     let left_exp = left_scale + left.len() as i64 - 1;
     let right_exp = right_scale + right.len() as i64 - 1;
@@ -857,4 +1034,111 @@ fn fixed(sign: &str, digits: &str, lsd: i128) -> String {
     out.push('.');
     out.push_str(&digits[left..]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_mag, cmp_decimal, cmp_real, decimal_parts, real};
+
+    fn cmp_alloc(left: &str, right: &str) -> i8 {
+        let Some((left_neg, left_digits, left_scale)) = decimal_parts(left) else {
+            return cmp_real(real(left), real(right));
+        };
+        let Some((right_neg, right_digits, right_scale)) = decimal_parts(right) else {
+            return cmp_real(real(left), real(right));
+        };
+        let left_mag = canonical_mag(left_digits, left_scale);
+        let right_mag = canonical_mag(right_digits, right_scale);
+        match (left_mag, right_mag) {
+            (None, None) => 0,
+            (None, Some(_)) => {
+                if right_neg {
+                    1
+                } else {
+                    -1
+                }
+            }
+            (Some(_), None) => {
+                if left_neg {
+                    -1
+                } else {
+                    1
+                }
+            }
+            (Some((ld, ls)), Some((rd, rs))) => {
+                let mag = super::cmp_mag(&ld, ls, &rd, rs);
+                if left_neg == right_neg {
+                    if left_neg {
+                        -mag
+                    } else {
+                        mag
+                    }
+                } else if left_neg {
+                    -1
+                } else {
+                    1
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_scan_matches_the_copying_compare() {
+        let samples = [
+            "0",
+            "0.0",
+            "-0",
+            "0.00",
+            "1",
+            "1.0",
+            "1.00",
+            "1.50",
+            "01.20",
+            "4.404",
+            "12.5",
+            ".5",
+            "0.04",
+            "0.040",
+            "10",
+            "10.0",
+            "100",
+            "-4.5",
+            "-0.5",
+            "1e2",
+            "1e+2",
+            "1E-1",
+            "1e10",
+            "1e-10",
+            "2.5e1",
+            "25",
+            "250e-1",
+            "1e",
+            "e10",
+            "99.99",
+            "100.00",
+            "-1.5e2",
+            "-150",
+            "1e9",
+            "1e10",
+            "999999999",
+            "1e-9",
+            "0001",
+            "1.2.3",
+            "1e000",
+            "1e+0008",
+            "-0.0",
+            "1e10000000000",
+            "1e-10000000000",
+            "-2e10000000000",
+        ];
+        for left in samples {
+            for right in samples {
+                assert_eq!(
+                    cmp_decimal(left, right),
+                    cmp_alloc(left, right),
+                    "{left} compared with {right}"
+                );
+            }
+        }
+    }
 }

@@ -269,7 +269,49 @@ enum Cmp<'a> {
 /// Element order is the same as a recursive walk. The stack is on the heap
 /// so a nest of tens of thousands of arrays does not overflow.
 pub(super) fn cmp_value(left: &Value, right: &Value) -> i8 {
-    let mut stack = vec![Cmp::Pair(left, right)];
+    if let Some(cmp) = cmp_shallow(left, right) {
+        return cmp;
+    }
+    cmp_deep(left, right)
+}
+
+/// Numbers, strings, and arrays of those. Nested arrays and objects go
+/// through `cmp_deep`, which keeps its stack on the heap.
+fn cmp_shallow(left: &Value, right: &Value) -> Option<i8> {
+    let left_rank = type_rank(left);
+    let right_rank = type_rank(right);
+    if left_rank != right_rank {
+        return Some(if left_rank < right_rank { -1 } else { 1 });
+    }
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => Some(cmp_number(a, b)),
+        (Value::String(a), Value::String(b)) => Some(ord_i8(a.cmp(b))),
+        (Value::Array(left), Value::Array(right)) => cmp_shallow_arrays(left, right),
+        (Value::Object(_), Value::Object(_)) => None,
+        _ => Some(0),
+    }
+}
+
+fn cmp_shallow_arrays(left: &[Value], right: &[Value]) -> Option<i8> {
+    let shared = left.len().min(right.len());
+    for index in 0..shared {
+        if matches!(
+            (&left[index], &right[index]),
+            (Value::Array(_) | Value::Object(_), _) | (_, Value::Array(_) | Value::Object(_))
+        ) {
+            return None;
+        }
+        let cmp = cmp_shallow(&left[index], &right[index])?;
+        if cmp != 0 {
+            return Some(cmp);
+        }
+    }
+    Some(ord_i8(left.len().cmp(&right.len())))
+}
+
+fn cmp_deep(left: &Value, right: &Value) -> i8 {
+    let mut stack = Vec::with_capacity(8);
+    stack.push(Cmp::Pair(left, right));
     while let Some(job) = stack.pop() {
         match job {
             Cmp::Pair(left, right) => {
