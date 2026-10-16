@@ -2187,7 +2187,7 @@ impl<'a> Parser<'a> {
         }
         self.skip_ws();
         if self.eat(']') {
-            return Ok(Filter::Literal(Value::Array(Vec::new())));
+            return Ok(Filter::Literal(Value::array(Vec::new())));
         }
         let inner = self.parse_pipe()?;
         self.skip_ws();
@@ -2195,7 +2195,7 @@ impl<'a> Parser<'a> {
             return Err(ProgramError::Syntax);
         }
         if let Some(items) = const_outputs(&inner) {
-            return Ok(Filter::Literal(Value::Array(items)));
+            return Ok(Filter::Literal(Value::array(items)));
         }
         Ok(Filter::Collect(Box::new(inner)))
     }
@@ -2206,7 +2206,7 @@ impl<'a> Parser<'a> {
         }
         self.skip_ws();
         if self.eat('}') {
-            return Ok(Filter::Literal(Value::Object(Vec::new())));
+            return Ok(Filter::Literal(Value::object(Vec::new())));
         }
         let mut fields = Vec::new();
         loop {
@@ -2594,7 +2594,7 @@ pub(super) fn const_outputs(filter: &Filter) -> Option<Vec<Value>> {
         }
         Filter::Collect(inner) => {
             let items = const_outputs(inner)?;
-            Some(vec![Value::Array(items)])
+            Some(vec![Value::array(items)])
         }
         Filter::Object(fields) => const_object(fields).map(|value| vec![value]),
         Filter::Optional(inner) => const_outputs(inner),
@@ -2716,5 +2716,5 @@ pub(super) fn const_object(fields: &[ObjField]) -> Option<Value> {
         let value = const_one(value)?;
         put(&mut pairs, name, value);
     }
-    Some(Value::Object(pairs))
+    Some(Value::object(pairs))
 }

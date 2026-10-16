@@ -32,9 +32,10 @@ pub(super) fn add_values(left: &Value, right: &Value) -> Result<Value, String> {
             Ok(Value::String(text))
         }
         (Value::Array(a), Value::Array(b)) => {
-            let mut items = a.clone();
+            let mut items = Vec::with_capacity(a.len() + b.len());
+            items.extend(a.iter().cloned());
             items.extend(b.iter().cloned());
-            Ok(Value::Array(items))
+            Ok(Value::array(items))
         }
         (Value::Object(a), Value::Object(b)) => Ok(merge_objects(a, b)),
         _ => Err(binary_type(left, right, "cannot be added")),
@@ -179,14 +180,14 @@ pub(super) fn string_times(text: &str, n: number::Real) -> Option<Value> {
 
 pub(super) fn split_string(text: &str, sep: &str) -> Value {
     if sep.is_empty() {
-        return Value::Array(
+        return Value::array(
             text.chars()
                 .map(|ch| Value::String(ch.to_string()))
                 .collect(),
         );
     }
     if text.is_empty() {
-        return Value::Array(Vec::new());
+        return Value::array(Vec::new());
     }
     let mut parts = Vec::new();
     let mut rest = text;
@@ -195,7 +196,7 @@ pub(super) fn split_string(text: &str, sep: &str) -> Value {
         rest = &rest[at + sep.len()..];
     }
     parts.push(Value::String(rest.to_string()));
-    Value::Array(parts)
+    Value::array(parts)
 }
 
 pub(super) fn array_sub(left: &[Value], right: &[Value]) -> Value {
@@ -205,7 +206,7 @@ pub(super) fn array_sub(left: &[Value], right: &[Value]) -> Value {
             out.push(item.clone());
         }
     }
-    Value::Array(out)
+    Value::array(out)
 }
 
 pub(super) fn merge_objects(left: &[(String, Value)], right: &[(String, Value)]) -> Value {
@@ -213,7 +214,7 @@ pub(super) fn merge_objects(left: &[(String, Value)], right: &[(String, Value)])
     for (key, value) in right {
         put(&mut pairs, key.clone(), value.clone());
     }
-    Value::Object(pairs)
+    Value::object(pairs)
 }
 
 pub(super) fn merge_deep(left: &[(String, Value)], right: &[(String, Value)]) -> Value {
@@ -235,7 +236,7 @@ pub(super) fn merge_deep(left: &[(String, Value)], right: &[(String, Value)]) ->
             pairs.push((key.clone(), right_value.clone()));
         }
     }
-    Value::Object(pairs)
+    Value::object(pairs)
 }
 
 pub(super) fn type_rank(value: &Value) -> u8 {

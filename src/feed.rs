@@ -61,7 +61,7 @@ pub fn environ() -> Value {
 }
 
 pub fn here(line: usize) -> Value {
-    Value::Object(vec![
+    Value::object(vec![
         ("file".to_string(), Value::String("<top-level>".to_string())),
         ("line".to_string(), Value::Number(line.to_string())),
     ])
@@ -421,7 +421,7 @@ impl Session {
         if let Some((name, line)) = self.cur.as_ref().map(|cur| (cur.name.clone(), cur.line)) {
             self.note(&name, line);
         }
-        Ok(Pulled::Value(Value::Array(items)))
+        Ok(Pulled::Value(Value::array(items)))
     }
 
     fn append(&mut self) -> Result<More, String> {
@@ -607,5 +607,5 @@ fn environment() -> Value {
     let fields = std::env::vars()
         .map(|(key, value)| (key, Value::String(value)))
         .collect();
-    Value::Object(fields)
+    Value::object(fields)
 }

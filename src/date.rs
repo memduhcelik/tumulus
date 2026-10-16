@@ -116,7 +116,7 @@ fn clock_array(input: &Value, local: bool, bad_type: &str) -> Result<Value, Stri
     let ts = as_f64(text);
     let tm = broken_down(ts, local)?;
     let year = tm.tm_year.wrapping_add(1900);
-    Ok(Value::Array(vec![
+    Ok(Value::array(vec![
         field(year),
         field(tm.tm_mon),
         field(tm.tm_mday),
@@ -220,7 +220,7 @@ pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, Strin
     if unsafe { *end } != 0 {
         items.push(Value::String(c_str(end)));
     }
-    Ok(Value::Array(items))
+    Ok(Value::array(items))
 }
 
 pub(crate) fn now() -> Value {

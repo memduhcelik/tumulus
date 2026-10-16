@@ -386,7 +386,7 @@ fn apply_slurp(
         run.status = finish_input(missing, true);
         return Ok(());
     }
-    let input = Value::Array(parsed.values.into_iter().map(|item| item.value).collect());
+    let input = Value::array(parsed.values.into_iter().map(|item| item.value).collect());
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
     run.status = finish_input(missing, failed);
     Ok(())
@@ -830,7 +830,7 @@ fn file_binding(flag: &str, name: &str, path: &str) -> Value {
     if let Some(message) = parsed.error {
         jq_die(&format!("jq: Bad JSON in {flag} {name} {path}: {message}"));
     }
-    Value::Array(parsed.values.into_iter().map(|item| item.value).collect())
+    Value::array(parsed.values.into_iter().map(|item| item.value).collect())
 }
 
 fn is_option_cluster(arg: &str) -> bool {
@@ -894,9 +894,9 @@ fn initial_env(
             env.push((name.clone(), value.clone()));
         }
     }
-    let args = Value::Object(vec![
-        ("positional".to_string(), Value::Array(positional.to_vec())),
-        ("named".to_string(), Value::Object(fields)),
+    let args = Value::object(vec![
+        ("positional".to_string(), Value::array(positional.to_vec())),
+        ("named".to_string(), Value::object(fields)),
     ]);
     // The first binding wins. `$ARGS` and `$ENV` sit in front of `--arg`.
     env.insert(0, ("ENV".to_string(), environ.clone()));

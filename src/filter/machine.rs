@@ -1799,7 +1799,7 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             match items {
                 Err(failure) => return Ok(Act::Fail(failure)),
                 Ok(items) if items.is_empty() => {
-                    return hold(machine, index, vec![Value::Array(Vec::new())], None);
+                    return hold(machine, index, vec![Value::array(Vec::new())], None);
                 }
                 Ok(items) => {
                     let inner = match &*machine.stack[index].body {
@@ -1847,7 +1847,7 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 _ => true,
             };
             if empty {
-                return hold(machine, index, vec![Value::Object(Vec::new())], None);
+                return hold(machine, index, vec![Value::object(Vec::new())], None);
             }
             let key = object_key(machine, index);
             nest_arm(machine, index, key, input);
@@ -1950,7 +1950,7 @@ fn finish_collect(machine: &mut Machine, index: usize) -> Result<DoneAct, Failur
     if let Some(failure) = err {
         return Ok(DoneAct::Fail(eval::bare_fail(failure)));
     }
-    queue_out(machine, index, vec![Value::Array(items)], None)
+    queue_out(machine, index, vec![Value::array(items)], None)
 }
 
 fn finish_at_base(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
@@ -2469,7 +2469,7 @@ fn finish_map_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
             Body::Nest(nest) => std::mem::take(&mut nest.buf),
             _ => Vec::new(),
         };
-        return queue_out(machine, index, vec![Value::Array(items)], None);
+        return queue_out(machine, index, vec![Value::array(items)], None);
     }
     let (inner, input) = match &*machine.stack[index].body {
         Body::Nest(nest) => {
@@ -2930,9 +2930,9 @@ fn walk_set_kids(
     }
     if empty {
         let value = if is_object {
-            Value::Object(Vec::new())
+            Value::object(Vec::new())
         } else {
-            Value::Array(Vec::new())
+            Value::array(Vec::new())
         };
         walk_apply(machine, index, value);
         return;
@@ -3050,9 +3050,9 @@ fn walk_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
     let value = match &mut *machine.stack[index].body {
         Body::Walk(walk) => {
             if walk.is_object {
-                Value::Object(std::mem::take(&mut walk.built_obj))
+                Value::object(std::mem::take(&mut walk.built_obj))
             } else {
-                Value::Array(std::mem::take(&mut walk.built_arr))
+                Value::array(std::mem::take(&mut walk.built_arr))
             }
         }
         _ => Value::Null,

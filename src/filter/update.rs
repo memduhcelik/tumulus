@@ -275,7 +275,7 @@ pub(super) fn accelerate_reduce(
                 Ok(true)
             }
             Filter::Literal(Value::Array(items)) => {
-                extend_acc(acc, items.clone(), lookup)?;
+                extend_acc(acc, items.iter().cloned().collect(), lookup)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -304,7 +304,7 @@ pub(super) fn accelerate_reduce(
         // same value as a copy, and a deep nest stays one step per wrap.
         Filter::Collect(inner) if matches!(inner.as_ref(), Filter::Identity) => {
             let inner = std::mem::replace(acc, Value::Null);
-            *acc = Value::Array(vec![inner]);
+            *acc = Value::array(vec![inner]);
             *lookup = None;
             Ok(true)
         }
@@ -392,14 +392,14 @@ fn fill_shell(shell: &Shell, hole: &mut Value) -> Value {
             for item in items {
                 out.push(fill_shell(item, hole));
             }
-            Value::Array(out)
+            Value::array(out)
         }
         Shell::Obj(fields) => {
             let mut pairs = Vec::with_capacity(fields.len());
             for (name, slot) in fields {
                 put(&mut pairs, (*name).to_string(), fill_shell(slot, hole));
             }
-            Value::Object(pairs)
+            Value::object(pairs)
         }
     }
 }
@@ -455,7 +455,7 @@ fn remove_simple(
         Step::Key(key) => match acc {
             Value::Null => Ok(()),
             Value::Object(pairs) => {
-                pairs.retain(|(name, _)| name != key);
+                pairs.make_mut().retain(|(name, _)| name != key);
                 *lookup = None;
                 Ok(())
             }
@@ -470,6 +470,7 @@ fn remove_simple(
             Value::String(_) => Err(fail("Cannot index string with number".to_string())),
             Value::Object(_) => Err(fail("Cannot index object with number".to_string())),
             Value::Array(items) => {
+                let items = items.make_mut();
                 if let Some(position) = resolve_index(*at, items.len()) {
                     if position < items.len() {
                         items.remove(position);
@@ -608,15 +609,15 @@ fn extend_acc(
     lookup: &mut Option<ObjIndex>,
 ) -> Result<(), Failure> {
     if matches!(acc, Value::Null) {
-        *acc = Value::Array(items);
+        *acc = Value::array(items);
         *lookup = None;
         return Ok(());
     }
     if let Value::Array(slot) = acc {
-        slot.extend(items);
+        slot.make_mut().extend(items);
         return Ok(());
     }
-    let right = Value::Array(items);
+    let right = Value::array(items);
     match add_values(acc, &right) {
         Ok(value) => {
             *acc = value;
@@ -806,7 +807,7 @@ fn object_set(
 ) -> Result<(), String> {
     match acc {
         Value::Null => {
-            *acc = Value::Object(vec![(key.to_string(), value)]);
+            *acc = Value::object(vec![(key.to_string(), value)]);
             let ptr = match acc {
                 Value::Object(pairs) => pairs.as_ptr() as usize,
                 _ => 0,
@@ -830,6 +831,7 @@ fn object_set(
     let Value::Object(pairs) = acc else {
         unreachable!("object");
     };
+    let pairs = pairs.make_mut();
     let ptr = pairs.as_ptr() as usize;
     let current = lookup
         .as_ref()
@@ -864,7 +866,7 @@ fn array_set(acc: &mut Value, index: i64, value: Value) -> Result<(), String> {
     }
     match acc {
         Value::Object(_) => return Err("Cannot index object with number".to_string()),
-        Value::Null => *acc = Value::Array(Vec::new()),
+        Value::Null => *acc = Value::array(Vec::new()),
         Value::Array(_) => {}
         other => {
             return Err(format!("Cannot index {} with number", other.type_name()));
@@ -873,6 +875,7 @@ fn array_set(acc: &mut Value, index: i64, value: Value) -> Result<(), String> {
     let Value::Array(items) = acc else {
         unreachable!("array");
     };
+    let items = items.make_mut();
     let Some(position) = resolve_index(index, items.len()) else {
         return Err("Out of bounds negative array index".to_string());
     };
@@ -1667,7 +1670,7 @@ fn near_iter(value: &Value) -> String {
 }
 
 fn shown_slice(start: &Value, end: &Value) -> Value {
-    Value::Object(vec![
+    Value::object(vec![
         ("start".to_string(), render_bound(start)),
         ("end".to_string(), render_bound(end)),
     ])
@@ -2962,7 +2965,9 @@ fn force_object<'a>(edit: &'a mut Edit, key: &str) -> Result<&'a mut Vec<(String
         Edit::Obj(_) => {}
         Edit::Pure(Value::Null) => *edit = Edit::Obj(Vec::new()),
         Edit::Pure(Value::Object(items)) => {
-            let fields = std::mem::take(items)
+            let taken = std::mem::replace(items, crate::value::Share::new(Vec::new()));
+            let fields = taken
+                .unwrap_or_clone()
                 .into_iter()
                 .map(|(name, value)| (name, Edit::Pure(value)))
                 .collect();
@@ -3111,7 +3116,7 @@ fn write_slice(
             new.extend_from_slice(&cur[..from]);
             new.extend(items.iter().cloned());
             new.extend_from_slice(&cur[to..]);
-            *edit = Edit::Pure(Value::Array(new));
+            *edit = Edit::Pure(Value::array(new));
             Ok(())
         }
     }
@@ -3127,10 +3132,8 @@ fn force_array(edit: &mut Edit) -> Result<&mut Arr, String> {
             });
         }
         Edit::Pure(Value::Array(items)) => {
-            let slots = std::mem::take(items)
-                .into_iter()
-                .map(|value| live(value))
-                .collect();
+            let taken = std::mem::replace(items, crate::value::Share::new(Vec::new()));
+            let slots = taken.unwrap_or_clone().into_iter().map(live).collect();
             *edit = Edit::Arr(Arr {
                 slots,
                 tail: Vec::new(),
@@ -3200,7 +3203,7 @@ fn read_edit(edit: &Edit, path: &[Step]) -> Result<Value, String> {
             let start = bound_text(start)?;
             let end = bound_text(end)?;
             let (from, to) = slice_range(start.as_deref(), end.as_deref(), arr.slots.len());
-            let value = Value::Array(slice_slots(arr, from, to));
+            let value = Value::array(slice_slots(arr, from, to));
             if path.len() == 1 {
                 Ok(value)
             } else {
@@ -3233,7 +3236,7 @@ fn body_values(body: &Body) -> Vec<Value> {
 fn freeze(edit: &Edit) -> Value {
     match edit {
         Edit::Pure(value) => value.clone(),
-        Edit::Obj(fields) => Value::Object(
+        Edit::Obj(fields) => Value::object(
             fields
                 .iter()
                 .map(|(key, value)| (key.clone(), freeze(value)))
@@ -3246,7 +3249,7 @@ fn freeze(edit: &Edit) -> Value {
                 items.extend(body_values(&slot.body));
             }
             items.extend(arr.tail.iter().map(freeze));
-            Value::Array(items)
+            Value::array(items)
         }
     }
 }
@@ -3420,7 +3423,7 @@ fn path_steps(root: &Value, out: POut) -> Result<Vec<Step>, Value> {
 }
 
 fn render_steps(steps: &[Step]) -> Value {
-    Value::Array(steps.iter().map(render_step).collect())
+    Value::array(steps.iter().map(render_step).collect())
 }
 
 fn render_step(step: &Step) -> Value {
@@ -3495,7 +3498,7 @@ fn push_get(base: &POut, key: &Value, ctx: &Ctx) -> Result<POut, String> {
         Value::Array(_) if matches!(base.value, Value::Array(_)) => Ok(adopt(
             base,
             Step::Raw(key.clone()),
-            Value::Array(Vec::new()),
+            Value::array(Vec::new()),
             ctx,
         )),
         Value::Object(_) if matches!(base.value, Value::Null) => {
@@ -3576,7 +3579,7 @@ fn get_one(value: &Value, key: &Value) -> Result<Value, String> {
             }
             Err(format!("Cannot index {} with object", value.type_name()))
         }
-        Value::Array(_) if matches!(value, Value::Array(_)) => Ok(Value::Array(Vec::new())),
+        Value::Array(_) if matches!(value, Value::Array(_)) => Ok(Value::array(Vec::new())),
         other => Err(format!(
             "Cannot index {} with {}",
             value.type_name(),

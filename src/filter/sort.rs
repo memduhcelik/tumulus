@@ -36,20 +36,20 @@ pub(super) fn eval_order(
         return Err(not_array(input));
     };
     if matches!(kind, SortKind::Sort) {
-        return Ok(vec![Value::Array(sorted(items))]);
+        return Ok(vec![Value::array(sorted(items))]);
     }
     let keyed = match keys_of(items, by, env) {
         Ok(keyed) => keyed,
         Err(failure) => return Err(failure),
     };
     let value = match kind {
-        SortKind::SortBy => Value::Array(arrange(keyed, false)),
+        SortKind::SortBy => Value::array(arrange(keyed, false)),
         SortKind::Group | SortKind::Unique | SortKind::UniqueBy => {
             let groups = arrange(keyed, true);
             if matches!(kind, SortKind::Group) {
-                Value::Array(groups)
+                Value::array(groups)
             } else {
-                Value::Array(firsts(groups))
+                Value::array(firsts(groups))
             }
         }
         SortKind::Min | SortKind::MinBy => extreme(&keyed, false),
@@ -82,11 +82,11 @@ fn object_order(
         // which is what `map([.])` produces.
         let key = match by {
             Some(filter) => key_of(filter, value, env)?,
-            None => Value::Array(vec![value.clone()]),
+            None => Value::array(vec![value.clone()]),
         };
         rows.push(key);
     }
-    let keys = Value::Array(rows);
+    let keys = Value::array(rows);
     Ok(if matches!(kind, SortKind::MinBy | SortKind::MaxBy) {
         both_iterated(input, &keys)
     } else {
@@ -109,7 +109,7 @@ fn keys_of(
     for item in items {
         let key = match by {
             Some(filter) => key_of(filter, item, env)?,
-            None => Value::Array(vec![item.clone()]),
+            None => Value::array(vec![item.clone()]),
         };
         keyed.push((key, item.clone()));
     }
@@ -118,7 +118,7 @@ fn keys_of(
 
 fn key_of(filter: &Filter, item: &Value, env: &[(String, Value)]) -> Result<Value, Failure> {
     match eval::eval_in(filter, item, env) {
-        Ok(values) => Ok(Value::Array(values)),
+        Ok(values) => Ok(Value::array(values)),
         Err(failure) => Err(bare_fail(failure)),
     }
 }
@@ -152,10 +152,10 @@ fn arrange(keyed: Vec<(Value, Value)>, grouped: bool) -> Vec<Value> {
             .is_some_and(|before| cmp_value(before, key) == 0);
         if same {
             if let Some(Value::Array(group)) = groups.last_mut() {
-                group.push(value.clone());
+                group.make_mut().push(value.clone());
             }
         } else {
-            groups.push(Value::Array(vec![value.clone()]));
+            groups.push(Value::array(vec![value.clone()]));
             previous = Some(key.clone());
         }
     }

@@ -37,7 +37,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         if self.peek() == Some(']') {
             self.bump();
-            return Ok(Value::Array(Vec::new()));
+            return Ok(Value::array(Vec::new()));
         }
         let mut items = Vec::new();
         loop {
@@ -64,14 +64,14 @@ impl<'a> Parser<'a> {
                 Some(_) => return Err(self.expected_separator()),
             }
         }
-        Ok(Value::Array(items))
+        Ok(Value::array(items))
     }
 
     fn parse_object(&mut self) -> Result<Value, ParseErr> {
         self.skip_ws();
         if self.peek() == Some('}') {
             self.bump();
-            return Ok(Value::Object(Vec::new()));
+            return Ok(Value::object(Vec::new()));
         }
         // First key position wins; a later duplicate replaces the value.
         let mut items: Vec<(String, Value)> = Vec::new();
@@ -115,7 +115,7 @@ impl<'a> Parser<'a> {
                 Some(_) => return Err(self.expected_separator()),
             }
         }
-        Ok(Value::Object(items))
+        Ok(Value::object(items))
     }
 
     fn expect_colon(&mut self) -> Result<(), ParseErr> {

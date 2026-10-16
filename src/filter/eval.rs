@@ -82,7 +82,7 @@ pub(super) fn produce(
             super::builtin::eval_format_string(name, pieces, input, env)
         }
         Filter::Collect(inner) => match eval_in(inner, input, env) {
-            Ok(items) => Ok(vec![Value::Array(items)]),
+            Ok(items) => Ok(vec![Value::array(items)]),
             Err(failure) => Err(bare_fail(failure)),
         },
         Filter::Object(fields) => eval_object(fields, input, env),
@@ -287,7 +287,7 @@ pub(super) fn slice(
         Value::Null => Ok(vec![Value::Null]),
         Value::Array(items) => {
             let (from, to) = slice_range(start, end, items.len());
-            Ok(vec![Value::Array(items[from..to].to_vec())])
+            Ok(vec![Value::array(items[from..to].to_vec())])
         }
         Value::String(text) => {
             let chars: Vec<char> = text.chars().collect();
@@ -440,7 +440,7 @@ pub(super) fn recurse(input: &Value) -> Vec<Value> {
 
 pub(super) fn iterate(input: &Value) -> Result<Vec<Value>, Failure> {
     match input {
-        Value::Array(items) => Ok(items.clone()),
+        Value::Array(items) => Ok(items.iter().cloned().collect()),
         Value::Object(items) => Ok(items.iter().map(|(_, value)| value.clone()).collect()),
         other => Err(fail(format!(
             "Cannot iterate over {} ({})",
@@ -1191,7 +1191,7 @@ pub(super) fn combine_fields(
     base: Vec<(String, Value)>,
 ) -> Result<Vec<Value>, Failure> {
     let Some(stream) = streams.get(index) else {
-        return Ok(vec![Value::Object(base)]);
+        return Ok(vec![Value::object(base)]);
     };
     let mut out = Vec::new();
     for (key, value) in &stream.pairs {
@@ -1276,7 +1276,7 @@ pub(super) fn index_by(base: &Value, key: &Value) -> Result<Vec<Value>, Failure>
         Value::Object(_) if matches!(base, Value::Array(_) | Value::String(_)) => Err(fail(
             "Array/string slice indices must be integers".to_string(),
         )),
-        Value::Array(_) if matches!(base, Value::Array(_)) => Ok(vec![Value::Array(Vec::new())]),
+        Value::Array(_) if matches!(base, Value::Array(_)) => Ok(vec![Value::array(Vec::new())]),
         other => Err(fail(format!(
             "Cannot index {} with {}",
             base.type_name(),

@@ -1,3 +1,59 @@
+use std::rc::Rc;
+
+/// A value several parents can hold. Cloning bumps the count. A write copies
+/// the container first when another parent still has it, so the other parent
+/// keeps the old contents.
+#[derive(Debug)]
+pub struct Share<T>(Rc<T>);
+
+impl<T> Clone for Share<T> {
+    fn clone(&self) -> Self {
+        Share(Rc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Share<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> Share<T> {
+    pub fn new(value: T) -> Self {
+        Share(Rc::new(value))
+    }
+
+    /// The value, with no other parent. `None` leaves this share in place.
+    pub(crate) fn unique_mut(&mut self) -> Option<&mut T> {
+        Rc::get_mut(&mut self.0)
+    }
+}
+
+impl<T: Clone> Share<T> {
+    /// A container this owner can write. Other owners keep the previous one.
+    pub(crate) fn make_mut(&mut self) -> &mut T {
+        Rc::make_mut(&mut self.0)
+    }
+
+    pub(crate) fn unwrap_or_clone(self) -> T {
+        match Rc::try_unwrap(self.0) {
+            Ok(value) => value,
+            Err(shared) => (*shared).clone(),
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Share<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug)]
 pub enum Value {
     Null,
@@ -5,8 +61,8 @@ pub enum Value {
     /// Text jq would print for this number.
     Number(String),
     String(String),
-    Array(Vec<Value>),
-    Object(Vec<(String, Value)>),
+    Array(Share<Vec<Value>>),
+    Object(Share<Vec<(String, Value)>>),
 }
 
 /// Past this depth the rest of a nest is freed on the heap. A wide array
@@ -26,13 +82,17 @@ fn drop_in_place(value: &mut Value, depth: usize) {
     }
     match value {
         Value::Array(items) => {
-            for mut item in std::mem::take(items) {
-                drop_in_place(&mut item, depth + 1);
+            if let Some(items) = items.unique_mut() {
+                for mut item in std::mem::take(items) {
+                    drop_in_place(&mut item, depth + 1);
+                }
             }
         }
         Value::Object(items) => {
-            for (_, mut item) in std::mem::take(items) {
-                drop_in_place(&mut item, depth + 1);
+            if let Some(items) = items.unique_mut() {
+                for (_, mut item) in std::mem::take(items) {
+                    drop_in_place(&mut item, depth + 1);
+                }
             }
         }
         _ => {}
@@ -51,9 +111,15 @@ fn drop_deep(value: &mut Value) {
 
 fn take_children(value: &mut Value, stack: &mut Vec<Value>) {
     match value {
-        Value::Array(items) => stack.extend(std::mem::take(items)),
+        Value::Array(items) => {
+            if let Some(items) = items.unique_mut() {
+                stack.extend(std::mem::take(items));
+            }
+        }
         Value::Object(items) => {
-            stack.extend(std::mem::take(items).into_iter().map(|(_, item)| item));
+            if let Some(items) = items.unique_mut() {
+                stack.extend(std::mem::take(items).into_iter().map(|(_, item)| item));
+            }
         }
         _ => {}
     }
@@ -61,72 +127,16 @@ fn take_children(value: &mut Value, stack: &mut Vec<Value>) {
 
 impl Clone for Value {
     fn clone(&self) -> Self {
-        clone_at(self, 0)
-    }
-}
-
-fn clone_at(value: &Value, depth: usize) -> Value {
-    if depth >= DROP_RECURSION {
-        return clone_deep(value);
-    }
-    match value {
-        Value::Null => Value::Null,
-        Value::Bool(bit) => Value::Bool(*bit),
-        Value::Number(text) => Value::Number(text.clone()),
-        Value::String(text) => Value::String(text.clone()),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|item| clone_at(item, depth + 1)).collect())
-        }
-        Value::Object(items) => Value::Object(
-            items
-                .iter()
-                .map(|(key, item)| (key.clone(), clone_at(item, depth + 1)))
-                .collect(),
-        ),
-    }
-}
-
-enum CloneJob<'a> {
-    Expand(&'a Value),
-    Array(usize),
-    Object(Vec<String>),
-}
-
-/// Post-order, so a long chain does not use a stack frame per level.
-fn clone_deep(value: &Value) -> Value {
-    let mut jobs = vec![CloneJob::Expand(value)];
-    let mut built = Vec::new();
-    while let Some(job) = jobs.pop() {
-        match job {
-            CloneJob::Expand(Value::Array(items)) => {
-                jobs.push(CloneJob::Array(items.len()));
-                for item in items.iter().rev() {
-                    jobs.push(CloneJob::Expand(item));
-                }
-            }
-            CloneJob::Expand(Value::Object(items)) => {
-                jobs.push(CloneJob::Object(
-                    items.iter().map(|(key, _)| key.clone()).collect(),
-                ));
-                for (_, item) in items.iter().rev() {
-                    jobs.push(CloneJob::Expand(item));
-                }
-            }
-            CloneJob::Expand(Value::Null) => built.push(Value::Null),
-            CloneJob::Expand(Value::Bool(bit)) => built.push(Value::Bool(*bit)),
-            CloneJob::Expand(Value::Number(text)) => built.push(Value::Number(text.clone())),
-            CloneJob::Expand(Value::String(text)) => built.push(Value::String(text.clone())),
-            CloneJob::Array(count) => {
-                let children = built.split_off(built.len() - count);
-                built.push(Value::Array(children));
-            }
-            CloneJob::Object(keys) => {
-                let children = built.split_off(built.len() - keys.len());
-                built.push(Value::Object(keys.into_iter().zip(children).collect()));
-            }
+        match self {
+            Value::Null => Value::Null,
+            Value::Bool(bit) => Value::Bool(*bit),
+            Value::Number(text) => Value::Number(text.clone()),
+            Value::String(text) => Value::String(text.clone()),
+            // The copy sees the same array or object until a write.
+            Value::Array(items) => Value::Array(items.clone()),
+            Value::Object(items) => Value::Object(items.clone()),
         }
     }
-    built.pop().unwrap_or(Value::Null)
 }
 
 impl Value {
@@ -139,16 +149,30 @@ impl Value {
 
     pub(crate) fn into_array(mut self) -> Result<Vec<Value>, Self> {
         match &mut self {
-            Value::Array(items) => Ok(std::mem::take(items)),
+            Value::Array(items) => {
+                let taken = std::mem::replace(items, Share::new(Vec::new()));
+                Ok(taken.unwrap_or_clone())
+            }
             _ => Err(self),
         }
     }
 
     pub(crate) fn into_object(mut self) -> Result<Vec<(String, Value)>, Self> {
         match &mut self {
-            Value::Object(items) => Ok(std::mem::take(items)),
+            Value::Object(items) => {
+                let taken = std::mem::replace(items, Share::new(Vec::new()));
+                Ok(taken.unwrap_or_clone())
+            }
             _ => Err(self),
         }
+    }
+
+    pub fn array(items: Vec<Value>) -> Self {
+        Value::Array(Share::new(items))
+    }
+
+    pub fn object(pairs: Vec<(String, Value)>) -> Self {
+        Value::Object(Share::new(pairs))
     }
 
     pub(crate) fn type_name(&self) -> &'static str {

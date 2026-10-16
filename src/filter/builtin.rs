@@ -101,7 +101,7 @@ pub(super) fn apply_unary(op: math::Unary, input: &Value) -> Result<Value, Strin
     let n = number_required(input)?;
     Ok(match math::unary(op, n) {
         math::Out::Num(n) => from_f64(n),
-        math::Out::Pair(first, second) => Value::Array(vec![from_f64(first), from_f64(second)]),
+        math::Out::Pair(first, second) => Value::array(vec![from_f64(first), from_f64(second)]),
     })
 }
 
@@ -230,7 +230,7 @@ pub(super) fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
             let keys = (0..items.len())
                 .map(|index| Value::Number(index.to_string()))
                 .collect();
-            Ok(vec![Value::Array(keys)])
+            Ok(vec![Value::array(keys)])
         }
         Value::Object(items) => {
             let mut names: Vec<&str> = items.iter().map(|(name, _)| name.as_str()).collect();
@@ -240,7 +240,7 @@ pub(super) fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
                 .into_iter()
                 .map(|name| Value::String(name.to_string()))
                 .collect();
-            Ok(vec![Value::Array(keys)])
+            Ok(vec![Value::array(keys)])
         }
         other => Err(fail(format!(
             "{} ({}) has no keys",
@@ -337,11 +337,11 @@ pub(super) fn eval_to_entries(input: &Value) -> Result<Vec<Value>, Failure> {
             .iter()
             .enumerate()
             .map(|(index, value)| entry(Value::Number(index.to_string()), value.clone()))
-            .collect(),
+            .collect::<Vec<_>>(),
         Value::Object(pairs) => pairs
             .iter()
             .map(|(key, value)| entry(Value::String(key.clone()), value.clone()))
-            .collect(),
+            .collect::<Vec<_>>(),
         other => {
             return Err(fail(format!(
                 "{} ({}) has no keys",
@@ -350,11 +350,11 @@ pub(super) fn eval_to_entries(input: &Value) -> Result<Vec<Value>, Failure> {
             )));
         }
     };
-    Ok(vec![Value::Array(entries)])
+    Ok(vec![Value::array(entries)])
 }
 
 fn entry(key: Value, value: Value) -> Value {
-    Value::Object(vec![("key".to_string(), key), ("value".to_string(), value)])
+    Value::object(vec![("key".to_string(), key), ("value".to_string(), value)])
 }
 
 /// `key`, then `Key`, then `name`, then `Name`. Null and false are skipped,
@@ -371,7 +371,7 @@ pub(super) fn eval_from_entries(input: &Value) -> Result<Vec<Value>, Failure> {
         };
         put(&mut pairs, name, entry_value(&item));
     }
-    Ok(vec![Value::Object(pairs)])
+    Ok(vec![Value::object(pairs)])
 }
 
 fn entry_key(item: &Value) -> Result<Value, Failure> {
@@ -441,7 +441,7 @@ pub(super) fn eval_map(
             Err(failure) => return Err(bare_fail(failure)),
         }
     }
-    Ok(vec![Value::Array(collected)])
+    Ok(vec![Value::array(collected)])
 }
 
 /// A number is unchanged. A string must be one JSON number. The parse error
@@ -584,7 +584,7 @@ pub(super) fn eval_explode(input: &Value) -> Result<Vec<Value>, Failure> {
         .chars()
         .map(|ch| Value::Number((ch as u32).to_string()))
         .collect();
-    Ok(vec![Value::Array(points)])
+    Ok(vec![Value::array(points)])
 }
 
 pub(super) fn eval_implode(input: &Value) -> Result<Vec<Value>, Failure> {
@@ -703,7 +703,7 @@ fn locate(input: &Value, needle: &Value) -> Result<Vec<Value>, Failure> {
 }
 
 fn positions(hits: Vec<usize>) -> Value {
-    Value::Array(
+    Value::array(
         hits.into_iter()
             .map(|hit| Value::Number(hit.to_string()))
             .collect(),
