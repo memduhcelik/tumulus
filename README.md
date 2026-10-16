@@ -1,18 +1,18 @@
 # tumulus
 
-tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.6.0.
+tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.7.0.
 
 macOS on Apple silicon:
 
 ```sh
-curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.6.0/tumulus-macos-arm64
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.7.0/tumulus-macos-arm64
 chmod +x tumulus
 ```
 
 Linux on x86_64:
 
 ```sh
-curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.6.0/tumulus-linux-x86_64
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.7.0/tumulus-linux-x86_64
 chmod +x tumulus
 ```
 
@@ -100,7 +100,7 @@ Filters past the list above are rejected. A call to a name or a number of argume
 
 An object written in the brackets, `.[ {start:1, end:3} ]`, does not read the slice jq reads. It fails with `Array/string slice indices must be integers`. Assignment, `del`, `getpath`, and `setpath` of that object do slice when both `start` and `end` are present. `path` of it prints `start` before `end`. A `?` written immediately after a slice, as in `.[1,error("z"):]?`, also swallows an `error` raised while computing a bound. jq reports that error. `(.[1,error("z"):])?` agrees with jq. When the first slice of an update cannot be written, a later bound is still run. jq does not run it. `try (.[1,(input):] = 9) catch input` therefore reads the next input here and does not in jq.
 
-Options other than the ones above are rejected. `-s` exits 1 with `tumulus: unknown option: -s`. jq slurps with `-s`. An unknown long option exits 1 with `tumulus: unknown option: ...`. jq exits 2 and prints its usage text.
+Options other than the ones above are rejected. An unknown long option exits 1 with `tumulus: unknown option: ...`. jq exits 2 and prints its usage text.
 
 A directory passed as a file exits 1 with `tumulus: cannot read ...: Is a directory (os error 21)`, unless the program calls `input`, `inputs`, or `input_filename`. jq exits 2. Without one of those calls, jq prints nothing for that directory.
 

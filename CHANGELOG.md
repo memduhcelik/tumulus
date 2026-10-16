@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
+
+Released on 2026-10-16.
 
 `reduce range(20000) as $i (0; [.])` wraps the accumulator in place, so a nest of that depth is built in one step per value. `{a:.}`, `[., 1]`, and `[[.]]` move that accumulator the same way, and so does any other nest of arrays and objects that contains one `.`, with literal strings as object keys and literal values everywhere else. Copying an array or object shares it until a later write, so `reduce range(25) as $i (0; [., .])` stays small, `[.] | [.]` wraps in one step, and `..` walks a deep value without copying each level. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything nested deeper than 256. `==` still compares the values themselves, including a difference past that depth. Input deeper than 256 is still rejected.
 
