@@ -64,11 +64,21 @@ impl<'a> Parser<'a> {
         self.parse_nan()
     }
 
+    /// `nan`, any letter case, then digits. `nan1234` is one number.
+    /// A letter after `nan` is not a number. `Infinity` takes no digits.
     fn parse_nan(&mut self) -> Result<Value, ()> {
-        if self.take_nonfinite_word("nan") {
-            return Ok(Value::Number(number::nan_text()));
+        let rest = &self.src[self.index..];
+        if rest.len() < 3 || !rest[..3].eq_ignore_ascii_case(b"nan") {
+            return Err(());
         }
-        Err(())
+        self.index += 3;
+        while matches!(self.peek(), Some('0'..='9')) {
+            self.index += 1;
+        }
+        if !self.token_boundary_ok() {
+            return Err(());
+        }
+        Ok(Value::Number(number::nan_text()))
     }
 
     fn parse_infinity(&mut self, negative: bool) -> Result<Value, ()> {

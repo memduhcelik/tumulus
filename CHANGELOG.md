@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+`split(sep)` splits a string on a string. An empty separator splits it into Unicode code points, and an empty string becomes `[]`. The input and the separator have to be strings, or the error is `split input and separator must be strings`. `fromjson` reads one JSON value from a string. `nan` and `NaN` with digits after them are `nan`. `Infinity`, `Inf`, and `infinity` are infinite, with an optional leading sign. A value that is not a string fails with `only strings can be parsed`. A bad string fails with jq's parse message and `(while parsing '...')`.
+
+`contains(value)` tests a substring, an array subset, or an object subset. Numbers use `==`. The same boolean and `null` match. A different type, or the other boolean, fails with `cannot have their containment checked`. Inside an array or object that mismatch is false. `inside(value)` asks whether `value` contains the input.
+
+`flatten` pulls nested arrays out, and an object contributes its values. `flatten(n)` pulls `n` levels for an integer `n` that is at least 0. `infinite`, and a positive number that is not an integer, pull every level. `nan`, `null`, a boolean, or a negative number fails with `flatten depth must not be negative`. Another depth is subtracted from when a nested array is entered. `any` and `all` take no filter, one filter, or a generator and a condition. With fewer than two, the generator is `.[]`. The first answer stops the rest. `all` of nothing is true, and `any` of nothing is false. `isempty(expr)` is true when `expr` yields nothing. `map_values(expr)` keeps the first value of `expr` for each element or object value, and removes the place when there is none. `keys_unsorted` lists array indexes, or object keys in stored order. The wrong kind of value fails the way jq fails, and the exit status is 5.
+
+Of the 447 programs in jq 1.7.1's test file, 368 come out the same. The 43 new ones use `split`, `fromjson`, `contains`, `flatten`, `any`, `all`, `isempty`, or `map_values`. No previously matching program was lost. `split` with two filters is still rejected. That is a regular expression split in jq.
+
 ## 0.7.0
 
 Released on 2026-10-16.

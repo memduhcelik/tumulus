@@ -1199,6 +1199,35 @@ fn run(
         Filter::Unresolved { name, arity, .. } => {
             Err(bare(format!("{name}/{arity} is not defined")))
         }
+        // `any` and `all` are paths when the value they stop on was reached
+        // through the input. The value itself is computed by `eval_quant`.
+        Filter::Quant { all, stream, cond } => {
+            let expanded = super::builtin::expand_quant(*all, stream, cond);
+            run(&expanded, input, path, line, input_gen, ctx)
+        }
+        Filter::IsEmpty(expr) => {
+            let expanded = super::builtin::expand_isempty(expr);
+            run(&expanded, input, path, line, input_gen, ctx)
+        }
+        // `map_values(f)` is `.[] |= f`. Inside `path` that update is the
+        // first element of `[update, []]`, which is the failure jq reports.
+        Filter::MapValues(expr) => {
+            let update = Filter::Update {
+                op: UpdateOp::Modify,
+                path: Box::new(Filter::Iterate),
+                expr: expr.clone(),
+            };
+            let pair = Filter::Comma(
+                Box::new(update),
+                Box::new(Filter::Literal(Value::array(Vec::new()))),
+            );
+            let indexed = Filter::At {
+                base: Box::new(Filter::Collect(Box::new(pair))),
+                key: Box::new(Filter::Literal(Value::Number("0".to_string()))),
+                optional: false,
+            };
+            run(&indexed, input, path, line, input_gen, ctx)
+        }
         other => run_fallback(other, input, path, line, ctx),
     }
 }

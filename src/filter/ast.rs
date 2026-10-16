@@ -149,6 +149,30 @@ pub enum Filter {
     Length,
     /// `keys`
     Keys,
+    /// `keys_unsorted`. Array indexes, or object keys in stored order.
+    KeysUnsorted,
+    /// `fromjson`. One JSON value read from a string.
+    FromJson,
+    /// `split(sep)`. The input and the separator are strings.
+    Split(Box<Filter>),
+    /// `contains(needle)`.
+    Contains(Box<Filter>),
+    /// `inside(haystack)`. The input is what `haystack` is asked to contain.
+    Inside(Box<Filter>),
+    /// `flatten`, or `flatten(depth)` when the filter is present.
+    Flatten(Option<Box<Filter>>),
+    /// `any` or `all`. The generator of the no-filter and one-filter forms
+    /// is `.[]`. A path sees `generator | condition | if . then ...`.
+    Quant {
+        all: bool,
+        stream: Box<Filter>,
+        cond: Box<Filter>,
+    },
+    /// `isempty(expr)`.
+    IsEmpty(Box<Filter>),
+    /// `map_values(expr)`. The first value `expr` yields replaces the
+    /// element. No value removes it. A later value is not run.
+    MapValues(Box<Filter>),
     /// `has(expr)`
     Has(Box<Filter>),
     /// `select(expr)`

@@ -36,6 +36,8 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Empty
             | Filter::Length
             | Filter::Keys
+            | Filter::KeysUnsorted
+            | Filter::FromJson
             | Filter::Type
             | Filter::ToNumber
             | Filter::ToString
@@ -90,6 +92,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Has(inner)
             | Filter::Select(inner)
             | Filter::Map(inner)
+            | Filter::MapValues(inner)
             | Filter::Walk(inner)
             | Filter::WithEntries(inner)
             | Filter::Join(inner)
@@ -100,6 +103,10 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::IndexOf(inner)
             | Filter::RIndexOf(inner)
             | Filter::IndicesOf(inner)
+            | Filter::Split(inner)
+            | Filter::Contains(inner)
+            | Filter::Inside(inner)
+            | Filter::IsEmpty(inner)
             | Filter::StrfTime(inner)
             | Filter::StrfLocalTime(inner)
             | Filter::StrpTime(inner)
@@ -108,9 +115,11 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::GetPath(inner)
             | Filter::DelPaths(inner)
             | Filter::Repeat(inner) => walk(inner, seen),
-            Filter::First(inner) | Filter::Last(inner) | Filter::Paths(inner) => {
-                inner.as_deref().is_some_and(|inner| walk(inner, seen))
-            }
+            Filter::First(inner)
+            | Filter::Last(inner)
+            | Filter::Paths(inner)
+            | Filter::Flatten(inner) => inner.as_deref().is_some_and(|inner| walk(inner, seen)),
+            Filter::Quant { stream, cond, .. } => walk(stream, seen) || walk(cond, seen),
             Filter::RecurseDown { step, cond } => {
                 walk(step, seen) || cond.as_deref().is_some_and(|cond| walk(cond, seen))
             }
@@ -227,6 +236,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Empty
         | Filter::Length
         | Filter::Keys
+        | Filter::KeysUnsorted
+        | Filter::FromJson
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString
@@ -298,6 +309,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner)
+        | Filter::MapValues(inner)
         | Filter::Walk(inner)
         | Filter::WithEntries(inner)
         | Filter::Join(inner)
@@ -308,10 +320,22 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::IndexOf(inner)
         | Filter::RIndexOf(inner)
         | Filter::IndicesOf(inner)
+        | Filter::Split(inner)
+        | Filter::Contains(inner)
+        | Filter::Inside(inner)
+        | Filter::IsEmpty(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
         | Filter::Raise(inner) => check_vars(inner, scope),
+        Filter::Flatten(inner) => match inner {
+            Some(inner) => check_vars(inner, scope),
+            None => Ok(()),
+        },
+        Filter::Quant { stream, cond, .. } => {
+            check_vars(stream, scope)?;
+            check_vars(cond, scope)
+        }
         Filter::Try { body, handler } => {
             check_vars(body, scope)?;
             if let Some(handler) = handler {
@@ -529,6 +553,8 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Empty
         | Filter::Length
         | Filter::Keys
+        | Filter::KeysUnsorted
+        | Filter::FromJson
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString
@@ -561,7 +587,8 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::InputFilename
         | Filter::Environ
         | Filter::Param(_)
-        | Filter::Paths(None) => {}
+        | Filter::Paths(None)
+        | Filter::Flatten(None) => {}
         Filter::Slice { base, start, end } => {
             if let Some(base) = base {
                 walk_defs(base, seen, errors);
@@ -597,6 +624,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Has(inner)
         | Filter::Select(inner)
         | Filter::Map(inner)
+        | Filter::MapValues(inner)
         | Filter::Walk(inner)
         | Filter::WithEntries(inner)
         | Filter::Join(inner)
@@ -607,6 +635,10 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::IndexOf(inner)
         | Filter::RIndexOf(inner)
         | Filter::IndicesOf(inner)
+        | Filter::Split(inner)
+        | Filter::Contains(inner)
+        | Filter::Inside(inner)
+        | Filter::IsEmpty(inner)
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
@@ -616,7 +648,12 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::DelPaths(inner)
         | Filter::First(Some(inner))
         | Filter::Last(Some(inner))
-        | Filter::Repeat(inner) => walk_defs(inner, seen, errors),
+        | Filter::Repeat(inner)
+        | Filter::Flatten(Some(inner)) => walk_defs(inner, seen, errors),
+        Filter::Quant { stream, cond, .. } => {
+            walk_defs(stream, seen, errors);
+            walk_defs(cond, seen, errors);
+        }
         Filter::RecurseDown { step, cond } => {
             walk_defs(step, seen, errors);
             if let Some(cond) = cond {
@@ -778,16 +815,18 @@ fn unbox(args: Vec<Box<Filter>>) -> Vec<Filter> {
 
 fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
-        "not" | "empty" | "length" | "keys" | "type" | "tonumber" | "tostring" | "tojson"
-        | "ascii_downcase" | "ascii_upcase" | "explode" | "implode" | "utf8bytelength"
-        | "todate" | "fromdate" | "gmtime" | "localtime" | "mktime" | "now" | "add"
-        | "to_entries" | "from_entries" | "input" | "inputs" | "input_filename" | "env"
-        | "sort" | "unique" | "min" | "max" => arity == 0,
+        "not" | "empty" | "length" | "keys" | "keys_unsorted" | "type" | "tonumber"
+        | "tostring" | "tojson" | "fromjson" | "ascii_downcase" | "ascii_upcase" | "explode"
+        | "implode" | "utf8bytelength" | "todate" | "fromdate" | "gmtime" | "localtime"
+        | "mktime" | "now" | "add" | "to_entries" | "from_entries" | "input" | "inputs"
+        | "input_filename" | "env" | "sort" | "unique" | "min" | "max" => arity == 0,
         "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
-        "has" | "select" | "map" | "join" | "ltrimstr" | "rtrimstr" | "startswith" | "endswith"
-        | "index" | "rindex" | "indices" | "strftime" | "strflocaltime" | "strptime" | "path"
-        | "getpath" | "delpaths" | "del" | "repeat" | "walk" | "with_entries" => arity == 1,
-        "paths" | "first" | "last" | "error" => arity <= 1,
+        "has" | "select" | "map" | "map_values" | "join" | "ltrimstr" | "rtrimstr"
+        | "startswith" | "endswith" | "index" | "rindex" | "indices" | "split" | "contains"
+        | "inside" | "isempty" | "strftime" | "strflocaltime" | "strptime" | "path" | "getpath"
+        | "delpaths" | "del" | "repeat" | "walk" | "with_entries" => arity == 1,
+        "paths" | "first" | "last" | "error" | "flatten" => arity <= 1,
+        "any" | "all" => arity <= 2,
         "recurse" => arity <= 2,
         "nth" => arity == 1 || arity == 2,
         "range" => (1..=3).contains(&arity),
@@ -836,6 +875,8 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "empty" => Filter::Empty,
         "length" => Filter::Length,
         "keys" => Filter::Keys,
+        "keys_unsorted" => Filter::KeysUnsorted,
+        "fromjson" => Filter::FromJson,
         "type" => Filter::Type,
         "tonumber" => Filter::ToNumber,
         "tostring" => Filter::ToString,
@@ -865,6 +906,26 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "has" => Filter::Has(args.next().expect("arg")),
         "select" => Filter::Select(args.next().expect("arg")),
         "map" => Filter::Map(args.next().expect("arg")),
+        "map_values" => Filter::MapValues(args.next().expect("arg")),
+        "split" => Filter::Split(args.next().expect("arg")),
+        "contains" => Filter::Contains(args.next().expect("arg")),
+        "inside" => Filter::Inside(args.next().expect("arg")),
+        "isempty" => Filter::IsEmpty(args.next().expect("arg")),
+        "flatten" => Filter::Flatten(args.next()),
+        "any" | "all" => {
+            let all_form = name == "all";
+            let (stream, cond) = match (args.next(), args.next()) {
+                (None, None) => (Box::new(Filter::Iterate), Box::new(Filter::Identity)),
+                (Some(cond), None) => (Box::new(Filter::Iterate), cond),
+                (Some(stream), Some(cond)) => (stream, cond),
+                (None, Some(_)) => unreachable!("quantifier arity"),
+            };
+            Filter::Quant {
+                all: all_form,
+                stream,
+                cond,
+            }
+        }
         "join" => Filter::Join(args.next().expect("arg")),
         "ltrimstr" => Filter::LTrim(args.next().expect("arg")),
         "rtrimstr" => Filter::RTrim(args.next().expect("arg")),
@@ -2624,9 +2685,18 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Empty
         | Filter::Length
         | Filter::Keys
+        | Filter::KeysUnsorted
+        | Filter::FromJson
         | Filter::Has(_)
         | Filter::Select(_)
         | Filter::Map(_)
+        | Filter::MapValues(_)
+        | Filter::Split(_)
+        | Filter::Contains(_)
+        | Filter::Inside(_)
+        | Filter::Flatten(_)
+        | Filter::Quant { .. }
+        | Filter::IsEmpty(_)
         | Filter::Type
         | Filter::ToNumber
         | Filter::ToString

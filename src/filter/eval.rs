@@ -138,6 +138,17 @@ pub(super) fn produce(
         Filter::Empty => Ok(Vec::new()),
         Filter::Length => eval_length(input),
         Filter::Keys => eval_keys(input),
+        Filter::KeysUnsorted => super::builtin::eval_keys_unsorted(input),
+        Filter::FromJson => super::builtin::eval_fromjson(input),
+        Filter::Split(sep) => super::builtin::eval_split(sep, input, env),
+        Filter::Contains(needle) => super::builtin::eval_contains(needle, input, env),
+        Filter::Inside(haystack) => super::builtin::eval_inside(haystack, input, env),
+        Filter::Flatten(depth) => super::builtin::eval_flatten(depth.as_deref(), input, env),
+        Filter::Quant {
+            all, stream, cond, ..
+        } => super::builtin::eval_quant(*all, stream, cond, input, env),
+        Filter::IsEmpty(expr) => super::builtin::eval_isempty(expr, input, env),
+        Filter::MapValues(expr) => super::builtin::eval_map_values(expr, input, env),
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),
         Filter::Map(arg) => eval_map(arg, input, env),

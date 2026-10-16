@@ -225,6 +225,15 @@ pub(super) fn number_length(text: &str) -> Value {
 }
 
 pub(super) fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
+    key_list(input, true)
+}
+
+/// Object keys stay in stored order. A repeated name keeps its first place.
+pub(super) fn eval_keys_unsorted(input: &Value) -> Result<Vec<Value>, Failure> {
+    key_list(input, false)
+}
+
+fn key_list(input: &Value, sorted: bool) -> Result<Vec<Value>, Failure> {
     match input {
         Value::Array(items) => {
             let keys = (0..items.len())
@@ -233,9 +242,15 @@ pub(super) fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
             Ok(vec![Value::array(keys)])
         }
         Value::Object(items) => {
-            let mut names: Vec<&str> = items.iter().map(|(name, _)| name.as_str()).collect();
-            names.sort_unstable();
-            names.dedup();
+            let mut names: Vec<&str> = Vec::new();
+            for (name, _) in items.iter() {
+                if !names.contains(&name.as_str()) {
+                    names.push(name.as_str());
+                }
+            }
+            if sorted {
+                names.sort_unstable();
+            }
             let keys = names
                 .into_iter()
                 .map(|name| Value::String(name.to_string()))
@@ -1140,4 +1155,409 @@ fn base64_trailing(text: &str) -> Failure {
         "string ({}) trailing base64 byte found",
         shown(&Value::String(text.to_string()))
     ))
+}
+
+/// One JSON text. The parse message is jq's, then the original string.
+pub(super) fn eval_fromjson(input: &Value) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::String(text) => one(parse_any_text(text)),
+        other => Err(fail(format!(
+            "{} ({}) only strings can be parsed",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+pub(super) fn parse_any_text(text: &str) -> Result<Value, String> {
+    let parsed = match crate::parse::parse_stream(text.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(err) => return Err(format!("{err} (while parsing '{text}')")),
+    };
+    let suffix = format!(" (while parsing '{text}')");
+    if let Some(message) = parsed.error {
+        return Err(format!("{message}{suffix}"));
+    }
+    match parsed.values.as_slice() {
+        [] => Err(format!("Expected JSON value{suffix}")),
+        [only] => Ok(only.value.clone()),
+        _ => Err(format!("Unexpected extra JSON values{suffix}")),
+    }
+}
+
+/// Each separator is its own split. A failure keeps the splits already made.
+pub(super) fn eval_split(
+    sep: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (seps, err) = parts(eval_in(sep, input, env));
+    let mut out = Vec::new();
+    for sep in seps {
+        match split_one(input, &sep) {
+            Ok(value) => out.push(value),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+fn split_one(input: &Value, sep: &Value) -> Result<Value, String> {
+    match (input, sep) {
+        (Value::String(text), Value::String(sep)) => Ok(split_string(text, sep)),
+        _ => Err("split input and separator must be strings".to_string()),
+    }
+}
+
+pub(super) fn eval_contains(
+    needle: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (needles, err) = parts(eval_in(needle, input, env));
+    let mut out = Vec::new();
+    for needle in needles {
+        match contains_top(input, &needle) {
+            Ok(flag) => out.push(Value::Bool(flag)),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+/// `inside(haystack)` asks whether `haystack` contains the input.
+pub(super) fn eval_inside(
+    haystack: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (haystacks, err) = parts(eval_in(haystack, input, env));
+    let mut out = Vec::new();
+    for haystack in haystacks {
+        match contains_top(&haystack, input) {
+            Ok(flag) => out.push(Value::Bool(flag)),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+/// Different types fail here. An unequal pair of booleans fails here too.
+/// A mismatch inside an array or object is false, which `contains_rec` does.
+fn contains_top(hay: &Value, needle: &Value) -> Result<bool, String> {
+    let unequal_bools =
+        matches!((hay, needle), (Value::Bool(left), Value::Bool(right)) if left != right);
+    if hay.type_name() != needle.type_name() || unequal_bools {
+        return Err(format!(
+            "{} ({}) and {} ({}) cannot have their containment checked",
+            hay.type_name(),
+            shown(hay),
+            needle.type_name(),
+            shown(needle)
+        ));
+    }
+    Ok(contains_rec(hay, needle))
+}
+
+fn contains_rec(hay: &Value, needle: &Value) -> bool {
+    match (hay, needle) {
+        (Value::String(hay), Value::String(needle)) => needle.is_empty() || hay.contains(needle),
+        (Value::Array(hay), Value::Array(needle)) => needle
+            .iter()
+            .all(|item| hay.iter().any(|element| contains_rec(element, item))),
+        (Value::Object(hay), Value::Object(needle)) => needle.iter().all(|(key, want)| {
+            hay.iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .is_some_and(|(_, have)| contains_rec(have, want))
+        }),
+        _ => cmp_value(hay, needle) == 0,
+    }
+}
+
+pub(super) fn eval_flatten(
+    depth: Option<&Filter>,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let Some(depth) = depth else {
+        return flatten_one(input, None)
+            .map(|value| vec![value])
+            .map_err(fail);
+    };
+    let (depths, err) = parts(eval_in(depth, input, env));
+    let mut out = Vec::new();
+    for depth in depths {
+        match flatten_one(input, Some(&depth)) {
+            Ok(value) => out.push(value),
+            Err(message) => return Err(fresh(out, message)),
+        }
+    }
+    finish(out, err)
+}
+
+enum Flat {
+    /// Do not enter nested arrays.
+    Keep,
+    /// Enter every nested array.
+    Full,
+    /// Enter one level and pass `depth - 1` down.
+    Down,
+}
+
+fn flatten_one(input: &Value, depth: Option<&Value>) -> Result<Value, String> {
+    let (mode, depth) = match depth {
+        None => (Flat::Full, Value::Null),
+        Some(depth) => {
+            let zero = Value::Number("0".to_string());
+            if cmp_value(depth, &zero) < 0 {
+                return Err("flatten depth must not be negative".to_string());
+            }
+            (flat_mode(depth), depth.clone())
+        }
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![FlatFrame {
+        items: children(input)?,
+        index: 0,
+        mode,
+        depth,
+    }];
+    loop {
+        let Some(top) = stack.last() else {
+            break;
+        };
+        if top.index >= top.items.len() {
+            stack.pop();
+            continue;
+        }
+        let at = top.index;
+        let item = top.items[at].clone();
+        let mode = match top.mode {
+            Flat::Keep => Flat::Keep,
+            Flat::Full => Flat::Full,
+            Flat::Down => Flat::Down,
+        };
+        let depth = top.depth.clone();
+        stack.last_mut().expect("frame").index = at + 1;
+        if !matches!(item, Value::Array(_)) {
+            out.push(item);
+            continue;
+        }
+        match mode {
+            Flat::Keep => out.push(item),
+            Flat::Full => stack.push(FlatFrame {
+                items: children(&item)?,
+                index: 0,
+                mode: Flat::Full,
+                depth,
+            }),
+            Flat::Down => {
+                let one = Value::Number("1".to_string());
+                let next = sub_values(&depth, &one)?;
+                stack.push(FlatFrame {
+                    items: children(&item)?,
+                    index: 0,
+                    mode: flat_mode(&next),
+                    depth: next,
+                });
+            }
+        }
+    }
+    Ok(Value::array(out))
+}
+
+struct FlatFrame {
+    items: Vec<Value>,
+    index: usize,
+    mode: Flat,
+    depth: Value,
+}
+
+fn children(value: &Value) -> Result<Vec<Value>, String> {
+    iterate(value).map_err(|failure| failure.message)
+}
+
+/// A positive number that is not an integer flattens every level.
+/// A string, array, or object is greater than 0, so entering an array
+/// subtracts and reports that those values cannot be subtracted.
+fn flat_mode(depth: &Value) -> Flat {
+    let zero = Value::Number("0".to_string());
+    if let Value::Number(text) = depth {
+        if cmp_value(depth, &zero) == 0 {
+            return Flat::Keep;
+        }
+        let n = number::f64_of(text);
+        let whole = n.is_infinite() || (n.is_finite() && n.floor() == n);
+        if !whole {
+            return Flat::Full;
+        }
+        return Flat::Down;
+    }
+    if cmp_value(depth, &zero) > 0 {
+        Flat::Down
+    } else {
+        Flat::Keep
+    }
+}
+
+/// The first decisive condition stops the generator. `all` of nothing is true.
+pub(super) fn eval_quant(
+    all: bool,
+    stream: &Filter,
+    cond: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let decided = std::cell::Cell::new(None);
+    let failure = std::cell::RefCell::new(None);
+    let ran = super::stream::feed(stream, input, env, &mut |item| {
+        let mut halt = false;
+        let inner = super::stream::feed(cond, item, env, &mut |flag| {
+            let yes = truthy(flag);
+            if all {
+                if !yes {
+                    decided.set(Some(false));
+                    halt = true;
+                    return true;
+                }
+            } else if yes {
+                decided.set(Some(true));
+                halt = true;
+                return true;
+            }
+            false
+        });
+        if let Err(err) = inner {
+            *failure.borrow_mut() = Some(err);
+            return true;
+        }
+        halt
+    });
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    ran?;
+    Ok(vec![Value::Bool(decided.get().unwrap_or(all))])
+}
+
+pub(super) fn eval_isempty(
+    expr: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let saw = std::cell::Cell::new(false);
+    let ran = super::stream::feed(expr, input, env, &mut |_| {
+        saw.set(true);
+        true
+    });
+    if saw.get() {
+        return Ok(vec![Value::Bool(false)]);
+    }
+    ran?;
+    Ok(vec![Value::Bool(true)])
+}
+
+/// The first value wins, and the rest of `expr` is not run. No value deletes.
+pub(super) fn eval_map_values(
+    expr: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    match input {
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items.iter() {
+                match first_value(expr, item, env)? {
+                    Some(value) => out.push(value),
+                    None => {}
+                }
+            }
+            Ok(vec![Value::array(out)])
+        }
+        Value::Object(pairs) => {
+            let mut out = Vec::new();
+            for (key, value) in pairs.iter() {
+                if let Some(value) = first_value(expr, value, env)? {
+                    out.push((key.clone(), value));
+                }
+            }
+            Ok(vec![Value::object(out)])
+        }
+        other => Err(fail(format!(
+            "Cannot iterate over {} ({})",
+            other.type_name(),
+            shown(other)
+        ))),
+    }
+}
+
+fn first_value(
+    expr: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Option<Value>, Failure> {
+    let found = std::cell::RefCell::new(None);
+    let ran = super::stream::feed(expr, input, env, &mut |value| {
+        *found.borrow_mut() = Some(value.clone());
+        true
+    });
+    if let Some(value) = found.into_inner() {
+        return Ok(Some(value));
+    }
+    match ran {
+        Ok(_) => Ok(None),
+        Err(err) => Err(bare_fail(err)),
+    }
+}
+
+/// Path and assignment see the same filter jq builds for `any` and `all`.
+/// The condition runs before `if`, so a path inside it is kept. Value
+/// results use `eval_quant`, which stops before a later side effect.
+pub(super) fn expand_quant(all: bool, stream: &Filter, cond: &Filter) -> Filter {
+    let yes = if all {
+        Filter::Empty
+    } else {
+        Filter::Literal(Value::Bool(true))
+    };
+    let no = if all {
+        Filter::Literal(Value::Bool(false))
+    } else {
+        Filter::Empty
+    };
+    // `generator | condition | if . then ...`
+    let body = Filter::Pipe(
+        Box::new(stream.clone()),
+        Box::new(Filter::Pipe(
+            Box::new(cond.clone()),
+            Box::new(Filter::If {
+                cond: Box::new(Filter::Identity),
+                yes: Box::new(yes),
+                no: Box::new(no),
+            }),
+        )),
+    );
+    if all {
+        Filter::First(Some(Box::new(Filter::Comma(
+            Box::new(body),
+            Box::new(Filter::Literal(Value::Bool(true))),
+        ))))
+    } else {
+        Filter::Alt(
+            Box::new(Filter::First(Some(Box::new(body)))),
+            Box::new(Filter::Literal(Value::Bool(false))),
+        )
+    }
+}
+
+/// `first((expr | false), true)`. A value stops before `true`.
+pub(super) fn expand_isempty(expr: &Filter) -> Filter {
+    let pipe = Filter::Pipe(
+        Box::new(expr.clone()),
+        Box::new(Filter::Literal(Value::Bool(false))),
+    );
+    Filter::First(Some(Box::new(Filter::Comma(
+        Box::new(pipe),
+        Box::new(Filter::Literal(Value::Bool(true))),
+    ))))
 }
