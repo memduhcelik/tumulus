@@ -1064,8 +1064,8 @@ pub(super) fn expand_pieces(
                         Ok(more) => partial.extend(more),
                         Err(inner) => {
                             for value in inner.partial {
-                                if let Value::String(text) = value {
-                                    partial.push(text);
+                                if let Value::String(text) = &value {
+                                    partial.push(text.clone());
                                 }
                             }
                             // An inner piece that fails reuses this piece's error.
@@ -1128,7 +1128,7 @@ pub(super) fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) 
     let (keys, key_err) = parts(eval_in(key, input, env));
     let mut pairs = Vec::new();
     for value in keys {
-        let Value::String(name) = value else {
+        let Ok(name) = value.clone().into_string() else {
             return Alts {
                 pairs,
                 error: Some(fail(key_message(&value))),

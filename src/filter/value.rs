@@ -250,36 +250,110 @@ pub(super) fn type_rank(value: &Value) -> u8 {
     }
 }
 
+enum Cmp<'a> {
+    Pair(&'a Value, &'a Value),
+    Array {
+        left: &'a [Value],
+        right: &'a [Value],
+        index: usize,
+    },
+    Object {
+        left: &'a [(String, Value)],
+        right: &'a [(String, Value)],
+        keys: Vec<&'a str>,
+        index: usize,
+    },
+}
+
+/// Element order is the same as a recursive walk. The stack is on the heap
+/// so a nest of tens of thousands of arrays does not overflow.
 pub(super) fn cmp_value(left: &Value, right: &Value) -> i8 {
-    let left_rank = type_rank(left);
-    let right_rank = type_rank(right);
-    if left_rank != right_rank {
-        return if left_rank < right_rank { -1 } else { 1 };
-    }
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => cmp_number(a, b),
-        (Value::String(a), Value::String(b)) => ord_i8(a.cmp(b)),
-        (Value::Array(a), Value::Array(b)) => cmp_array(a, b),
-        (Value::Object(a), Value::Object(b)) => cmp_object(a, b),
-        _ => 0,
-    }
-}
-
-pub(super) fn cmp_number(left: &str, right: &str) -> i8 {
-    number::cmp_number_text(left, right)
-}
-
-pub(super) fn cmp_array(left: &[Value], right: &[Value]) -> i8 {
-    for (a, b) in left.iter().zip(right.iter()) {
-        let cmp = cmp_value(a, b);
-        if cmp != 0 {
-            return cmp;
+    let mut stack = vec![Cmp::Pair(left, right)];
+    while let Some(job) = stack.pop() {
+        match job {
+            Cmp::Pair(left, right) => {
+                let left_rank = type_rank(left);
+                let right_rank = type_rank(right);
+                if left_rank != right_rank {
+                    return if left_rank < right_rank { -1 } else { 1 };
+                }
+                match (left, right) {
+                    (Value::Number(a), Value::Number(b)) => {
+                        let cmp = cmp_number(a, b);
+                        if cmp != 0 {
+                            return cmp;
+                        }
+                    }
+                    (Value::String(a), Value::String(b)) => {
+                        let cmp = ord_i8(a.cmp(b));
+                        if cmp != 0 {
+                            return cmp;
+                        }
+                    }
+                    (Value::Array(a), Value::Array(b)) => {
+                        stack.push(Cmp::Array {
+                            left: a,
+                            right: b,
+                            index: 0,
+                        });
+                    }
+                    (Value::Object(a), Value::Object(b)) => match object_keys(a, b) {
+                        Err(cmp) => return cmp,
+                        Ok(keys) => stack.push(Cmp::Object {
+                            left: a,
+                            right: b,
+                            keys,
+                            index: 0,
+                        }),
+                    },
+                    _ => {}
+                }
+            }
+            Cmp::Array { left, right, index } => {
+                if index >= left.len() || index >= right.len() {
+                    let cmp = ord_i8(left.len().cmp(&right.len()));
+                    if cmp != 0 {
+                        return cmp;
+                    }
+                    continue;
+                }
+                stack.push(Cmp::Array {
+                    left,
+                    right,
+                    index: index + 1,
+                });
+                stack.push(Cmp::Pair(&left[index], &right[index]));
+            }
+            Cmp::Object {
+                left,
+                right,
+                keys,
+                index,
+            } => {
+                if index >= keys.len() {
+                    continue;
+                }
+                let left_value = object_get(left, keys[index]);
+                let right_value = object_get(right, keys[index]);
+                stack.push(Cmp::Object {
+                    left,
+                    right,
+                    keys,
+                    index: index + 1,
+                });
+                stack.push(Cmp::Pair(left_value, right_value));
+            }
         }
     }
-    ord_i8(left.len().cmp(&right.len()))
+    0
 }
 
-pub(super) fn cmp_object(left: &[(String, Value)], right: &[(String, Value)]) -> i8 {
+/// Sorted keys when the two objects have the same names. Otherwise the
+/// comparison of the names.
+fn object_keys<'a>(
+    left: &'a [(String, Value)],
+    right: &'a [(String, Value)],
+) -> Result<Vec<&'a str>, i8> {
     let mut left_keys: Vec<&str> = left.iter().map(|(key, _)| key.as_str()).collect();
     let mut right_keys: Vec<&str> = right.iter().map(|(key, _)| key.as_str()).collect();
     left_keys.sort_unstable();
@@ -287,26 +361,22 @@ pub(super) fn cmp_object(left: &[(String, Value)], right: &[(String, Value)]) ->
     for (a, b) in left_keys.iter().zip(right_keys.iter()) {
         match a.cmp(b) {
             std::cmp::Ordering::Equal => {}
-            std::cmp::Ordering::Less => return -1,
-            std::cmp::Ordering::Greater => return 1,
+            std::cmp::Ordering::Less => return Err(-1),
+            std::cmp::Ordering::Greater => return Err(1),
         }
     }
     if left_keys.len() != right_keys.len() {
-        return if left_keys.len() < right_keys.len() {
+        return Err(if left_keys.len() < right_keys.len() {
             -1
         } else {
             1
-        };
+        });
     }
-    for key in left_keys {
-        let left_value = object_get(left, key);
-        let right_value = object_get(right, key);
-        let cmp = cmp_value(left_value, right_value);
-        if cmp != 0 {
-            return cmp;
-        }
-    }
-    0
+    Ok(left_keys)
+}
+
+pub(super) fn cmp_number(left: &str, right: &str) -> i8 {
+    number::cmp_number_text(left, right)
 }
 
 pub(super) fn object_get<'a>(items: &'a [(String, Value)], key: &str) -> &'a Value {

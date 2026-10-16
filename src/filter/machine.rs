@@ -2892,20 +2892,26 @@ fn walk_open(machine: &mut Machine, index: usize) {
         Body::Walk(walk) => std::mem::replace(&mut walk.input, Value::Null),
         _ => return,
     };
-    match input {
-        Value::Array(items) => {
+    let input = match input.into_array() {
+        Ok(items) => {
             let kids = items.into_iter().map(|value| (None, value)).collect();
             walk_set_kids(machine, index, false, kids);
+            return;
         }
-        Value::Object(pairs) => {
+        Err(input) => input,
+    };
+    let input = match input.into_object() {
+        Ok(pairs) => {
             let kids = pairs
                 .into_iter()
                 .map(|(key, value)| (Some(key), value))
                 .collect();
             walk_set_kids(machine, index, true, kids);
+            return;
         }
-        other => walk_apply(machine, index, other),
-    }
+        Err(input) => input,
+    };
+    walk_apply(machine, index, input);
 }
 
 fn walk_set_kids(

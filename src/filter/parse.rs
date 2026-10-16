@@ -2493,8 +2493,8 @@ pub(super) fn cmp_at(rest: &str) -> Option<(Op, usize)> {
 }
 
 pub(super) fn at_key(base: Option<Filter>, key: Filter) -> Filter {
-    if let Filter::Literal(Value::String(name)) = key {
-        return chain(base, Filter::Field(name));
+    if let Filter::Literal(Value::String(name)) = &key {
+        return chain(base, Filter::Field(name.clone()));
     }
     Filter::At {
         base: Box::new(base.unwrap_or(Filter::Identity)),
@@ -2709,7 +2709,8 @@ pub(super) fn const_object(fields: &[ObjField]) -> Option<Value> {
         let ObjField::Pair { key, value } = field else {
             return None;
         };
-        let Value::String(name) = const_one(key)? else {
+        let name = const_one(key)?;
+        let Ok(name) = name.into_string() else {
             return None;
         };
         let value = const_one(value)?;

@@ -165,9 +165,9 @@ fn arrange(keyed: Vec<(Value, Value)>, grouped: bool) -> Vec<Value> {
 fn firsts(groups: Vec<Value>) -> Vec<Value> {
     groups
         .into_iter()
-        .filter_map(|group| match group {
-            Value::Array(mut items) => items.drain(..).next(),
-            other => Some(other),
+        .filter_map(|group| match group.into_array() {
+            Ok(mut items) => items.drain(..).next(),
+            Err(other) => Some(other),
         })
         .collect()
 }

@@ -47,14 +47,28 @@ impl Style {
 
 /// Empty arrays and objects stay on one line. Anything else breaks across
 /// lines, indented the way the style asks.
+/// jq replaces a value nested deeper than this. The top-level value is depth 0.
+const DUMP_DEPTH: usize = 256;
+
 pub fn render(value: &Value, style: Style) -> String {
     let mut out = String::new();
     // Raw output applies only to a top-level string, not to strings nested in JSON.
-    write_value(&mut out, value, style, 0, true);
+    write_value(&mut out, value, style, 0, 0, true);
     out
 }
 
-fn write_value(out: &mut String, value: &Value, style: Style, level: usize, raw_here: bool) {
+fn write_value(
+    out: &mut String,
+    value: &Value,
+    style: Style,
+    level: usize,
+    depth: usize,
+    raw_here: bool,
+) {
+    if depth > DUMP_DEPTH {
+        out.push_str("<skipped: too deep>");
+        return;
+    }
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -62,12 +76,12 @@ fn write_value(out: &mut String, value: &Value, style: Style, level: usize, raw_
         Value::Number(raw) => crate::number::write_number(out, raw),
         Value::String(text) if raw_here && style.raw_strings() => out.push_str(text),
         Value::String(text) => push_string(out, text, style.ascii),
-        Value::Array(items) => write_array(out, items, style, level),
-        Value::Object(items) => write_object(out, items, style, level),
+        Value::Array(items) => write_array(out, items, style, level, depth),
+        Value::Object(items) => write_object(out, items, style, level, depth),
     }
 }
 
-fn write_array(out: &mut String, items: &[Value], style: Style, level: usize) {
+fn write_array(out: &mut String, items: &[Value], style: Style, level: usize, depth: usize) {
     if items.is_empty() {
         out.push_str("[]");
         return;
@@ -78,7 +92,7 @@ fn write_array(out: &mut String, items: &[Value], style: Style, level: usize) {
             if index > 0 {
                 out.push(',');
             }
-            write_value(out, item, style, 0, false);
+            write_value(out, item, style, 0, depth + 1, false);
         }
         out.push(']');
         return;
@@ -86,7 +100,7 @@ fn write_array(out: &mut String, items: &[Value], style: Style, level: usize) {
     out.push_str("[\n");
     for (index, item) in items.iter().enumerate() {
         push_indent(out, style, level + 1);
-        write_value(out, item, style, level + 1, false);
+        write_value(out, item, style, level + 1, depth + 1, false);
         if index + 1 != items.len() {
             out.push(',');
         }
@@ -96,7 +110,13 @@ fn write_array(out: &mut String, items: &[Value], style: Style, level: usize) {
     out.push(']');
 }
 
-fn write_object(out: &mut String, items: &[(String, Value)], style: Style, level: usize) {
+fn write_object(
+    out: &mut String,
+    items: &[(String, Value)],
+    style: Style,
+    level: usize,
+    depth: usize,
+) {
     if items.is_empty() {
         out.push_str("{}");
         return;
@@ -114,7 +134,7 @@ fn write_object(out: &mut String, items: &[(String, Value)], style: Style, level
             let (key, value) = &items[*slot];
             push_string(out, key, style.ascii);
             out.push(':');
-            write_value(out, value, style, 0, false);
+            write_value(out, value, style, 0, depth + 1, false);
         }
         out.push('}');
         return;
@@ -125,7 +145,7 @@ fn write_object(out: &mut String, items: &[(String, Value)], style: Style, level
         let (key, value) = &items[*slot];
         push_string(out, key, style.ascii);
         out.push_str(": ");
-        write_value(out, value, style, level + 1, false);
+        write_value(out, value, style, level + 1, depth + 1, false);
         if index + 1 != order.len() {
             out.push(',');
         }

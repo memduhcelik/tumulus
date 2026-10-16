@@ -34,7 +34,7 @@ Printing:
 - `-a` and `--ascii-output` escape non-ASCII as `\uXXXX`.
 - `-S` and `--sort-keys` sort object keys when printing.
 
-Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected.
+Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.
 
 Filters that work are field access (`.a`, `.a.b`, `.["a"]`, `."a b"`), array indexes (`.[0]` and negative indexes), slices (`.[2:5]`, `.[:-1]`, `.[$i:]`, `.[:length-1]`, `.[index("b"):]`), several keys or indexes in one bracket (`.["a","b"]`), iteration (`.[]`), recurse (`..`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
 

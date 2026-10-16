@@ -659,10 +659,10 @@ pub(super) fn nth_span(index: &Value) -> NthSpan {
         Ok(value) => value,
         Err(message) => return NthSpan::Add(message),
     };
-    let Value::Number(text) = summed else {
+    let Value::Number(text) = &summed else {
         return NthSpan::Add("number required".to_string());
     };
-    let n = number::f64_of(&text);
+    let n = number::f64_of(text);
     if !n.is_finite() {
         return NthSpan::Never;
     }

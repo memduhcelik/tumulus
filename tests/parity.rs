@@ -7934,3 +7934,146 @@ fn formats_match_jq() {
         compare_exact(program, &["-c", "--", program], input.as_bytes());
     }
 }
+
+#[test]
+fn deep_values_match_jq() {
+    require_jq();
+    let programs = [
+        "reduce range(0) as $i (0; [.])",
+        "reduce range(1) as $i (0; [.])",
+        "reduce range(4) as $i (0; [.])",
+        "reduce range(4) as $i (0; [.]) | tojson",
+        "reduce range(4) as $i (0; [.]) | tostring",
+        "reduce range(10) as $i (0; [., $i])",
+        "reduce range(8) as $i ({}; {a:.})",
+        "reduce range(3) as $i (0; {b:1, a:.})",
+        "reduce range(3) as $i (0; [., 9])",
+        "reduce range(3) as $i (0; [9, .])",
+        "def f: reduce range(6) as $i (0; [.]); f",
+        "reduce range(256) as $i (0; [.]) | tojson",
+        "reduce range(256) as $i (0; [.]) | tostring",
+        "reduce range(257) as $i (0; [.]) | tojson",
+        "reduce range(257) as $i (0; [.]) | tostring",
+        "reduce range(257) as $i (0; [.]) | @json",
+        "reduce range(257) as $i (0; [.]) | @text",
+        "reduce range(300) as $i (0; [.]) | tojson",
+        "reduce range(300) as $i (0; [.]) | tostring",
+        "reduce range(512) as $i (0; [.]) | (tojson == tostring)",
+        "reduce range(257) as $i (null; [.]) | tojson",
+        "reduce range(257) as $i (true; [.]) | tojson",
+        "reduce range(257) as $i (\"x\"; [.]) | tojson",
+        "reduce range(257) as $i ([1,2]; [.]) | tojson",
+        "reduce range(257) as $i ({b:1}; [.]) | tojson",
+        "reduce range(256) as $i ({}; {a:.}) | tojson",
+        "reduce range(257) as $i ({}; {a:.}) | tojson",
+        "reduce range(257) as $i (0; {a:.}) | tojson",
+        "reduce range(257) as $i (0; {a:., b:1}) | tojson",
+        "reduce range(257) as $i (0; {b:1, a:.}) | tojson",
+        "reduce range(257) as $i (0; [., 9]) | tojson",
+        "reduce range(257) as $i (0; [9, .]) | tojson",
+        "[range(5)] | reduce range(252) as $i (.; [.]) | tojson",
+        "[range(5)] | reduce range(253) as $i (.; [.]) | tojson",
+        "reduce range(256) as $i (0; [., $i]) | tojson",
+        "reduce range(257) as $i (0; [., $i]) | tojson",
+        "reduce range(255) as $i (0; [.]) == reduce range(255) as $i (0; [.])",
+        "reduce range(256) as $i (0; [.]) == reduce range(256) as $i (0; [.])",
+        "reduce range(257) as $i (0; [.]) == reduce range(257) as $i (0; [.])",
+        "reduce range(300) as $i (0; [.]) == reduce range(299) as $i (0; [.])",
+        "reduce range(300) as $i (0; [.]) == reduce range(300) as $i (1; [.])",
+        "reduce range(300) as $i (0; [.]) != reduce range(300) as $i (1; [.])",
+        "reduce range(257) as $i (0; [.]) < reduce range(257) as $i (1; [.])",
+        "reduce range(257) as $i (1; [.]) < reduce range(257) as $i (0; [.])",
+        "reduce range(257) as $i (0; [.]) > reduce range(256) as $i (0; [.])",
+        "reduce range(399) as $i (0; [.]) < reduce range(400) as $i (0; [.])",
+        "reduce range(400) as $i (0; [.]) < reduce range(399) as $i (0; [.])",
+        "reduce range(400) as $i (0; {z:.}) < reduce range(400) as $i (1; {z:.})",
+        "reduce range(400) as $i (0; {b:1, a:.}) == reduce range(400) as $i (0; {a:., b:1})",
+        "reduce range(300) as $i ({}; {a:.}) == reduce range(300) as $i ({}; {a:.})",
+        "reduce range(300) as $i ({}; {a:.}) == reduce range(299) as $i ({}; {a:.})",
+        "reduce range(400) as $i ([1,2,3]; [.]) == reduce range(400) as $i ([1,2,3]; [.])",
+        "reduce range(400) as $i ([1,2,3]; [.]) == reduce range(400) as $i ([1,9,3]; [.])",
+        "reduce range(400) as $i ([1,2]; [.]) < reduce range(400) as $i ([1,2,3]; [.])",
+        "[[range(3)]] == [[0,1,2]]",
+        "[1,2,3] == [1,2]",
+        "{\"b\":1,\"a\":2} == {\"a\":2,\"b\":1}",
+        "reduce range(2000) as $i (0; [.]) == reduce range(2000) as $i (0; [.])",
+        "reduce range(2000) as $i (0; [.]) == reduce range(2000) as $i (1; [.])",
+        "reduce range(2000) as $i (0; [.]) == reduce range(1999) as $i (0; [.])",
+        "reduce range(2000) as $i (0; [.]) | tojson | length",
+        "reduce range(2000) as $i (0; [.]) | tostring | length",
+        "reduce range(400) as $i ({}; {a:.}) == reduce range(400) as $i ({}; {a:.})",
+        "reduce range(400) as $i ({}; {a:.}) == reduce range(399) as $i ({}; {a:.})",
+        "reduce range(400) as $i ({}; {a:.}) | tojson | length",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    compare_exact(
+        "pretty 4",
+        &["-n", "--", "reduce range(4) as $i (0; [.])"],
+        b"",
+    );
+    compare_exact(
+        "pretty 257",
+        &["-n", "--", "reduce range(257) as $i (0; [.])"],
+        b"",
+    );
+    compare_exact(
+        "pretty object 257",
+        &["-n", "--", "reduce range(257) as $i ({}; {a:.})"],
+        b"",
+    );
+    compare_exact(
+        "tab 257",
+        &["-n", "--tab", "--", "reduce range(257) as $i (0; [.])"],
+        b"",
+    );
+    compare_exact(
+        "indent 1",
+        &[
+            "-n",
+            "--indent",
+            "1",
+            "--",
+            "reduce range(257) as $i (0; [.])",
+        ],
+        b"",
+    );
+    compare_exact(
+        "compact 257",
+        &["-n", "-c", "--", "reduce range(257) as $i (0; [.])"],
+        b"",
+    );
+    compare_exact(
+        "raw tostring",
+        &[
+            "-n",
+            "-r",
+            "--",
+            "reduce range(257) as $i (0; [.]) | tostring",
+        ],
+        b"",
+    );
+    compare_exact(
+        "sort keys 257",
+        &[
+            "-n",
+            "-c",
+            "-S",
+            "--",
+            "reduce range(257) as $i ({}; {b:1, a:.})",
+        ],
+        b"",
+    );
+    compare_exact(
+        "sort keys shallow",
+        &[
+            "-n",
+            "-c",
+            "-S",
+            "--",
+            "reduce range(4) as $i ({}; {b:1, a:.})",
+        ],
+        b"",
+    );
+}

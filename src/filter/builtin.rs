@@ -365,8 +365,9 @@ pub(super) fn eval_from_entries(input: &Value) -> Result<Vec<Value>, Failure> {
     let mut pairs = Vec::new();
     for item in items {
         let key = entry_key(&item)?;
-        let Value::String(name) = key else {
-            return Err(fail(super::parse::key_message(&key)));
+        let name = match key.into_string() {
+            Ok(name) => name,
+            Err(key) => return Err(fail(super::parse::key_message(&key))),
         };
         put(&mut pairs, name, entry_value(&item));
     }

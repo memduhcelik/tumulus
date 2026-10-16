@@ -299,6 +299,14 @@ pub(super) fn accelerate_reduce(
             accelerate_setpath(path, value, acc, env, lookup)?;
             Ok(true)
         }
+        // `[.]` is the accumulator wrapped in one array. Moving it is the
+        // same value as a copy, and a deep nest stays one step per wrap.
+        Filter::Collect(inner) if matches!(inner.as_ref(), Filter::Identity) => {
+            let inner = std::mem::replace(acc, Value::Null);
+            *acc = Value::Array(vec![inner]);
+            *lookup = None;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -2998,10 +3006,10 @@ fn write_slice(
             let Value::Array(items) = value else {
                 return Err("A slice of an array can only be assigned another array".to_string());
             };
-            let cur = match freeze(edit) {
-                Value::Array(items) => items,
-                Value::Null => Vec::new(),
-                other => {
+            let cur = match freeze(edit).into_array() {
+                Ok(items) => items,
+                Err(other) if matches!(other, Value::Null) => Vec::new(),
+                Err(other) => {
                     return Err(format!("Cannot index {} with object", other.type_name()));
                 }
             };
