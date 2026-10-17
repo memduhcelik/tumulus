@@ -33,6 +33,11 @@ Printing:
 - `-j` and `--join-output` do the same and leave off the newline. `-j` implies `-r`.
 - `-a` and `--ascii-output` escape non-ASCII as `\uXXXX`.
 - `-S` and `--sort-keys` sort object keys when printing.
+- `-C` and `--color-output` color JSON. `-M` and `--monochrome-output` do not. `-M` wins when both are set. With neither, color is used when stdout is a terminal, unless `NO_COLOR` is set to something other than empty. `JQ_COLORS` is eight colon-separated slots, for null, false, true, numbers, strings, arrays, objects, and keys. A bad value prints `Failed to set $JQ_COLORS` and the default colors are kept.
+- `--seq` reads and writes application/json-seq. A JSON text is preceded by an ASCII record separator. A raw string is not. A bad record prints `jq: ignoring parse error` and reading continues.
+- `--raw-output0` implies `-r` and ends each output with a NUL byte. A string that contains a NUL is rejected.
+- `--unbuffered` flushes after each output.
+- `-V` and `--version` print the version and exit 0. The filter is not run.
 
 Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.
 

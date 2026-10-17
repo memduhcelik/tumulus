@@ -75,6 +75,226 @@ pub(crate) fn nul_cut(bytes: &[u8]) -> usize {
     }
 }
 
+/// One JSON text from a `--seq` input, or an error jq ignores and keeps reading.
+pub enum SeqItem {
+    Value(LocatedValue),
+    Error(String),
+}
+
+/// `application/json-seq`. Bytes before the first ASCII RS are skipped.
+/// A value cut off by RS is dropped. An input with no RS is abandoned text.
+pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
+    let mut items = Vec::new();
+    let mut index = 0;
+    let mut line = 1usize;
+    let mut column = 0usize;
+    while index < bytes.len() && bytes[index] != b'\x1e' {
+        step(&mut line, &mut column, bytes[index]);
+        index += 1;
+    }
+    if index == bytes.len() {
+        items.push(SeqItem::Error(format!(
+            "Unfinished abandoned text at EOF at line {line}, column {column}"
+        )));
+        return items;
+    }
+    let mut saw_newline = false;
+    while index < bytes.len() {
+        // The RS itself.
+        step(&mut line, &mut column, bytes[index]);
+        index += 1;
+        let start = index;
+        let start_line = line;
+        let start_column = column;
+        let mut chunk_newline = false;
+        while index < bytes.len() && bytes[index] != b'\x1e' {
+            if bytes[index] == b'\n' {
+                chunk_newline = true;
+            }
+            step(&mut line, &mut column, bytes[index]);
+            index += 1;
+        }
+        let ended_by_rs = index < bytes.len() && bytes[index] == b'\x1e';
+        let chunk = &bytes[start..index];
+        // A record with no newline, after an earlier newline, is discarded.
+        if saw_newline && !chunk_newline {
+            continue;
+        }
+        saw_newline |= chunk_newline;
+        push_chunk(
+            &mut items,
+            chunk,
+            start_line,
+            start_column,
+            ended_by_rs,
+            line,
+            column,
+        );
+    }
+    items
+}
+
+fn step(line: &mut usize, column: &mut usize, byte: u8) {
+    if byte == b'\n' {
+        *line += 1;
+        *column = 0;
+    } else {
+        *column += 1;
+    }
+}
+
+fn push_chunk(
+    items: &mut Vec<SeqItem>,
+    chunk: &[u8],
+    start_line: usize,
+    start_column: usize,
+    ended_by_rs: bool,
+    end_line: usize,
+    end_column: usize,
+) {
+    let mut offset = 0usize;
+    let mut line = start_line;
+    let mut column = start_column;
+    while offset < chunk.len() {
+        let scanned = scan_text_at(&chunk[offset..], line, column);
+        let base = offset;
+        let mut values = scanned.values;
+        let at_end = base
+            + scanned
+                .error
+                .as_ref()
+                .map(|_| scanned.error_at)
+                .unwrap_or(chunk.len() - base)
+            >= chunk.len()
+            || scanned.error.is_none();
+        let slice_end = chunk.len() - base;
+        let trailing_ws = matches!(chunk[base..].last(), Some(b' ' | b'\t' | b'\n' | b'\r'));
+        if scanned.error.is_none() && !trailing_ws {
+            if let Some((value, end)) = values.last() {
+                let end = *end;
+                if end == slice_end
+                    && is_atom(value)
+                    && (ended_by_rs || matches!(value, Value::Number(_)))
+                {
+                    let value = value.clone();
+                    values.pop();
+                    push_kept(items, &values, &chunk[base..], line);
+                    if ended_by_rs {
+                        let column = end_column + 1;
+                        let phrase = if matches!(value, Value::Number(_)) {
+                            format!(
+                                "Potentially truncated top-level numeric value at line {end_line}, column {column}"
+                            )
+                        } else {
+                            format!("Truncated value at line {end_line}, column {column}")
+                        };
+                        items.push(SeqItem::Error(phrase));
+                    } else if matches!(value, Value::Number(_)) {
+                        items.push(SeqItem::Error(format!(
+                            "Potentially truncated top-level numeric value at EOF at line {end_line}, column {end_column}"
+                        )));
+                    } else {
+                        push_kept(items, &[(value, end)], &chunk[base..], line);
+                    }
+                    return;
+                }
+            }
+        }
+        push_kept(items, &values, &chunk[base..], line);
+        let Some(err) = scanned.error else {
+            return;
+        };
+        let error_line = err.line();
+        let message = err.text();
+        if ended_by_rs && at_end && message.contains(" at EOF ") {
+            if chunk.contains(&b'\n') {
+                return;
+            }
+            let column = end_column + 1;
+            items.push(SeqItem::Error(format!(
+                "Truncated value at line {end_line}, column {column}"
+            )));
+            return;
+        }
+        if message.contains(" at EOF ") {
+            items.push(SeqItem::Error(message));
+            return;
+        }
+        items.push(SeqItem::Error(format!("{message} (need RS to resync)")));
+        // jq names the following line as well when the bad token did not
+        // already end there, then keeps parsing.
+        if scanned.resume_line > error_line && base + scanned.resume < chunk.len() {
+            items.push(SeqItem::Error(format!(
+                "Invalid numeric literal at line {}, column 0 (need RS to resync)",
+                scanned.resume_line
+            )));
+        }
+        let resume = scanned.resume;
+        if resume == 0 {
+            return;
+        }
+        offset = base + resume;
+        line = scanned.resume_line;
+        column = 0;
+        if offset >= chunk.len() {
+            return;
+        }
+    }
+}
+
+fn push_kept(items: &mut Vec<SeqItem>, values: &[(Value, usize)], chunk: &[u8], start_line: usize) {
+    for (value, end) in values {
+        let line = start_line + chunk[..*end].iter().filter(|byte| **byte == b'\n').count();
+        items.push(SeqItem::Value(LocatedValue {
+            value: value.clone(),
+            line,
+        }));
+    }
+}
+
+fn scan_text_at(text: &[u8], line: usize, column: usize) -> Scanned {
+    let mut parser = Parser::new(text);
+    parser.seek_at(0, line, column);
+    let mut values = Vec::new();
+    loop {
+        parser.skip_ws();
+        if parser.eof() {
+            return Scanned {
+                values,
+                error: None,
+                incomplete: false,
+                error_at: parser.index,
+                resume: parser.index,
+                resume_line: parser.line,
+                restart: parser.index,
+                restart_line: parser.line,
+            };
+        }
+        let restart = parser.index;
+        let restart_line = parser.line;
+        let value = match parser.parse_value() {
+            Ok(value) => value,
+            Err(err) => return stop(values, err, &parser, restart, restart_line),
+        };
+        let end = parser.index;
+        if is_atom(&value) {
+            let phrase = match parser.peek() {
+                Some(']') => Some("Unmatched ']'"),
+                Some('}') => Some("Unmatched '}'"),
+                Some(',') => Some("Expected value before ','"),
+                Some(':') => Some("Expected string key before ':'"),
+                _ => None,
+            };
+            if let Some(phrase) = phrase {
+                parser.bump();
+                let err = parser.fail(phrase, false);
+                return stop(values, err, &parser, restart, restart_line);
+            }
+        }
+        values.push((value, end));
+    }
+}
+
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
     let bytes = &bytes[..nul_cut(bytes)];
     let (bom, text) = split_bom(bytes);

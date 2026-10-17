@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+`-C` forces colored JSON. `-M` turns color off, and `-M` wins when both are given. With neither, color is used when stdout is a terminal, unless `NO_COLOR` is set to a non-empty value. `JQ_COLORS` replaces the eight color slots, in order: null, false, true, numbers, strings, arrays, objects, and keys. A trailing colon does not add a slot. A bad value prints `Failed to set $JQ_COLORS` and the default colors are kept. `debug` uses those colors. `stderr` does not.
+
+`--seq` reads and writes application/json-seq. Each JSON text is preceded by an ASCII record separator. A raw string is not. Bytes before the first separator are skipped. A bad record prints `jq: ignoring parse error` and reading continues. `--raw-output0` implies `-r` and ends each output with a NUL instead of a newline. A string containing a NUL is rejected. `--unbuffered` flushes stdout after each output. `-V` and `--version` print the version and exit 0 before the filter runs.
+
 ## 0.9.0
 
 Released on 2026-10-17.

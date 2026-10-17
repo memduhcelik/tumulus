@@ -12,6 +12,10 @@ impl ParseErr {
         self.at_eof
     }
 
+    pub(in crate::parse) fn line(&self) -> usize {
+        self.line
+    }
+
     pub(in crate::parse) fn text(&self) -> String {
         if self.at_eof {
             format!(

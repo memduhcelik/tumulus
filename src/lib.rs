@@ -13,16 +13,16 @@ mod value;
 pub use error::Error;
 pub use feed::{
     bind_source, environ_now, jq_origin, library_paths, location, next_main, open_failed,
-    set_dump_flags, set_environ, set_input_line, set_library_paths, set_prog_origin, set_unknown,
-    streaming, MainNext, Source, SourceGuard,
+    output_place, set_dump_color, set_dump_flags, set_environ, set_input_line, set_library_paths,
+    set_output_place, set_prog_origin, set_unknown, streaming, MainNext, Source, SourceGuard,
 };
 pub use filter::{
     compile, compile_with, eval, eval_stream, eval_with, reads_input, set_import_origin, Failure,
     Filter, ProgramError,
 };
 pub use parse::{
-    parse_stream, program_stream, program_stream_with, write_input, LocatedValue, ParsedStream,
-    StreamFeed, StreamValue,
+    parse_seq, parse_stream, program_stream, program_stream_with, write_input, LocatedValue,
+    ParsedStream, SeqItem, StreamFeed, StreamValue,
 };
-pub use print::{render, Indent, Layout, Style};
+pub use print::{parse_colors, render, set_palette, Indent, Layout, Style};
 pub use value::Value;

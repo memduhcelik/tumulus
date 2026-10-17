@@ -10,8 +10,8 @@ use std::fs::{self, File};
 use std::io::{self, Read as IoRead};
 
 use crate::parse::{
-    closer_is_detached, nul_cut, program_stream_with, pull_stream, scan_input, stream_line,
-    LineCursor, StreamState,
+    closer_is_detached, nul_cut, parse_seq, program_stream, program_stream_with, pull_stream,
+    scan_input, stream_line, LineCursor, SeqItem, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -22,6 +22,8 @@ thread_local! {
     static INPUT_LINE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DUMP_ASCII: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DUMP_SORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DUMP_COLOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OUTPUT_PLACE: RefCell<String> = const { RefCell::new(String::new()) };
     static PROG_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
     /// `None` is jq's default list. `Some` is the `-L` list, which replaces it.
     static LIBRARIES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -46,6 +48,10 @@ pub struct Source {
     pub stream: bool,
     /// `--stream-errors`. A parse error is one more value, and parsing goes on.
     pub stream_errors: bool,
+    /// `--seq` input. Raw input ignores this and keeps lines.
+    pub seq: bool,
+    /// Read stdin in pieces so a finished value can be printed before EOF.
+    pub piecewise: bool,
 }
 
 pub struct SourceGuard;
@@ -91,6 +97,14 @@ pub fn input_line_value() -> Value {
 pub fn set_dump_flags(ascii: bool, sort_keys: bool) {
     DUMP_ASCII.with(|slot| slot.set(ascii));
     DUMP_SORT.with(|slot| slot.set(sort_keys));
+}
+
+pub fn set_dump_color(color: bool) {
+    DUMP_COLOR.with(|slot| slot.set(color));
+}
+
+pub fn dump_color() -> bool {
+    DUMP_COLOR.with(|slot| slot.get())
 }
 
 pub fn dump_flags() -> (bool, bool) {
@@ -148,6 +162,15 @@ pub fn set_unknown() {
     let _ = with_mut(|session| session.at = "<unknown>".to_string());
 }
 
+/// Where a dump error is reported when the input reader is not running.
+pub fn set_output_place(place: String) {
+    OUTPUT_PLACE.with(|slot| *slot.borrow_mut() = place);
+}
+
+pub fn output_place() -> String {
+    OUTPUT_PLACE.with(|slot| slot.borrow().clone())
+}
+
 pub fn location() -> Option<String> {
     with(|session| session.at.clone())
 }
@@ -162,14 +185,19 @@ pub fn streaming() -> bool {
 }
 
 pub fn read_one() -> Read {
-    with_mut(|session| match session.pull(true) {
-        Ok(Pulled::Value(value)) => Read::Value(value),
-        Ok(Pulled::Parse(message)) => Read::Parse(message),
-        Ok(Pulled::End) => {
-            session.mark_break();
-            Read::Break
+    with_mut(|session| loop {
+        match session.pull(true) {
+            Ok(Pulled::Value(value)) => return Read::Value(value),
+            Ok(Pulled::Parse(message)) => return Read::Parse(message),
+            Ok(Pulled::Soft(message)) => {
+                eprintln!("jq: ignoring parse error: {message}");
+            }
+            Ok(Pulled::End) => {
+                session.mark_break();
+                return Read::Break;
+            }
+            Err(message) => return Read::Fatal(message),
         }
-        Err(message) => Read::Fatal(message),
     })
     .unwrap_or(Read::Break)
 }
@@ -186,6 +214,7 @@ pub fn next_main() -> Result<MainNext, Error> {
         Ok(match pulled {
             Pulled::Value(value) => MainNext::Value(value),
             Pulled::Parse(message) => MainNext::Parse(message),
+            Pulled::Soft(message) => MainNext::Soft(message),
             Pulled::End => MainNext::Eof,
         })
     }) else {
@@ -197,12 +226,15 @@ pub fn next_main() -> Result<MainNext, Error> {
 pub enum MainNext {
     Value(Value),
     Parse(String),
+    /// `--seq` keeps reading after this message.
+    Soft(String),
     Eof,
 }
 
 enum Pulled {
     Value(Value),
     Parse(String),
+    Soft(String),
     End,
 }
 
@@ -291,6 +323,15 @@ struct Session {
     drive: StreamState,
     /// The stream value released just before the one still held.
     prev: Option<Value>,
+    seq: bool,
+    piecewise: bool,
+    seq_done: bool,
+    seq_queue: VecDeque<SeqQueued>,
+}
+
+enum SeqQueued {
+    Value(Value),
+    Soft(String),
 }
 
 struct Staged {
@@ -319,6 +360,8 @@ impl Session {
             slurp: source.slurp,
             stream: source.stream,
             stream_errors: source.stream_errors,
+            seq: source.seq,
+            piecewise: source.piecewise,
             buf: Vec::new(),
             chunks: Vec::new(),
             scan_at: 0,
@@ -346,6 +389,8 @@ impl Session {
             staging: VecDeque::new(),
             drive: StreamState::default(),
             prev: None,
+            seq_done: false,
+            seq_queue: VecDeque::new(),
         }
     }
 
@@ -356,6 +401,9 @@ impl Session {
         if self.dead {
             return Ok(Pulled::End);
         }
+        if self.seq && !self.raw {
+            return self.pull_seq();
+        }
         if self.slurp {
             return self.pull_slurp(from_input);
         }
@@ -363,6 +411,56 @@ impl Session {
             return self.pull_raw();
         }
         self.pull_json(from_input)
+    }
+
+    /// `--seq` is one pass over the whole input. Errors are kept, and reading goes on.
+    fn pull_seq(&mut self) -> Result<Pulled, String> {
+        if !self.seq_done {
+            loop {
+                if self.append()? == More::Eof {
+                    break;
+                }
+            }
+            let mut slurped = Vec::new();
+            for item in parse_seq(&self.buf) {
+                match item {
+                    SeqItem::Error(message) => self.seq_queue.push_back(SeqQueued::Soft(message)),
+                    SeqItem::Value(located) if self.slurp => slurped.push(located.value),
+                    SeqItem::Value(located) if self.stream => self.queue_stream(&located.value),
+                    SeqItem::Value(located) => {
+                        self.seq_queue.push_back(SeqQueued::Value(located.value))
+                    }
+                }
+            }
+            if self.slurp {
+                self.seq_queue
+                    .push_back(SeqQueued::Value(Value::array(slurped)));
+            }
+            self.seq_done = true;
+        }
+        Ok(match self.seq_queue.pop_front() {
+            Some(SeqQueued::Value(value)) => Pulled::Value(value),
+            Some(SeqQueued::Soft(message)) => Pulled::Soft(message),
+            None => Pulled::End,
+        })
+    }
+
+    fn queue_stream(&mut self, value: &Value) {
+        let bytes = crate::print::render(
+            value,
+            crate::print::Style {
+                layout: crate::print::Layout::Compact,
+                ..crate::print::Style::default()
+            },
+        )
+        .into_bytes();
+        let fed = program_stream(&bytes, false);
+        for item in fed.values {
+            self.seq_queue.push_back(SeqQueued::Value(item.value));
+        }
+        if let Some(message) = fed.error {
+            self.seq_queue.push_back(SeqQueued::Soft(message));
+        }
     }
 
     fn pull_json(&mut self, recover: bool) -> Result<Pulled, String> {
@@ -729,7 +827,7 @@ impl Session {
     }
 
     fn append(&mut self) -> Result<More, String> {
-        if self.stream && !self.raw && !self.slurp {
+        if self.piecewise || (self.stream && !self.raw && !self.slurp) {
             return self.append_stream();
         }
         self.append_whole()

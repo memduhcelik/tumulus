@@ -35,6 +35,8 @@ pub(super) fn eval_debug(input: &Value) -> Result<Vec<Value>, Failure> {
         join: false,
         ascii,
         sort_keys,
+        color: crate::feed::dump_color(),
+        ..crate::print::Style::default()
     };
     let mut bytes = crate::print::render(&wrapped, style).into_bytes();
     bytes.push(b'\n');
@@ -48,10 +50,7 @@ pub(super) fn eval_stderr(input: &Value) -> Result<Vec<Value>, Failure> {
         other => {
             let style = crate::print::Style {
                 layout: crate::print::Layout::Compact,
-                raw: false,
-                join: false,
-                ascii: false,
-                sort_keys: false,
+                ..crate::print::Style::default()
             };
             crate::print::render(other, style).into_bytes()
         }
@@ -125,10 +124,7 @@ fn halt_bytes(value: &Value) -> Vec<u8> {
         other => {
             let style = crate::print::Style {
                 layout: crate::print::Layout::Compact,
-                raw: false,
-                join: false,
-                ascii: false,
-                sort_keys: false,
+                ..crate::print::Style::default()
             };
             let mut bytes = crate::print::render(other, style).into_bytes();
             bytes.push(b'\n');

@@ -10428,3 +10428,204 @@ fn search_key_matches_jq() {
         b"",
     );
 }
+
+#[test]
+fn output_options_match_jq() {
+    require_jq();
+    let value = r#"[null,false,true,1,"hi",[],{"b":1,"a":"x"}]"#;
+    let programs = [
+        ("color null", &["-n", "-C", "null"][..]),
+        ("color value", &["-n", "-C", "-c", value]),
+        ("color pretty", &["-n", "-C", "[1,2]"]),
+        ("color object", &["-n", "-C", "{b:1,a:2}"]),
+        ("color sorted", &["-n", "-C", "-S", "{b:1,a:2}"]),
+        ("color tab", &["-n", "-C", "--tab", "[1]"]),
+        ("color raw", &["-n", "-C", "-r", r#""hi""#]),
+        ("color ascii", &["-n", "-C", "-a", r#""é""#]),
+        ("mono", &["-n", "-M", "null"]),
+        ("color then mono", &["-n", "-C", "-M", "null"]),
+        ("mono then color", &["-n", "-M", "-C", "null"]),
+        ("cluster CM", &["-n", "-CM", "null"]),
+        ("cluster MC", &["-n", "-MC", "-c", "1"]),
+        ("debug color", &["-n", "-C", "1|debug"]),
+        ("debug plain", &["-n", "1|debug"]),
+        ("stderr color", &["-n", "-C", "1|stderr"]),
+        ("seq values", &["-n", "--seq", "1,2,null"]),
+        ("seq compact", &["-n", "-c", "--seq", "[1,2]"]),
+        ("seq pretty", &["-n", "--seq", "{a:1}"]),
+        ("seq raw", &["-n", "--seq", "-r", r#""ab""#]),
+        ("seq join", &["-n", "-j", "--seq", r#"1,"a""#]),
+        ("seq ascii", &["-n", "-a", "--seq", r#""é""#]),
+        ("seq color", &["-n", "-C", "--seq", "-c", "1"]),
+        ("seq debug", &["-n", "--seq", "1|debug"]),
+        ("seq empty", &["-n", "--seq", "empty"]),
+        ("raw0 string", &["-n", "--raw-output0", r#""ab""#]),
+        ("raw0 two", &["-n", "--raw-output0", r#""a","b",1"#]),
+        ("raw0 empty", &["-n", "--raw-output0", r#""""#]),
+        ("raw0 newline", &["-n", "--raw-output0", r#""a\nb""#]),
+        ("raw0 object", &["-n", "--raw-output0", "{a:1}"]),
+        ("raw0 compact", &["-n", "--raw-output0", "-c", "{a:1}"]),
+        ("raw0 nul", &["-n", "--raw-output0", r#""a\u0000b""#]),
+        ("raw0 file nul", &["-c", "--raw-output0", "."]),
+        ("raw0 join", &["-n", "--raw-output0", "-j", "1,2"]),
+        ("raw0 then join", &["-n", "-j", "--raw-output0", r#""ab""#]),
+        ("raw0 ascii", &["-n", "-a", "--raw-output0", r#""é""#]),
+        ("raw0 color", &["-n", "-C", "--raw-output0", "1"]),
+        (
+            "raw0 color string",
+            &["-n", "-C", "--raw-output0", r#""hi""#],
+        ),
+        (
+            "raw0 seq",
+            &["-n", "--seq", "--raw-output0", r#"1,{a:1},"z""#],
+        ),
+        ("raw0 status", &["-n", "-e", "--raw-output0", "false"]),
+        ("raw0 empty out", &["-n", "--raw-output0", "empty"]),
+    ];
+    for (name, args) in programs {
+        compare_exact(name, args, b"");
+    }
+    compare_exact(
+        "raw0 stdin nul",
+        &["-c", "--raw-output0", "."],
+        b"\"a\\u0000b\"\n",
+    );
+
+    let seq_in = [
+        ("seq in", &b"\x1e1\n\x1e2\n"[..]),
+        ("seq ws", b"\x1e  1\n"),
+        ("seq two in one", b"\x1e1 2\n"),
+        ("seq no rs", b"1\n"),
+        ("seq bare", b"1"),
+        ("seq empty", b""),
+        ("seq only rs", b"\x1e"),
+        ("seq newline", b"\n"),
+        ("seq lead", b"x\x1e1\n"),
+        ("seq cut number", b"\x1e1\x1e2\n"),
+        ("seq cut true", b"\x1etrue\x1e1\n"),
+        ("seq number eof", b"\x1e1"),
+        ("seq number space", b"\x1e1 "),
+        ("seq true eof", b"\x1etrue"),
+        ("seq array eof", b"\x1e[]"),
+        ("seq drop tail", b"\x1e1\n\x1e[]"),
+        ("seq keep nl", b"\x1e1\n\x1e[]\n"),
+        ("seq second number", b"\x1e1\n2"),
+        ("seq bad middle", b"\x1e1\n\x1ebad\n\x1e3\n"),
+        ("seq string nl", b"\x1e\"a\nb\"\n"),
+        ("seq slash", b"\x1e[\x1e]\n"),
+        ("seq obj cut", b"\x1e{\"a\"\x1e1\n"),
+        ("seq comment", b"\x1e // c\n1\n"),
+        ("seq slurp", b"\x1e1\n\x1e2\n"),
+        ("seq slurp empty", b""),
+        ("seq slurp bad", b"\x1e1\n\x1ebad\n\x1e3\n"),
+        ("seq stream obj", b"\x1e{\"a\":1}\n"),
+        ("seq stream arr", b"\x1e[1,2]\n"),
+        ("seq raw lines", b"\x1e1\n\x1e2\n"),
+    ];
+    for (name, input) in seq_in {
+        let args: &[&str] = if name.starts_with("seq slurp bad") || name == "seq slurp" {
+            &["-s", "--seq", "-c", "."]
+        } else if name == "seq slurp empty" {
+            &["-s", "--seq", "-c", "."]
+        } else if name.starts_with("seq stream") {
+            &["--stream", "--seq", "-c", "."]
+        } else if name == "seq raw lines" {
+            &["-R", "--seq", "."]
+        } else {
+            &["--seq", "-c", "."]
+        };
+        compare_exact(name, args, input);
+    }
+
+    compare_colored(
+        "palette",
+        &["-n", "-C", "-c", value],
+        "1;31:1;32:1;33:1;34:1;35:1;36:1;37:1;4",
+    );
+    compare_colored("palette one", &["-n", "-C", "null"], "1;31");
+    compare_colored("palette empty slots", &["-n", "-C", "-c", value], ":::::");
+    compare_colored("palette colon", &["-n", "-C", "null"], ":");
+    compare_colored("palette bad", &["-n", "-C", "null"], "bad");
+    compare_colored("palette bad mono", &["-n", "-M", "null"], "nope");
+    compare_colored("palette empty", &["-n", "-C", "null"], "");
+
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    for args in [
+        &["-V"][..],
+        &["--version"],
+        &["-Vn", "1"],
+        &["!", "-V"],
+        &["-V", "--bogus"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let got = run(bin, &owned, b"");
+        assert_eq!(got.stdout, b"tumulus-0.9.0\n", "{args:?}");
+        assert!(
+            got.stderr.is_empty(),
+            "{args:?} {}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(got.status.code(), Some(0), "{args:?}");
+    }
+    let jq = run("jq", &["-V".to_string()], b"");
+    assert!(jq.stdout.ends_with(b"\n") && jq.stdout.starts_with(b"jq-"));
+    assert!(jq.stderr.is_empty());
+    assert_eq!(jq.status.code(), Some(0));
+
+    assert!(early_byte(&["-c", "--unbuffered", "."], b"1\n").starts_with(b"1\n"));
+    assert!(early_byte(&["-c", "."], b"1\n").is_empty());
+}
+
+fn compare_colored(name: &str, args: &[&str], colors: &str) {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let go = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(&owned)
+            .env("JQ_COLORS", colors)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output().unwrap_or_else(|err| panic!("{name}: {err}"))
+    };
+    let got = go(bin);
+    let expected = go("jq");
+    assert_eq!(got.stdout, expected.stdout, "{name}: stdout");
+    assert_eq!(
+        got.stderr,
+        expected.stderr,
+        "{name}: stderr\n{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert_eq!(got.status.code(), expected.status.code(), "{name}: status");
+}
+
+fn early_byte(args: &[&str], input: &[u8]) -> Vec<u8> {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let mut child = Command::new(bin)
+        .args(&owned)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(input);
+    let _ = stdin.flush();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let n = stdout.read(&mut buf).unwrap_or(0);
+        let _ = tx.send(buf[..n].to_vec());
+    });
+    // Buffered output stays empty until the process ends. `--unbuffered` does not.
+    let got = rx
+        .recv_timeout(std::time::Duration::from_millis(400))
+        .unwrap_or_default();
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    got
+}

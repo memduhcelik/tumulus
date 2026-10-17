@@ -1,15 +1,15 @@
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
-    parse_stream, program_stream, program_stream_with, reads_input, render, set_dump_flags,
-    set_environ, set_import_origin, set_input_line, set_library_paths, set_prog_origin,
-    set_unknown, Error, Failure, Filter, Indent, Layout, MainNext, ProgramError, Source, Style,
-    Value,
+    output_place, parse_colors, parse_seq, parse_stream, program_stream, program_stream_with,
+    reads_input, render, set_dump_flags, set_environ, set_import_origin, set_input_line,
+    set_library_paths, set_output_place, set_palette, set_prog_origin, set_unknown, Error, Failure,
+    Filter, Indent, Layout, MainNext, ProgramError, SeqItem, Source, Style, Value,
 };
 
 fn main() {
@@ -117,7 +117,14 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     };
     let environ = environ_now();
     set_environ(environ.clone());
+    if let Ok(text) = env::var("JQ_COLORS") {
+        match parse_colors(&text) {
+            Some(colors) => set_palette(colors),
+            None => eprintln!("Failed to set $JQ_COLORS"),
+        }
+    }
     set_dump_flags(options.style.ascii, options.style.sort_keys);
+    tumulus::set_dump_color(options.style.color);
     set_prog_origin(program_origin(&options.program));
     set_input_line(0);
     let env = initial_env(&options.named, &options.positional, &environ);
@@ -137,6 +144,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
             options.style,
             options.stream,
             options.stream_errors,
+            options.seq,
             &program,
             &env,
             &mut run,
@@ -146,7 +154,15 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
         // The same reader as `inputs`, so a value can run on into the next file.
         apply_shared(&options, &program, &env, &mut run, out)?;
     } else {
-        apply_values(&options.files, options.style, &program, &env, &mut run, out)?;
+        apply_values(
+            &options.files,
+            options.style,
+            options.seq,
+            &program,
+            &env,
+            &mut run,
+            out,
+        )?;
     }
     apply_exit_status(&mut run, options.exit_status);
     Ok(run.status)
@@ -203,13 +219,27 @@ struct Outcome {
 fn apply_values(
     files: &[String],
     style: Style,
+    seq: bool,
     program: &Filter,
     env: &[(String, Value)],
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
+    // `--unbuffered` prints a finished value before stdin closes.
+    if files.is_empty() && style.flush {
+        return apply_incremental(style, seq, program, env, run, out);
+    }
     if files.is_empty() {
-        let outcome = apply(&read_stdin()?, style, program, "<stdin>", env, run, out)?;
+        let outcome = apply(
+            &read_stdin()?,
+            style,
+            seq,
+            program,
+            "<stdin>",
+            env,
+            run,
+            out,
+        )?;
         if outcome.jq_halt {
             run.stopped = true;
         }
@@ -220,7 +250,7 @@ fn apply_values(
         match read_input(path) {
             Ok(bytes) => {
                 let source = if path == "-" { "<stdin>" } else { path };
-                let outcome = apply(&bytes, style, program, source, env, run, out)?;
+                let outcome = apply(&bytes, style, seq, program, source, env, run, out)?;
                 if outcome.jq_halt {
                     run.stopped = true;
                     run.status = outcome.status;
@@ -253,17 +283,30 @@ fn apply_values(
 fn apply(
     bytes: &[u8],
     style: Style,
+    seq: bool,
     program: &Filter,
     source: &str,
     env: &[(String, Value)],
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<Outcome, Error> {
+    if seq {
+        return apply_seq(bytes, style, program, source, env, run, out);
+    }
     let parsed = parse_stream(bytes)?;
     let mut failed = false;
     for item in &parsed.values {
         set_input_line(item.line);
+        set_output_place(format!("{source}:{}", item.line));
         match run_program(program, &item.value, env, style, run, out)? {
+            Ok(()) if run.stopped => {
+                return Ok(Outcome {
+                    status: run.status,
+                    halt: true,
+                    clear_failure: false,
+                    jq_halt: false,
+                });
+            }
             Ok(()) => failed = false,
             Err(failure) => {
                 write_values(&failure.partial, style, run, out)?;
@@ -297,6 +340,108 @@ fn apply(
     })
 }
 
+fn apply_incremental(
+    style: Style,
+    seq: bool,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let _guard = bind_source(Source {
+        files: Vec::new(),
+        raw: false,
+        slurp: false,
+        stream: false,
+        stream_errors: false,
+        seq,
+        piecewise: true,
+    });
+    let mut failed = false;
+    loop {
+        if run.stopped {
+            break;
+        }
+        match next_main()? {
+            MainNext::Eof => break,
+            MainNext::Parse(message) => {
+                eprintln!("jq: parse error: {message}");
+                failed = true;
+                break;
+            }
+            MainNext::Soft(message) => {
+                eprintln!("jq: ignoring parse error: {message}");
+            }
+            MainNext::Value(value) => {
+                failed = emit(program, &value, env, style, "<stdin>", 0, run, out)?;
+            }
+        }
+    }
+    run.status = if run.stopped {
+        run.status
+    } else if failed {
+        5
+    } else {
+        0
+    };
+    Ok(())
+}
+
+fn apply_seq(
+    bytes: &[u8],
+    style: Style,
+    program: &Filter,
+    source: &str,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<Outcome, Error> {
+    let mut failed = false;
+    let mut any = false;
+    for item in parse_seq(bytes) {
+        match item {
+            SeqItem::Error(message) => {
+                eprintln!("jq: ignoring parse error: {message}");
+            }
+            SeqItem::Value(item) => {
+                any = true;
+                set_input_line(item.line);
+                set_output_place(format!("{source}:{}", item.line));
+                match run_program(program, &item.value, env, style, run, out)? {
+                    Ok(()) if run.stopped => {
+                        return Ok(Outcome {
+                            status: run.status,
+                            halt: true,
+                            clear_failure: false,
+                            jq_halt: false,
+                        });
+                    }
+                    Ok(()) => failed = false,
+                    Err(failure) => {
+                        write_values(&failure.partial, style, run, out)?;
+                        if let Some(code) = take_stop(&failure) {
+                            return Ok(Outcome {
+                                status: code,
+                                halt: true,
+                                clear_failure: false,
+                                jq_halt: true,
+                            });
+                        }
+                        report_error(&format!("{source}:{}", item.line), &failure);
+                        failed = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(Outcome {
+        status: if failed { 5 } else { 0 },
+        halt: false,
+        clear_failure: !failed && any,
+        jq_halt: false,
+    })
+}
+
 /// One stream for `.` and for `input`. `-n` does not take a value first.
 fn apply_shared(
     options: &Options,
@@ -311,6 +456,8 @@ fn apply_shared(
         slurp: options.slurp,
         stream: (options.stream || options.stream_errors) && !options.raw_input,
         stream_errors: options.stream_errors && !options.raw_input,
+        seq: options.seq && !options.raw_input,
+        piecewise: options.style.flush,
     });
     let mut failed = false;
     if options.null_input {
@@ -336,6 +483,9 @@ fn apply_shared(
                     eprintln!("jq: parse error: {message}");
                     failed = true;
                     break;
+                }
+                MainNext::Soft(message) => {
+                    eprintln!("jq: ignoring parse error: {message}");
                 }
                 MainNext::Value(value) => {
                     failed = emit(program, &value, env, options.style, "", 0, run, out)?;
@@ -365,6 +515,7 @@ fn apply_null(
 ) -> Result<(), Error> {
     set_input_line(0);
     match run_program(program, &Value::Null, env, style, run, out)? {
+        Ok(()) if run.stopped => {}
         Ok(()) => run.status = 0,
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
@@ -448,6 +599,7 @@ fn apply_slurp(
     style: Style,
     stream: bool,
     stream_errors: bool,
+    seq: bool,
     program: &Filter,
     env: &[(String, Value)],
     run: &mut Run,
@@ -474,7 +626,7 @@ fn apply_slurp(
                 buf.extend_from_slice(&bytes);
                 // A parse error is a value with `--stream-errors`, so a later
                 // file is still part of the input.
-                if stream_errors {
+                if stream_errors || seq {
                     continue;
                 }
                 if let Some(message) = if stream {
@@ -491,6 +643,41 @@ fn apply_slurp(
     if let Some(message) = early {
         eprintln!("jq: parse error: {message}");
         run.status = finish_input(missing, true);
+        return Ok(());
+    }
+    if seq {
+        let mut values = Vec::new();
+        for item in parse_seq(&buf) {
+            match item {
+                SeqItem::Error(message) => {
+                    eprintln!("jq: ignoring parse error: {message}");
+                }
+                SeqItem::Value(item) => values.push(item.value),
+            }
+        }
+        let input = if stream {
+            let mut streamed = Vec::new();
+            for value in values {
+                let bytes = render(
+                    &value,
+                    Style {
+                        layout: Layout::Compact,
+                        ..Style::default()
+                    },
+                )
+                .into_bytes();
+                let fed = program_stream(&bytes, false);
+                for item in fed.values {
+                    streamed.push(item.value);
+                }
+            }
+            Value::array(streamed)
+        } else {
+            Value::array(values)
+        };
+        set_input_line(at.line);
+        let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
+        run.status = stopped_status(run, missing, failed);
         return Ok(());
     }
     if stream {
@@ -695,6 +882,7 @@ fn emit_at(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<bool, Error> {
+    set_output_place(at.to_string());
     match run_program(program, input, env, style, run, out)? {
         Ok(()) => Ok(false),
         Err(failure) => {
@@ -718,12 +906,15 @@ fn run_program(
     out: &mut dyn Write,
 ) -> Result<Result<(), Failure>, Error> {
     let mut io_err = None;
-    let result = eval_stream(program, input, env, &mut |value| {
-        if let Err(err) = write_one(value, style, run, out) {
+    let result = eval_stream(program, input, env, &mut |value| match write_one(
+        value, style, run, out,
+    ) {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(err) => {
             io_err = Some(err);
-            return true;
+            true
         }
-        false
     });
     if let Some(err) = io_err {
         return Err(err);
@@ -759,10 +950,7 @@ fn report_error(at: &str, failure: &Failure) {
         Some(value) => {
             let style = Style {
                 layout: Layout::Compact,
-                raw: false,
-                join: false,
-                ascii: false,
-                sort_keys: false,
+                ..Style::default()
             };
             eprintln!(
                 "jq: error (at {at}) (not a string): {}",
@@ -784,23 +972,57 @@ fn write_values(
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     for value in values {
-        write_one(value, style, run, out)?;
+        if write_one(value, style, run, out)? {
+            break;
+        }
     }
     Ok(())
 }
 
-fn write_one(value: &Value, style: Style, run: &mut Run, out: &mut dyn Write) -> Result<(), Error> {
+fn write_one(
+    value: &Value,
+    style: Style,
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<bool, Error> {
+    if style.nul {
+        if let Value::String(text) = value {
+            if style.raw && !style.ascii && text.chars().any(|ch| ch == '\0') {
+                let at = {
+                    let place = output_place();
+                    if place.is_empty() {
+                        location().unwrap_or_else(|| "<unknown>".to_string())
+                    } else {
+                        place
+                    }
+                };
+                eprintln!(
+                    "jq: error (at {at}): Cannot dump a string containing NUL with --raw-output0 option"
+                );
+                run.status = 5;
+                run.stopped = true;
+                return Ok(true);
+            }
+        }
+    }
+    // A raw string is not a JSON text, so `--seq` does not prefix it.
+    let raw_string = matches!(value, Value::String(_)) && style.raw && !style.ascii;
+    if style.seq && !raw_string {
+        out.write_all(b"\x1e")?;
+    }
     let rendered = render(value, style);
     out.write_all(rendered.as_bytes())?;
-    if !style.join {
+    if style.nul {
+        out.write_all(b"\0")?;
+    } else if !style.join {
         out.write_all(b"\n")?;
     }
     run.produced = true;
     run.last_false = matches!(value, Value::Null | Value::Bool(false));
-    if tumulus::streaming() {
+    if style.flush || tumulus::streaming() {
         out.flush()?;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn os_reason(err: &std::io::Error) -> String {
@@ -824,6 +1046,7 @@ struct Options {
     exit_status: bool,
     stream: bool,
     stream_errors: bool,
+    seq: bool,
     /// `None` keeps jq's default module path. `Some` is every `-L`.
     libraries: Option<Vec<String>>,
     program: Program,
@@ -848,6 +1071,12 @@ struct Flags {
     from_file: bool,
     stream: bool,
     stream_errors: bool,
+    /// `-C` was seen. `-M` still wins.
+    color: bool,
+    /// `-M` was seen.
+    mono: bool,
+    seq: bool,
+    unbuffered: bool,
     libraries: Option<Vec<String>>,
 }
 
@@ -862,6 +1091,10 @@ fn options() -> Result<Options, Error> {
         from_file: false,
         stream: false,
         stream_errors: false,
+        color: false,
+        mono: false,
+        seq: false,
+        unbuffered: false,
         libraries: None,
     };
     let mut named = Vec::new();
@@ -991,6 +1224,18 @@ fn options() -> Result<Options, Error> {
                 flags.stream = true;
                 flags.stream_errors = true;
             }
+            "--seq" => flags.seq = true,
+            "--raw-output0" => {
+                flags.style.raw = true;
+                flags.style.nul = true;
+            }
+            "--unbuffered" => flags.unbuffered = true,
+            "--color-output" => flags.color = true,
+            "--monochrome-output" => flags.mono = true,
+            "--version" => {
+                print_version();
+                process::exit(0);
+            }
             // The file name is the first operand, not the next argument.
             "-f" | "--from-file" => flags.from_file = true,
             "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
@@ -1000,12 +1245,28 @@ fn options() -> Result<Options, Error> {
             // `-nc` is options. `-1` and `-.a` are programs, because the
             // character after the dash is not a letter.
             other if is_option_cluster(other) => {
+                let body = &other[1..];
+                // `V` prints the version before an unknown letter in the same
+                // cluster is rejected. `h` is left for the help text.
+                if body.contains('V') && !body.contains('h') {
+                    print_version();
+                    process::exit(0);
+                }
                 apply_short_cluster(&mut flags, other)?;
             }
             _ => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
         }
         index += 1;
     }
+    flags.style.color = if flags.mono {
+        false
+    } else if flags.color {
+        true
+    } else {
+        auto_color()
+    };
+    flags.style.seq = flags.seq;
+    flags.style.flush = flags.unbuffered;
     let (program, files) = if flags.from_file {
         if operands.is_empty() {
             (Program::File(".".to_string()), Vec::new())
@@ -1027,6 +1288,7 @@ fn options() -> Result<Options, Error> {
         exit_status: flags.exit_status,
         stream: flags.stream,
         stream_errors: flags.stream_errors,
+        seq: flags.seq,
         program,
         files,
         named,
@@ -1110,10 +1372,25 @@ fn apply_short_cluster(flags: &mut Flags, arg: &str) -> Result<(), Error> {
             'e' => flags.exit_status = true,
             'R' => flags.raw_input = true,
             'f' => flags.from_file = true,
+            'C' => flags.color = true,
+            'M' => flags.mono = true,
             _ => return Err(Error::new(format!("unknown option: {arg}"))),
         }
     }
     Ok(())
+}
+
+/// Color when stdout is a terminal, unless `NO_COLOR` is set to something.
+fn auto_color() -> bool {
+    match env::var_os("NO_COLOR") {
+        Some(value) if !value.is_empty() => false,
+        _ => io::stdout().is_terminal(),
+    }
+}
+
+/// `tumulus-0.9.0`. jq prints its own build the same way.
+fn print_version() {
+    println!("tumulus-{}", env!("CARGO_PKG_VERSION"));
 }
 
 fn one_json(text: &str) -> Option<Value> {
