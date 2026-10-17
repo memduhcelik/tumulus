@@ -651,6 +651,11 @@ fn set_reached(reached: HashSet<usize>) -> Reached {
     Reached
 }
 
+pub(super) fn reset_compile_state() {
+    REACHED.with(|slot| *slot.borrow_mut() = None);
+    PLACE.with(|slot| slot.borrow_mut().clear());
+}
+
 /// Calls that nobody defined, and the functions a call actually reaches.
 /// An argument of an undefined call is not itself reported: jq names the call.
 fn undefined_calls(filter: &Filter) -> (Vec<(usize, String)>, HashSet<usize>) {

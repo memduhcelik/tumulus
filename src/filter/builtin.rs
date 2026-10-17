@@ -60,10 +60,7 @@ pub(super) fn eval_stderr(input: &Value) -> Result<Vec<Value>, Failure> {
 }
 
 fn write_err(bytes: &[u8]) {
-    use std::io::Write;
-    let mut err = std::io::stderr();
-    let _ = err.write_all(bytes);
-    let _ = err.flush();
+    crate::host::write_stderr_bytes(bytes);
 }
 
 pub(super) fn builtins_value() -> Value {

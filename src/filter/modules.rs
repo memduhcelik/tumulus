@@ -18,6 +18,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::eprint;
+use crate::eprintln;
 use std::rc::Rc;
 
 use crate::value::Value;

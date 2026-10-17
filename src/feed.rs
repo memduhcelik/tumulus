@@ -9,9 +9,11 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read as IoRead};
 
+use crate::eprintln;
 use crate::parse::{
     closer_is_detached, finished_on_eof_cut, nul_cut, parse_seq, program_stream,
-    program_stream_with, pull_stream, scan_input, stream_line, LineCursor, SeqItem, StreamState,
+    program_stream_with, pull_stream, scan_input, stream_line, InputScan, LineCursor, SeqItem,
+    StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -65,6 +67,19 @@ impl Drop for SourceGuard {
 pub fn bind_source(source: Source) -> SourceGuard {
     SESSION.with(|slot| *slot.borrow_mut() = Some(Session::open(source)));
     SourceGuard
+}
+
+/// Clear the reader and the values a previous run stored on this thread.
+pub(crate) fn reset_for_run() {
+    SESSION.with(|slot| *slot.borrow_mut() = None);
+    ENVIRON.with(|slot| *slot.borrow_mut() = None);
+    INPUT_LINE.with(|slot| slot.set(0));
+    DUMP_ASCII.with(|slot| slot.set(false));
+    DUMP_SORT.with(|slot| slot.set(false));
+    DUMP_COLOR.with(|slot| slot.set(false));
+    OUTPUT_PLACE.with(|slot| slot.borrow_mut().clear());
+    PROG_ORIGIN.with(|slot| slot.borrow_mut().clear());
+    LIBRARIES.with(|slot| *slot.borrow_mut() = None);
 }
 
 pub fn set_environ(value: Value) {
@@ -142,7 +157,7 @@ pub fn prog_origin() -> String {
 
 /// Directory of `argv[0]`. A name with no slash is `.`, and symlinks stay unresolved.
 pub fn jq_origin() -> String {
-    let arg0 = std::env::args().next().unwrap_or_default();
+    let arg0 = crate::host::args().into_iter().next().unwrap_or_default();
     let path = std::path::Path::new(&arg0);
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_string_lossy().into_owned(),
@@ -510,44 +525,23 @@ impl Session {
             return self.fill_stream();
         }
         loop {
-            let scan = scan_input(&self.buf, self.scan_at, self.scan_line);
-            for (value, end) in scan.values {
-                let (name, line) = self.place(end, is_atom(&value));
-                self.pending.push_back(Item {
-                    value,
-                    name,
-                    line,
-                    unknown: false,
-                });
-            }
+            // A number or literal at the end of this file stays open until
+            // the next file proves it is finished.
+            let mut scan = scan_input(&self.buf, self.scan_at, self.scan_line, true);
             if scan.incomplete {
-                self.scan_at = scan.restart;
-                self.scan_line = scan.restart_line;
+                let restart = scan.restart;
+                let restart_line = scan.restart_line;
+                self.push_scanned(std::mem::take(&mut scan.values));
+                self.scan_at = restart;
+                self.scan_line = restart_line;
                 if self.append()? == More::Added {
                     continue;
                 }
-                let (name, line) = if let Some(name) = self.failed_here.clone() {
-                    (name, 0)
-                } else {
-                    self.place(scan.error_at, false)
-                };
-                self.fault = Some(Fault {
-                    message: scan.error.unwrap_or_else(|| "parse error".to_string()),
-                    name,
-                    line,
-                    unknown: false,
-                });
-                return Ok(true);
+                scan = scan_input(&self.buf, self.scan_at, self.scan_line, false);
             }
-            if let Some(message) = scan.error {
-                let (name, line) = self.place(scan.error_at, false);
-                self.fault = Some(Fault {
-                    message,
-                    name,
-                    line,
-                    unknown: false,
-                });
-                self.staged = Some((scan.resume, scan.resume_line));
+            self.push_scanned(std::mem::take(&mut scan.values));
+            if scan.incomplete || scan.error.is_some() {
+                self.store_fault(scan);
                 return Ok(true);
             }
             self.scan_at = scan.resume;
@@ -558,6 +552,40 @@ impl Session {
             if self.append()? == More::Eof {
                 return Ok(false);
             }
+        }
+    }
+
+    fn push_scanned(&mut self, values: Vec<(Value, usize)>) {
+        for (value, end) in values {
+            let (name, line) = self.place(end, is_atom(&value));
+            self.pending.push_back(Item {
+                value,
+                name,
+                line,
+                unknown: false,
+            });
+        }
+    }
+
+    fn store_fault(&mut self, scan: InputScan) {
+        let message = scan.error.unwrap_or_else(|| "parse error".to_string());
+        let (name, line) = if scan.incomplete {
+            if let Some(name) = self.failed_here.clone() {
+                (name, 0)
+            } else {
+                self.place(scan.error_at, false)
+            }
+        } else {
+            self.place(scan.error_at, false)
+        };
+        self.fault = Some(Fault {
+            message,
+            name,
+            line,
+            unknown: false,
+        });
+        if !scan.incomplete {
+            self.staged = Some((scan.resume, scan.resume_line));
         }
     }
 
@@ -761,7 +789,7 @@ impl Session {
             self.load_stream_slurp();
             return self.pop_slurp();
         }
-        let scan = scan_input(&self.buf, 0, 1);
+        let scan = scan_input(&self.buf, 0, 1, false);
         if let Some(message) = scan.error {
             let (name, line) = if scan.incomplete {
                 if let Some(name) = self.failed_here.clone() {
@@ -870,7 +898,7 @@ impl Session {
             }
             let mut tmp = [0u8; 4096];
             let read = match self.live.as_mut().expect("open stream") {
-                Live::Stdin => IoRead::read(&mut io::stdin(), &mut tmp),
+                Live::Stdin => crate::host::read_stdin(&mut tmp),
                 Live::File(file) => IoRead::read(file, &mut tmp),
             };
             let name = self.live_name();
@@ -1151,8 +1179,7 @@ fn open_live(path: &str) -> Result<LiveOpen, String> {
 fn read_path(path: &str) -> Result<Opened, String> {
     if path == "-" {
         let mut buf = Vec::new();
-        io::Read::read_to_end(&mut io::stdin(), &mut buf)
-            .map_err(|err| format!("cannot read -: {err}"))?;
+        crate::host::read_stdin_to_end(&mut buf).map_err(|err| format!("cannot read -: {err}"))?;
         return Ok(Opened::Data(buf));
     }
     match fs::read(path) {

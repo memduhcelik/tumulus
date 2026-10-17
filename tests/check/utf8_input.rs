@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn require_jq() {
     match Command::new("jq").arg("--version").output() {
@@ -17,6 +18,16 @@ fn require_jq() {
             String::from_utf8_lossy(&output.stderr)
         ),
         Err(err) => panic!("jq is required for parity checks and was not runnable: {err}"),
+    }
+}
+
+/// A child that exits before reading closes the pipe. The check still
+/// compares that child's output.
+fn write_stdin(stdin: &mut impl Write, program: &str, input: &[u8]) {
+    match stdin.write_all(input) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write stdin to {program}: {err}"),
     }
 }
 
@@ -35,16 +46,6 @@ fn run(program: &str, args: &[String], input: &[u8]) -> std::process::Output {
     child
         .wait_with_output()
         .unwrap_or_else(|err| panic!("wait for {program}: {err}"))
-}
-
-/// A child that exits before reading closes the pipe. The check still
-/// compares that child's output.
-fn write_stdin(stdin: &mut impl Write, program: &str, input: &[u8]) {
-    match stdin.write_all(input) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(err) => panic!("write stdin to {program}: {err}"),
-    }
 }
 
 fn matches_jq(name: &str, args: &[&str], input: &[u8]) {
@@ -200,17 +201,49 @@ fn invalid_utf8_in_a_string_matches_jq() {
         ("null glued to a bad byte", &["-c", "."], b"null\xff\n"),
         ("nan glued to a bad byte", &["-c", "."], b"nan\xff\n"),
     ];
-    for (name, args, input) in cases {
-        matches_jq(name, args, input);
-    }
+    let mut jobs: Vec<(String, Vec<String>, Vec<u8>)> = cases
+        .iter()
+        .map(|(name, args, input)| {
+            (
+                (*name).to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                input.to_vec(),
+            )
+        })
+        .collect();
     // 0x00 through 0x7F are valid UTF-8. 0x80 through 0xFF cannot be a
     // scalar on their own, so each one is a replacement inside the string.
     for byte in 0x80u8..=0xFF {
         let mut input = b"\"a".to_vec();
         input.push(byte);
         input.extend_from_slice(b"b\"");
-        matches_jq(&format!("string byte {byte:02x}"), &["-c", "."], &input);
+        jobs.push((
+            format!("string byte {byte:02x}"),
+            vec!["-c".to_string(), ".".to_string()],
+            input,
+        ));
     }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        / 4;
+    let cores = cores.max(1).min(jobs.len());
+    let next = AtomicUsize::new(0);
+    let next = &next;
+    let jobs = &jobs;
+    std::thread::scope(|scope| {
+        for _ in 0..cores {
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= jobs.len() {
+                    break;
+                }
+                let (name, args, input) = &jobs[index];
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                matches_jq(name, &borrowed, input);
+            });
+        }
+    });
     let file = TempJson::new(b"{\"msg\":\"a\xffb\"}\n");
     let path = file.path.to_str().expect("temp path is utf-8");
     matches_jq("bad byte in a file", &[".", path], b"");

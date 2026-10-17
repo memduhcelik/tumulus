@@ -68,6 +68,9 @@ extern "C" {
     fn gmtime_r(clock: *const i64, out: *mut Tm) -> *mut Tm;
     fn localtime_r(clock: *const i64, out: *mut Tm) -> *mut Tm;
     fn timegm(tm: *mut Tm) -> i64;
+    /// The C library keeps these for the whole process. `localtime` replaces
+    /// the numeric offset a fresh process would print.
+    static mut tzname: [*mut c_char; 2];
     fn strftime(buf: *mut c_char, max: usize, format: *const c_char, tm: *const Tm) -> usize;
     fn strptime(text: *const c_char, format: *const c_char, tm: *mut Tm) -> *mut c_char;
     fn isspace(c: i32) -> i32;
@@ -201,13 +204,13 @@ pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, Strin
     let mut tm = blank();
     tm.tm_wday = 8;
     tm.tm_yday = 367;
-    let end = unsafe {
+    let end = with_tz(|| unsafe {
         strptime(
             raw.as_ptr() as *const c_char,
             spec.as_ptr() as *const c_char,
             &mut tm,
         )
-    };
+    });
     if end.is_null() || !trailing_space(end) {
         return Err(mismatch(text, visible));
     }
@@ -264,13 +267,13 @@ fn fields(items: &[Value]) -> Option<Tm> {
 fn broken_down(ts: f64, local: bool) -> Result<Tm, String> {
     let clock = number::c_cast_i64(ts);
     let mut tm = blank();
-    let ptr = unsafe {
+    let ptr = with_tz(|| unsafe {
         if local {
             localtime_r(&clock, &mut tm)
         } else {
             gmtime_r(&clock, &mut tm)
         }
-    };
+    });
     if ptr.is_null() {
         Err("error converting number of seconds since epoch to datetime".to_string())
     } else {
@@ -279,7 +282,7 @@ fn broken_down(ts: f64, local: bool) -> Result<Tm, String> {
 }
 
 fn stamp(tm: &mut Tm) -> Result<Value, String> {
-    let clock = unsafe { timegm(tm) };
+    let clock = with_tz(|| unsafe { timegm(tm) });
     // `-1` and `-2` are real timestamps as well as `timegm`'s sentinels.
     // jq reports the sentinel either way.
     if clock == -2 {
@@ -301,14 +304,14 @@ fn render(tm: &Tm, format: &str, name: &str) -> Result<Value, String> {
     // an empty format, is an unknown system failure.
     let cap = visible.len() + 0x64;
     let mut buf = vec![0u8; cap];
-    let wrote = unsafe {
+    let wrote = with_tz(|| unsafe {
         strftime(
             buf.as_mut_ptr() as *mut c_char,
             cap,
             spec.as_ptr() as *const c_char,
             tm,
         )
-    };
+    });
     if wrote == 0 || wrote >= cap {
         return Err(format!("{name}/1: unknown system failure"));
     }
@@ -486,4 +489,154 @@ fn computed(n: f64) -> Value {
 
 fn as_f64(text: &str) -> f64 {
     number::f64_of(text)
+}
+
+/// One run's timezone names. A fresh process prints the numeric offset.
+/// `localtime` replaces that, for this run only, with the abbreviation.
+struct RunZone {
+    buf0: [u8; 64],
+    buf1: [u8; 64],
+}
+
+thread_local! {
+    static RUN_ZONE: std::cell::RefCell<Option<RunZone>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The names a fresh process prints, captured once.
+static FRESH_ZONE: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+
+/// Serializes the process-global `tzname` while a run borrows it.
+static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) struct ZoneGuard;
+
+/// Remember the fresh zone names for this run. Later runs do not see a
+/// `localtime` that happened in an earlier one.
+pub(crate) fn zone_guard() -> ZoneGuard {
+    let (saved0, saved1) = fresh_names();
+    RUN_ZONE.with(|slot| {
+        let mut zone = RunZone {
+            buf0: [0; 64],
+            buf1: [0; 64],
+        };
+        copy_into(&mut zone.buf0, &saved0);
+        copy_into(&mut zone.buf1, &saved1);
+        *slot.borrow_mut() = Some(zone);
+    });
+    ZoneGuard
+}
+
+impl Drop for ZoneGuard {
+    fn drop(&mut self) {
+        let _hold = TZ_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        RUN_ZONE.with(|slot| *slot.borrow_mut() = None);
+        point_at_fresh();
+    }
+}
+
+fn fresh_names() -> (Vec<u8>, Vec<u8>) {
+    FRESH_ZONE
+        .get_or_init(|| {
+            prime_tzname();
+            unsafe { (copy_cstr(tzname[0]), copy_cstr(tzname[1])) }
+        })
+        .clone()
+}
+
+/// The first `strftime` of a fresh process fills `tzname`.
+fn prime_tzname() {
+    let clock = 0i64;
+    let mut tm = blank();
+    unsafe {
+        gmtime_r(&clock, &mut tm);
+    }
+    clear_zone(&mut tm);
+    let spec = b"%Z\0";
+    let mut buf = [0u8; 32];
+    unsafe {
+        strftime(
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            spec.as_ptr() as *const c_char,
+            &tm,
+        );
+    }
+}
+
+/// Run `body` with this run's zone names. The real binary has no saved names
+/// and uses the process as it is.
+fn with_tz<T>(body: impl FnOnce() -> T) -> T {
+    let active = RUN_ZONE.with(|slot| slot.borrow().is_some());
+    if !active {
+        return body();
+    }
+    let _hold = TZ_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    point_at_run();
+    let out = body();
+    save_run();
+    out
+}
+
+fn point_at_run() {
+    RUN_ZONE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let zone = slot.as_mut().expect("zone");
+        unsafe {
+            tzname[0] = zone.buf0.as_mut_ptr() as *mut c_char;
+            tzname[1] = zone.buf1.as_mut_ptr() as *mut c_char;
+        }
+    });
+}
+
+fn point_at_fresh() {
+    let Some((saved0, saved1)) = FRESH_ZONE.get() else {
+        return;
+    };
+    // The buffers have to outlive this function. Leak one stable copy.
+    static LIVE: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    let (live0, live1) = LIVE.get_or_init(|| (saved0.clone(), saved1.clone()));
+    unsafe {
+        tzname[0] = live0.as_ptr() as *mut c_char;
+        tzname[1] = live1.as_ptr() as *mut c_char;
+    }
+}
+
+fn save_run() {
+    let name0 = unsafe { copy_cstr(tzname[0]) };
+    let name1 = unsafe { copy_cstr(tzname[1]) };
+    RUN_ZONE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(zone) = slot.as_mut() else {
+            return;
+        };
+        copy_into(&mut zone.buf0, &name0);
+        copy_into(&mut zone.buf1, &name1);
+    });
+}
+
+fn copy_into(dst: &mut [u8], src: &[u8]) {
+    dst.fill(0);
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    if n == dst.len() {
+        dst[dst.len() - 1] = 0;
+    }
+}
+
+fn copy_cstr(ptr: *const c_char) -> Vec<u8> {
+    if ptr.is_null() {
+        return vec![0];
+    }
+    let mut out = Vec::new();
+    unsafe {
+        for index in 0..63 {
+            let byte = *ptr.add(index) as u8;
+            out.push(byte);
+            if byte == 0 {
+                return out;
+            }
+        }
+    }
+    out.push(0);
+    out
 }

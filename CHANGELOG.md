@@ -8,6 +8,8 @@
 
 `input_line_number` stays at the newlines read so far while a value is produced. After `input` or `inputs` reads past the end, the count is 0 when the last value was completed at the end of the file, and it stays when the file ended on a newline. A newline still counts when it is not part of a value. With `-s`, the count is 0 once that array has been read.
 
+`input` and `inputs` keep one value open across files. One file holding `1`, a newline, and `2`, then a file holding `3`, is `[1,23]`. A newline or a space ends the value in the file where it is written.
+
 ## 0.9.0
 
 Released on 2026-10-17.

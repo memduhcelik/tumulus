@@ -11,6 +11,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Case {
     line: usize,
@@ -225,6 +226,90 @@ fn syntax_error(outcome: &Outcome) -> bool {
         && outcome.stderr == b"tumulus: syntax error\n"
 }
 
+enum Class {
+    Match(usize, String),
+    Rejected {
+        line: usize,
+        program: String,
+        label: &'static str,
+    },
+    Value(Diff),
+    Status(Diff),
+    Both(Diff),
+}
+
+fn classify(case: &Case, bin: &str, home: &Path) -> Class {
+    let input = case.input.as_deref().unwrap_or("").as_bytes();
+    // This binary is the only one running, so the two tools share the wait.
+    let (ours, jq) = std::thread::scope(|scope| {
+        let ours = scope.spawn(|| run_filter(bin, &case.program, input, home));
+        let jq = scope.spawn(|| run_filter("jq", &case.program, input, home));
+        (ours.join().unwrap(), jq.join().unwrap())
+    });
+    if same(&ours, &jq) {
+        return Class::Match(case.line, case.program.clone());
+    }
+    // Exit 3 is jq's compile error. Any other status means jq compiled
+    // the program and ran it, even when the value then failed.
+    if syntax_error(&ours) && jq.code != Some(3) {
+        return Class::Rejected {
+            line: case.line,
+            program: case.program.clone(),
+            label: bucket(&case.program),
+        };
+    }
+    let row = Diff {
+        line: case.line,
+        program: case.program.clone(),
+        ours,
+        jq,
+    };
+    if syntax_error(&row.ours) {
+        Class::Both(row)
+    } else if row.ours.stdout != row.jq.stdout {
+        Class::Value(row)
+    } else {
+        Class::Status(row)
+    }
+}
+
+/// Every case still runs jq. The cases run together.
+fn classify_all(cases: &[Case], bin: &str, home: &Path) -> Vec<Class> {
+    let mut slots = Vec::with_capacity(cases.len());
+    for _ in 0..cases.len() {
+        slots.push(None);
+    }
+    let slots = std::sync::Mutex::new(slots);
+    // The parity tests run in this same process, so leave most cores to them.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        / 4;
+    let cores = cores.max(1).min(cases.len());
+    let next = AtomicUsize::new(0);
+    let next = &next;
+    let cases = &cases;
+    let slots_ref = &slots;
+    std::thread::scope(|scope| {
+        for _ in 0..cores {
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= cases.len() {
+                    break;
+                }
+                let class = classify(&cases[index], bin, home);
+                slots_ref.lock().unwrap()[index] = Some(class);
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|class| class.expect("case"))
+        .collect()
+}
+
 #[test]
 fn compare_jq_test_file() {
     let version = require_jq();
@@ -233,43 +318,29 @@ fn compare_jq_test_file() {
     let home = empty_home();
     let _cleanup = DirGuard(home.clone());
 
+    let classes = classify_all(&cases, bin, &home);
     let mut matched = Vec::new();
     let mut syntax: BTreeMap<&'static str, Bucket> = BTreeMap::new();
     let mut both_reject = Vec::new();
     let mut values = Vec::new();
     let mut status = Vec::new();
-
-    for case in &cases {
-        let input = case.input.as_deref().unwrap_or("").as_bytes();
-        let ours = run_filter(bin, &case.program, input, &home);
-        let jq = run_filter("jq", &case.program, input, &home);
-        if same(&ours, &jq) {
-            matched.push((case.line, case.program.clone()));
-            continue;
-        }
-        // Exit 3 is jq's compile error. Any other status means jq compiled
-        // the program and ran it, even when the value then failed.
-        if syntax_error(&ours) && jq.code != Some(3) {
-            let label = bucket(&case.program);
-            let entry = syntax.entry(label).or_default();
-            if entry.examples.len() < 3 {
-                entry.examples.push((case.line, case.program.clone()));
+    for class in classes {
+        match class {
+            Class::Match(line, program) => matched.push((line, program)),
+            Class::Rejected {
+                line,
+                program,
+                label,
+            } => {
+                let entry = syntax.entry(label).or_default();
+                if entry.examples.len() < 3 {
+                    entry.examples.push((line, program));
+                }
+                entry.count += 1;
             }
-            entry.count += 1;
-            continue;
-        }
-        let row = Diff {
-            line: case.line,
-            program: case.program.clone(),
-            ours,
-            jq,
-        };
-        if syntax_error(&row.ours) {
-            both_reject.push(row);
-        } else if row.ours.stdout != row.jq.stdout {
-            values.push(row);
-        } else {
-            status.push(row);
+            Class::Value(row) => values.push(row),
+            Class::Status(row) => status.push(row),
+            Class::Both(row) => both_reject.push(row),
         }
     }
 

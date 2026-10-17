@@ -144,6 +144,10 @@ pub(super) fn install_scope(scope: Rc<ScopeNode>) {
     SCOPE.with(|slot| *slot.borrow_mut() = Some(scope));
 }
 
+pub(super) fn reset_scope() {
+    SCOPE.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// Install an empty scope for one top-level run. Drop restores the previous one.
 pub(super) fn root_scope() -> ScopeGuard {
     set_scope(empty_scope())

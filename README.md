@@ -18,7 +18,7 @@ chmod +x tumulus
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test jq_suite -- --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 382 come out the same on stdout, stderr, and the exit status.
+`cargo test --test check -- --exact jq_suite::compare_jq_test_file --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 382 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -97,7 +97,7 @@ Each side of a slice is an expression, so a variable, arithmetic, or a call work
 
 `try expr` keeps every value `expr` produced before it failed, then stops. That is the same as `try expr catch empty`. `try expr catch handler` runs `handler` on the error value instead. A builtin failure is caught as its message. `error` raises the current input, and `error(expr)` raises the first value `expr` produces. When nothing catches the error, a string is printed as `jq: error (at ...): ` and that text. Any other value is printed as `jq: error (at ...) (not a string): ` and the compact JSON. The exit status is 5 when that input is the last one.
 
-`input` reads the next value. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and `inputs` stops. A value that is not valid JSON fails that read with jq's parse message. If the failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, the stream is one array of every value. With `-R`, each line is one string.
+`input` reads the next value. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and `inputs` stops. A value continues from one file into the next: `1`, a newline, and `2` in the first file and `3` in the second are `1` and `23`. A value that is not valid JSON fails that read with jq's parse message. If the failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, the stream is one array of every value. With `-R`, each line is one string.
 
 `$__loc__` is an object `{"file":"<top-level>","line":N}`. `N` is the line of that `$`. A program read with `-f` still says `<top-level>`.
 

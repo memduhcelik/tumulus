@@ -7,7 +7,6 @@ use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-
 fn require_jq() {
     match Command::new("jq").arg("--version").output() {
         Ok(output) if output.status.success() => {}
@@ -21,6 +20,17 @@ fn require_jq() {
 }
 
 fn run(program: &str, args: &[String], input: &[u8]) -> std::process::Output {
+    // No stdin pipe when the program reads nothing. A pipe per case is
+    // most of the time spent comparing with jq.
+    if input.is_empty() {
+        return Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
+    }
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -60,8 +70,32 @@ fn compare(name: &str, args: &[&str], input: &[u8]) {
 fn compare_exact(name: &str, args: &[&str], input: &[u8]) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_tumulus");
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let got = run(bin, &owned, input);
-    let expected = run("jq", &owned, input);
+    // The program name is argv[0], so $ORIGIN matches the real binary.
+    // jq still runs as its own process.
+    let mut argv = Vec::with_capacity(1 + owned.len());
+    argv.push(bin.to_string());
+    argv.extend(owned.iter().cloned());
+    // jq starts before tumulus runs, so the two overlap. jq is still a
+    // separate process for this exact program.
+    let mut child = Command::new("jq")
+        .args(&owned)
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("could not start jq: {err}"));
+    if !input.is_empty() {
+        let mut stdin = child.stdin.take().expect("stdin pipe");
+        write_stdin(&mut stdin, "jq", input);
+    }
+    let got = tumulus::execute(&argv, input);
+    let expected = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("wait for jq: {err}"));
     assert_eq!(
         got.stdout,
         expected.stdout,
@@ -74,13 +108,24 @@ fn compare_exact(name: &str, args: &[&str], input: &[u8]) -> std::process::Outpu
         "{name}: stderr differs\nargs: {args:?}"
     );
     assert_eq!(
-        got.status.code(),
+        Some(got.code),
         expected.status.code(),
         "{name}: exit status differs\nstderr ours:\n{}\nstderr jq:\n{}",
         String::from_utf8_lossy(&got.stderr),
         String::from_utf8_lossy(&expected.stderr)
     );
     expected
+}
+
+/// Run `job` for each index, one after another.
+///
+/// The tests in this file already run side by side. Starting more jq
+/// processes inside one test makes the whole run slower. Every index still
+/// runs jq itself.
+fn each(count: usize, job: impl Fn(usize)) {
+    for index in 0..count {
+        job(index);
+    }
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -1664,9 +1709,10 @@ fn updates_match_jq() {
         "{\"a\":1} | (reduce .a as $x (0; .+$x)) = 9",
         "1 as $x | ($x) = 9",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
 }
 
 #[test]
@@ -2020,9 +2066,10 @@ fn variables_match_jq() {
         r#". as {({"a":1}):$x} | 1"#,
         "foreach 1 as $x (0; (5, .a); if .==5 then .b else . end)",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     let with_input = [
         ("42 as $x | . | . | . + 432 | $x + 1", "34324\n"),
         ("reduce .[] as $x (0; . + $x)", "[1,2,4]\n"),
@@ -3007,9 +3054,10 @@ fn small_builtins_match_jq() {
         "{\"a\": {\"b\": [1, {\"b\": 3}]}} | (.. | select(type == \"object\" and has(\"b\") and (.b | type) == \"array\") | .b) |= .[0]",
         "[-9007199254740993, -9007199254740992, 9007199254740992, 9007199254740993, 13911860366432393] | .[] as $n | $n+0 | [., tostring, . == $n]",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     compare_exact(
         "sort keys stays out of tostring",
         &["-n", "-c", "-S", "--", "{b:1,a:2} | tostring"],
@@ -3661,9 +3709,10 @@ fn dates_match_jq() {
         "(\"x\" | localtime), 1",
         "empty | localtime",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     let streams = [
         ("todate", "0\n1\n\"x\"\n"),
         ("gmtime", "0\n1\n\"x\"\n"),
@@ -6281,9 +6330,10 @@ fn generators_match_jq() {
         "[foreach range(3) as $i (0; .+$i)]",
         "nth(-1; 1)",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
 
     let fed = [
         ("[range(0;10)]", "null"),
@@ -6472,9 +6522,10 @@ fn defs_match_jq() {
         "def type: 1; type",
         "def error: 4; try error catch .",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     let fed = [
         ("def f: . + 1; f", "3"),
         ("def f($a): . + a; f(5)", "10"),
@@ -6539,9 +6590,97 @@ fn defs_match_jq() {
             "null",
         ),
     ];
-    for (program, input) in fed {
+    each(fed.len(), |index| {
+        let (program, input) = fed[index];
         compare_exact(program, &["-c", "--", program], input.as_bytes());
-    }
+    });
+}
+
+#[test]
+fn inputs_span_files_match_jq() {
+    require_jq();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("span-files-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let put = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let a = put("a.json", b"1\n2");
+    let b = put("b.json", b"3");
+    let c = put("c.json", b"4");
+    let nl = put("nl.json", b"1\n2\n");
+    let sp = put("sp.json", b"1\n2 ");
+    let tru = put("tru.json", b"tru");
+    let e = put("e.json", b"e");
+    let left = put("left.json", b"\"ab");
+    let right = put("right.json", b"c\"");
+    let open = put("open.json", b"[1,");
+    let close = put("close.json", b"2]");
+    let dot = put("dot.json", b"1.");
+    let five = put("five.json", b"5");
+    let inf = put("inf.json", b"inf");
+    let inity = put("inity.json", b"inity");
+    let nan = put("nan.json", b"nan");
+    let zero = put("zero.json", b"0");
+    let yes = put("yes.json", b"true");
+    let bad = put("bad.json", b"x");
+    let minus = put("minus.json", b"-");
+    let two = put("two.json", b"2");
+    let raw_a = put("raw-a.txt", b"ab");
+    let raw_b = put("raw-b.txt", b"c");
+    let path = |file: &Path| file.to_str().unwrap().to_string();
+    let a = path(&a);
+    let b = path(&b);
+    let c = path(&c);
+    let nl = path(&nl);
+    let sp = path(&sp);
+    let tru = path(&tru);
+    let e = path(&e);
+    let left = path(&left);
+    let right = path(&right);
+    let open = path(&open);
+    let close = path(&close);
+    let dot = path(&dot);
+    let five = path(&five);
+    let inf = path(&inf);
+    let inity = path(&inity);
+    let nan = path(&nan);
+    let zero = path(&zero);
+    let yes = path(&yes);
+    let bad = path(&bad);
+    let minus = path(&minus);
+    let two = path(&two);
+    let raw_a = path(&raw_a);
+    let raw_b = path(&raw_b);
+    compare_exact("span", &["-n", "[inputs]", &a, &b], b"");
+    compare_exact("span compact", &["-nc", "[inputs]", &a, &b], b"");
+    compare_exact("span three", &["-nc", "[inputs]", &a, &b, &c], b"");
+    compare_exact("span newline", &["-nc", "[inputs]", &nl, &b], b"");
+    compare_exact("span space", &["-nc", "[inputs]", &sp, &b], b"");
+    compare_exact("span true", &["-nc", "[inputs]", &tru, &e], b"");
+    compare_exact("span string", &["-nc", "[inputs]", &left, &right], b"");
+    compare_exact("span array", &["-nc", "[inputs]", &open, &close], b"");
+    compare_exact("span fraction", &["-nc", "[inputs]", &dot, &five], b"");
+    compare_exact("span infinity", &["-nc", "[inputs]", &inf, &inity], b"");
+    compare_exact("span nan", &["-nc", "[inputs]", &nan, &zero], b"");
+    compare_exact("span minus", &["-nc", "[inputs]", &minus, &two], b"");
+    compare_exact("span bad literal", &["-nc", "[inputs]", &yes, &bad], b"");
+    compare_exact("span raw", &["-Rnc", "[inputs]", &raw_a, &raw_b], b"");
+    compare_exact(
+        "span lines",
+        &[
+            "-nc",
+            "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number",
+            &a,
+            &b,
+        ],
+        b"",
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -6589,12 +6728,18 @@ fn ordering_match_jq() {
         "{\"a\":\"abcdefghijklmnopqrstuvwxyz\"}",
         "{\"abcdefghijklmnop\":[1,2,3,4]}",
     ];
-    for filter in filters {
-        for value in values {
-            let program = format!("{value} | {filter}");
-            compare_exact(&program, &["-n", "-c", "--", &program], b"");
-        }
-    }
+    let pairs: Vec<String> = filters
+        .iter()
+        .flat_map(|filter| {
+            values
+                .iter()
+                .map(move |value| format!("{value} | {filter}"))
+        })
+        .collect();
+    each(pairs.len(), |index| {
+        let program = &pairs[index];
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    });
 
     let caught = [
         "sort",
@@ -6784,9 +6929,10 @@ fn ordering_match_jq() {
         "true | max",
         "\"bac\" | [sort, unique, min, max]",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
 
     compare_exact("raw min", &["-n", "-r", "--", "[\"b\",\"a\"] | min"], b"");
     compare_exact("join min", &["-n", "-j", "--", "[\"b\",\"a\"] | min"], b"");
@@ -7916,9 +8062,10 @@ fn formats_match_jq() {
         r#""hi" | @text | length"#,
         "1 | @base64 | @base64d | @json",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     let with_input = [
         (r#"@text "\(input)\(1,2)""#, &b"10\n20\n30\n"[..]),
         (r#"@text "\(input)\(1)""#, &b"10\n20\n"[..]),
@@ -8735,9 +8882,10 @@ fn type_filters_match_jq() {
         "iterables(1)",
         "scalars(1)",
     ];
-    for program in programs {
+    each(programs.len(), |index| {
+        let program = programs[index];
         compare_exact(program, &["-n", "-c", "--", program], b"");
-    }
+    });
     let streamed = [
         (
             "in stops before input",
@@ -10760,6 +10908,12 @@ fn output_options_match_jq() {
             String::from_utf8_lossy(&got.stderr)
         );
         assert_eq!(got.status.code(), Some(0), "{args:?}");
+        let mut argv = vec![bin.to_string()];
+        argv.extend(owned);
+        let inplace = tumulus::execute(&argv, b"");
+        assert_eq!(inplace.stdout, got.stdout, "{args:?}");
+        assert_eq!(inplace.stderr, got.stderr, "{args:?}");
+        assert_eq!(Some(inplace.code), got.status.code(), "{args:?}");
     }
     let jq = run("jq", &["-V".to_string()], b"");
     assert!(jq.stdout.ends_with(b"\n") && jq.stdout.starts_with(b"jq-"));

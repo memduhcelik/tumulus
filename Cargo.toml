@@ -5,3 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "JSON processor"
 repository = "https://github.com/memduhcelik/tumulus"
+
+# Tests compare every case with jq. Optimized code keeps the deep cases
+# fast, and leaving debug info out keeps each short process cheap to start.
+[profile.test]
+opt-level = 3
+debug = 0

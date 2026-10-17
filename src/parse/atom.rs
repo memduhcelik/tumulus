@@ -12,6 +12,11 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
             let end = self.index;
+            // `2` at the end of this file is not finished while another file
+            // can still supply `3`.
+            if self.open_ended && self.eof() && end > start {
+                return Err(self.fail("Unfinished JSON term", true));
+            }
             if let Some(value) = interpret_atom(&self.src[start..end]) {
                 return Ok(value);
             }

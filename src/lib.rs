@@ -1,15 +1,18 @@
 //! Read JSON and write it back in jq's layout.
 
+mod cli;
 mod date;
 mod error;
 mod feed;
 mod filter;
+mod host;
 pub mod math;
 mod number;
 mod parse;
 mod print;
 mod value;
 
+pub use cli::{execute, run_cli, RunOutput};
 pub use error::Error;
 pub use feed::{
     bind_source, environ_now, jq_origin, library_paths, location, next_main, open_failed,

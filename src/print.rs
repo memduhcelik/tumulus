@@ -11,6 +11,10 @@ pub fn set_palette(colors: [String; 8]) {
     PALETTE.with(|slot| *slot.borrow_mut() = colors);
 }
 
+pub(crate) fn reset_palette() {
+    set_palette(default_colors());
+}
+
 /// How `.` is printed. Later layout flags replace earlier ones, as in jq.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Style {

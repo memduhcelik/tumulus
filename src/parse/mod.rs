@@ -298,7 +298,7 @@ fn scan_text_at(text: &[u8], line: usize, column: usize) -> Scanned {
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
     let bytes = &bytes[..nul_cut(bytes)];
     let (bom, text) = split_bom(bytes);
-    let scanned = scan_text(text, 0, 1);
+    let scanned = scan_text(text, 0, 1, false);
     Ok(ParsedStream {
         values: locate(bytes, bom, scanned.values),
         error: scanned.error.map(|err| err.text()),
@@ -327,7 +327,7 @@ pub struct InputScan {
     pub restart_line: usize,
 }
 
-pub fn scan_input(bytes: &[u8], start: usize, line: usize) -> InputScan {
+pub fn scan_input(bytes: &[u8], start: usize, line: usize, open_ended: bool) -> InputScan {
     let bytes = &bytes[..nul_cut(bytes)];
     let start = start.min(bytes.len());
     let bom = if start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -336,7 +336,7 @@ pub fn scan_input(bytes: &[u8], start: usize, line: usize) -> InputScan {
         0
     };
     let origin = if start == 0 { bom } else { start };
-    let scanned = scan_text(&bytes[bom..], origin - bom, line);
+    let scanned = scan_text(&bytes[bom..], origin - bom, line, open_ended);
     let shift = |index: usize| index + bom;
     InputScan {
         values: scanned
@@ -365,8 +365,9 @@ struct Scanned {
     restart_line: usize,
 }
 
-fn scan_text(text: &[u8], start: usize, line: usize) -> Scanned {
+fn scan_text(text: &[u8], start: usize, line: usize, open_ended: bool) -> Scanned {
     let mut parser = Parser::new(text);
+    parser.open_ended = open_ended;
     parser.seek(start, line);
     let mut values = Vec::new();
     loop {

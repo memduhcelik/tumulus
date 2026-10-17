@@ -43,6 +43,8 @@ pub(in crate::parse) struct Parser<'a> {
     /// First parse-buffer index of each file after the first. A NUL hides the
     /// rest of its own file, and the next file continues the token.
     pub(in crate::parse) boundaries: &'a [usize],
+    /// EOF does not finish a number or a literal. More bytes may follow.
+    pub(in crate::parse) open_ended: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -54,6 +56,7 @@ impl<'a> Parser<'a> {
             column: 0,
             depth: 0,
             boundaries: &[],
+            open_ended: false,
         }
     }
 
