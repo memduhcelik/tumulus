@@ -5,8 +5,9 @@ use std::process;
 
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
-    parse_stream, program_stream, reads_input, render, set_environ, set_unknown, Error, Failure,
-    Filter, Indent, Layout, MainNext, ProgramError, Source, Style, Value,
+    parse_stream, program_stream, program_stream_with, reads_input, render, set_environ,
+    set_unknown, Error, Failure, Filter, Indent, Layout, MainNext, ProgramError, Source, Style,
+    Value,
 };
 
 fn main() {
@@ -85,6 +86,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
             &options.files,
             options.style,
             options.stream,
+            options.stream_errors,
             &program,
             &env,
             &mut run,
@@ -232,7 +234,8 @@ fn apply_shared(
         files: options.files.clone(),
         raw: options.raw_input,
         slurp: options.slurp,
-        stream: options.stream && !options.raw_input,
+        stream: (options.stream || options.stream_errors) && !options.raw_input,
+        stream_errors: options.stream_errors && !options.raw_input,
     });
     let mut failed = false;
     if options.null_input {
@@ -361,12 +364,14 @@ fn apply_slurp(
     files: &[String],
     style: Style,
     stream: bool,
+    stream_errors: bool,
     program: &Filter,
     env: &[(String, Value)],
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     let mut buf = Vec::new();
+    let mut bounds = Vec::new();
     let mut at = At {
         source: "<stdin>".to_string(),
         line: 0,
@@ -380,7 +385,15 @@ fn apply_slurp(
             Opened::Missing => missing = true,
             Opened::Bytes(bytes) => {
                 at.line = newline_count(&bytes);
+                if !buf.is_empty() {
+                    bounds.push(buf.len());
+                }
                 buf.extend_from_slice(&bytes);
+                // A parse error is a value with `--stream-errors`, so a later
+                // file is still part of the input.
+                if stream_errors {
+                    continue;
+                }
                 if let Some(message) = if stream {
                     committed_stream_error(&buf)
                 } else {
@@ -398,7 +411,7 @@ fn apply_slurp(
         return Ok(());
     }
     if stream {
-        let fed = program_stream(&buf, true);
+        let fed = program_stream_with(&buf, true, stream_errors, &bounds);
         let mut failed = false;
         for item in &fed.values {
             let place = if item.unknown {
@@ -658,6 +671,9 @@ fn write_one(value: &Value, style: Style, run: &mut Run, out: &mut dyn Write) ->
     }
     run.produced = true;
     run.last_false = matches!(value, Value::Null | Value::Bool(false));
+    if tumulus::streaming() {
+        out.flush()?;
+    }
     Ok(())
 }
 
@@ -681,6 +697,7 @@ struct Options {
     raw_input: bool,
     exit_status: bool,
     stream: bool,
+    stream_errors: bool,
     program: Program,
     files: Vec<String>,
     named: Vec<(String, Value)>,
@@ -702,6 +719,7 @@ struct Flags {
     exit_status: bool,
     from_file: bool,
     stream: bool,
+    stream_errors: bool,
 }
 
 fn options() -> Result<Options, Error> {
@@ -714,6 +732,7 @@ fn options() -> Result<Options, Error> {
         exit_status: false,
         from_file: false,
         stream: false,
+        stream_errors: false,
     };
     let mut named = Vec::new();
     let mut positional = Vec::new();
@@ -817,6 +836,10 @@ fn options() -> Result<Options, Error> {
             "-e" | "--exit-status" => flags.exit_status = true,
             "-R" | "--raw-input" => flags.raw_input = true,
             "--stream" => flags.stream = true,
+            "--stream-errors" => {
+                flags.stream = true;
+                flags.stream_errors = true;
+            }
             // The file name is the first operand, not the next argument.
             "-f" | "--from-file" => flags.from_file = true,
             "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
@@ -852,6 +875,7 @@ fn options() -> Result<Options, Error> {
         raw_input: flags.raw_input,
         exit_status: flags.exit_status,
         stream: flags.stream,
+        stream_errors: flags.stream_errors,
         program,
         files,
         named,

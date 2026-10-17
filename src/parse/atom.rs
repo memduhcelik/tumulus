@@ -7,20 +7,88 @@ use crate::value::Value;
 impl<'a> Parser<'a> {
     pub(in crate::parse) fn scan_atom(&mut self) -> Result<Value, ParseErr> {
         let start = self.index;
-        while self.peek().is_some_and(|c| !is_delimiter(c)) {
-            self.bump();
+        if !self.nul_in_token() {
+            while self.peek().is_some_and(|c| !is_delimiter(c)) {
+                self.bump();
+            }
+            let end = self.index;
+            if let Some(value) = interpret_atom(&self.src[start..end]) {
+                return Ok(value);
+            }
+            let phrase = invalid_phrase(&self.src[start..end]);
+            return self.fail_atom(phrase);
         }
-        let end = self.index;
-        if let Some(value) = interpret_atom(&self.src[start..end]) {
+        // A NUL ends the token text. Junk after it, up to a delimiter or the
+        // next file, is not part of the value. A number keeps the text before
+        // the NUL. `true`, `false`, and `null` do not.
+        let mut text = Vec::new();
+        let mut saw_nul = false;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(c) if is_delimiter(c) => break,
+                Some('\0') => {
+                    saw_nul = true;
+                    self.bump();
+                    while let Some(c) = self.peek() {
+                        if is_delimiter(c) || self.at_boundary() {
+                            break;
+                        }
+                        self.bump();
+                    }
+                    if self.peek().is_some_and(|c| !is_delimiter(c)) {
+                        continue;
+                    }
+                    break;
+                }
+                Some(_) => {
+                    let at = self.index;
+                    self.bump();
+                    text.extend_from_slice(&self.src[at..self.index]);
+                }
+            }
+        }
+        if text.is_empty() {
+            return self.fail_atom("Invalid numeric literal");
+        }
+        if let Some(value) = interpret_atom(&text) {
+            if saw_nul && !matches!(value, Value::Number(_)) {
+                return self.fail_atom("Invalid literal");
+            }
             return Ok(value);
         }
-        let phrase = invalid_phrase(&self.src[start..end]);
+        self.fail_atom(invalid_phrase(&text))
+    }
+
+    fn fail_atom(&mut self, phrase: &'static str) -> Result<Value, ParseErr> {
         if self.eof() {
             Err(self.fail(phrase, true))
         } else {
             self.bump();
             Err(self.fail(phrase, false))
         }
+    }
+
+    /// A NUL sits in this token before the next delimiter.
+    fn nul_in_token(&self) -> bool {
+        let mut index = self.index;
+        while index < self.src.len() {
+            if self.boundaries.binary_search(&index).is_ok() && index != self.index {
+                return false;
+            }
+            let byte = self.src[index];
+            if byte == 0 {
+                return true;
+            }
+            if matches!(
+                byte,
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
+            ) {
+                return false;
+            }
+            index += 1;
+        }
+        false
     }
 
     fn parse_scalar(&mut self) -> Result<Value, ()> {

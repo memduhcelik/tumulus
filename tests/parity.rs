@@ -8958,6 +8958,67 @@ fn streaming_match_jq() {
         ("stream string tail", &["-c", "--stream", "."], b"\"\"]"),
         ("stream separator word", &["-c", "--stream", "."], b"[1["),
         ("stream bad key", &["-c", "--stream", "."], b"{1]"),
+        ("stream errors cut", &["-c", "--stream-errors", "."], b"[1,"),
+        (
+            "stream errors top",
+            &["-c", "--stream-errors", "."],
+            b"true}",
+        ),
+        (
+            "stream errors object",
+            &["-c", "--stream-errors", "."],
+            b"{\"a\":",
+        ),
+        (
+            "stream errors comma",
+            &["-c", "--stream-errors", "."],
+            b"{\"a\":1,}",
+        ),
+        (
+            "stream errors later",
+            &["-c", "--stream-errors", "."],
+            b"[1,]\n2\n",
+        ),
+        (
+            "stream errors length",
+            &["-c", "--stream-errors", "length"],
+            b"[1,",
+        ),
+        (
+            "stream errors empty",
+            &["-c", "--stream-errors", "empty"],
+            b"[1,",
+        ),
+        (
+            "stream errors slurp cut",
+            &["-c", "--stream-errors", "-s", "."],
+            b"[1,",
+        ),
+        (
+            "stream errors slurp hard",
+            &["-c", "--stream-errors", "-s", "."],
+            b"[1,2,]",
+        ),
+        (
+            "stream errors raw",
+            &["-c", "--stream-errors", "-R", "."],
+            b"ab\n",
+        ),
+        ("stream errors exit", &["-ce", "--stream-errors", "."], b""),
+        (
+            "stream errors lines",
+            &["-c", "--stream-errors", r#"error("z")"#],
+            b"[1,",
+        ),
+        ("nul end", &["-c", "."], b"1\x00junk"),
+        ("nul stream", &["-c", "--stream", "."], b"1\x00junk"),
+        ("nul lead", &["-c", "--stream", "."], b"\x001"),
+        ("nul mid", &["-c", "--stream", "."], b"[1,\x00 2]"),
+        ("nul plain mid", &["-c", "."], b"[1,\x00 2]"),
+        ("nul next line", &["-c", "--stream", "."], b"1\x00x\n2\n"),
+        ("nul literal", &["-c", "."], b"true\x00\n"),
+        ("nul array", &["-c", "--stream", "."], b"[1\x002]\n"),
+        ("nul inputs", &["-nc", "--stream", "inputs"], b"[1,"),
     ];
     for (name, args, input) in cases {
         compare_exact(name, args, input);
@@ -8989,4 +9050,67 @@ fn streaming_match_jq() {
         b"",
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stream_prints_before_input_ends() {
+    require_jq();
+    let mut payload = vec![b'['];
+    for _ in 0..4000 {
+        payload.extend_from_slice(b"0,");
+    }
+    assert!(
+        saw_stream_output_before_close("jq", &payload),
+        "jq did not print a stream item before stdin closed"
+    );
+    assert!(
+        saw_stream_output_before_close(env!("CARGO_BIN_EXE_tumulus"), &payload),
+        "tumulus did not print a stream item before stdin closed"
+    );
+}
+
+/// Write `payload` and stop once stdout has bytes, without closing stdin first.
+fn saw_stream_output_before_close(program: &str, payload: &[u8]) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(program)
+        .args(["-c", "--stream", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
+    let mut stdout = child.stdout.take().expect("stdout");
+    let saw = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&saw);
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        if stdout.read(&mut buf).ok().is_some_and(|n| n > 0) {
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut sent = 0;
+    let start = Instant::now();
+    // Keep stdin open after the bytes are written. The item has to show up
+    // before that pipe is closed.
+    while !saw.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(3) {
+        if sent < payload.len() {
+            let end = (sent + 1024).min(payload.len());
+            match stdin.write(&payload[sent..end]) {
+                Ok(0) | Err(_) => {}
+                Ok(n) => sent += n,
+            }
+            let _ = stdin.flush();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let printed = saw.load(Ordering::SeqCst);
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    printed
 }

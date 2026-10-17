@@ -14,8 +14,8 @@ use crate::value::Value;
 
 use parser::Parser;
 
-pub(crate) use stream::{closer_is_detached, scan_stream_input};
-pub use stream::{program_stream, StreamFeed, StreamValue};
+pub(crate) use stream::{closer_is_detached, pull_stream, StreamState};
+pub use stream::{program_stream, program_stream_with, StreamFeed, StreamValue};
 
 /// Bytes that are not UTF-8 become U+FFFD, the way a JSON string does.
 pub(crate) fn repair_utf8(bytes: &[u8]) -> String {
@@ -59,7 +59,17 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
     Ok(())
 }
 
+/// A NUL with no newline after it ends the input there. Bytes past it are
+/// not parsed. A NUL earlier on a line is handled while scanning that token.
+pub(crate) fn nul_cut(bytes: &[u8]) -> usize {
+    match bytes.iter().rposition(|byte| *byte == 0) {
+        Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
+        _ => bytes.len(),
+    }
+}
+
 pub fn parse_stream(bytes: &[u8]) -> Result<ParsedStream, Error> {
+    let bytes = &bytes[..nul_cut(bytes)];
     let (bom, text) = split_bom(bytes);
     let scanned = scan_text(text, 0, 1);
     Ok(ParsedStream {
@@ -91,6 +101,8 @@ pub struct InputScan {
 }
 
 pub fn scan_input(bytes: &[u8], start: usize, line: usize) -> InputScan {
+    let bytes = &bytes[..nul_cut(bytes)];
+    let start = start.min(bytes.len());
     let bom = if start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         3
     } else {
@@ -236,6 +248,50 @@ pub(crate) struct LineCursor {
 }
 
 impl LineCursor {
+    /// The line jq would report is fixed. More bytes would not change it,
+    /// or the input has already ended.
+    pub(crate) fn ready(&self, text: &[u8], end: usize, atom: bool, eof: bool) -> bool {
+        if atom && end >= text.len() && !eof {
+            return false;
+        }
+        let need = if atom && end < text.len() {
+            end
+        } else {
+            end.saturating_sub(1)
+        };
+        let mut filled = self.filled;
+        let mut last_start = self.last_start;
+        if filled > 0 && need < last_start {
+            filled = 0;
+            last_start = 0;
+        }
+        let _ = last_start;
+        while filled <= need {
+            if filled >= text.len() {
+                return eof;
+            }
+            let start = filled;
+            let limit = start.saturating_add(FGETS_MAX).min(text.len());
+            let mut next = start;
+            let mut at_newline = false;
+            while next < limit {
+                next += 1;
+                if text[next - 1] == b'\n' {
+                    at_newline = true;
+                    break;
+                }
+            }
+            if next == start {
+                return eof;
+            }
+            if next == text.len() && !at_newline && !eof && next - start < FGETS_MAX {
+                return false;
+            }
+            filled = next;
+        }
+        true
+    }
+
     pub(crate) fn line_at(&mut self, text: &[u8], end: usize, atom: bool) -> usize {
         let need = if atom && end < text.len() {
             end

@@ -12,14 +12,15 @@ mod value;
 
 pub use error::Error;
 pub use feed::{
-    bind_source, environ_now, location, next_main, open_failed, set_environ, set_unknown, MainNext,
-    Source, SourceGuard,
+    bind_source, environ_now, location, next_main, open_failed, set_environ, set_unknown,
+    streaming, MainNext, Source, SourceGuard,
 };
 pub use filter::{
     compile, compile_with, eval, eval_stream, eval_with, reads_input, Failure, Filter, ProgramError,
 };
 pub use parse::{
-    parse_stream, program_stream, write_input, LocatedValue, ParsedStream, StreamFeed, StreamValue,
+    parse_stream, program_stream, program_stream_with, write_input, LocatedValue, ParsedStream,
+    StreamFeed, StreamValue,
 };
 pub use print::{render, Indent, Layout, Style};
 pub use value::Value;

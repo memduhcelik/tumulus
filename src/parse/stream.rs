@@ -15,15 +15,23 @@ struct RawItem {
     /// Parser index in the text the scanner was given.
     end: usize,
     atom: bool,
+    /// A parse error jq reports at `<unknown>` rather than a file line.
+    unknown: bool,
 }
 
 struct RawScan {
     items: Vec<RawItem>,
     error: Option<ParseErr>,
+    path: Vec<Value>,
     incomplete: bool,
+    blocked: bool,
     error_at: usize,
     resume: usize,
     resume_line: usize,
+    index: usize,
+    line: usize,
+    column: usize,
+    stack: Vec<Frame>,
 }
 
 /// One value `--stream` hands the program, with the line a runtime error names.
@@ -41,25 +49,58 @@ pub struct StreamFeed {
     pub error: Option<String>,
 }
 
-/// Stream items for one buffer, in the same shape `scan_input` uses.
-pub(crate) struct StreamScan {
-    pub items: Vec<(Value, usize, bool)>,
-    pub error: Option<String>,
-    pub incomplete: bool,
-    pub error_at: usize,
-    pub resume: usize,
-    pub resume_line: usize,
-}
-
 struct Walker<'a> {
     parser: Parser<'a>,
     items: Vec<RawItem>,
+    stack: Vec<Frame>,
+    err_path: Vec<Value>,
+    /// End of the input, not merely the end of the bytes read so far.
+    final_eof: bool,
+    blocked: bool,
+}
+
+/// Where a `--stream` scan should continue.
+pub(crate) struct StreamState {
+    pub index: usize,
+    pub line: usize,
+    pub column: usize,
+    stack: Vec<Frame>,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            line: 1,
+            column: 0,
+            stack: Vec::new(),
+        }
+    }
+}
+
+impl StreamState {
+    pub(crate) fn stack_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
+pub(crate) struct StreamOut {
+    pub items: Vec<(Value, usize, bool, bool)>,
+    pub error: Option<String>,
+    pub path: Vec<Value>,
+    pub blocked: bool,
+    pub incomplete: bool,
+    pub resume: usize,
+    pub resume_line: usize,
+    pub error_at: usize,
 }
 
 enum Act {
     Keep,
     Nest(Frame),
     Done,
+    /// The next token is not finished in this buffer yet.
+    Block,
 }
 
 struct Arr {
@@ -72,6 +113,8 @@ struct Arr {
 
 enum ObjStage {
     Key,
+    /// The key and the colon are in. The value has not been read.
+    Value,
     Sep,
 }
 
@@ -128,147 +171,384 @@ fn new_obj(path: Vec<Value>) -> Frame {
 
 /// One whole input. `slurp` packs the items the way `--stream -s` does.
 pub fn program_stream(bytes: &[u8], slurp: bool) -> StreamFeed {
+    program_stream_with(bytes, slurp, false, &[])
+}
+
+/// `errors` turns a parse error into a `[message, path]` value.
+/// `bounds` are the parse indexes where a later file starts.
+pub fn program_stream_with(
+    bytes: &[u8],
+    slurp: bool,
+    errors: bool,
+    bounds: &[usize],
+) -> StreamFeed {
+    let bytes = &bytes[..super::nul_cut(bytes)];
     let (bom, text) = split_bom(bytes);
-    let scanned = walk_text(text, 0, 1);
+    let bounds = shift_bounds(bounds, bom);
+    let scanned = walk_all(text, errors, &bounds);
     let mut cursor = LineCursor::default();
     let mut located = Vec::with_capacity(scanned.items.len());
     for item in &scanned.items {
         let line = cursor.line_at(bytes, item.end + bom, item.atom);
-        located.push((item.value.clone(), line));
+        located.push((item.value.clone(), line, item.unknown));
     }
     let error = scanned.error.as_ref().map(ParseErr::text);
-    let values: Vec<Value> = located.iter().map(|(value, _)| value.clone()).collect();
-    let detach = error.is_none() && detached(&values, bytes);
+    let error_path = scanned.path;
     if slurp {
-        return slurp_feed(&located, detach, error, bytes);
+        return slurp_feed(&located, error, error_path, errors, bytes);
     }
-    let last = located.len();
-    let values = located
-        .into_iter()
-        .enumerate()
-        .map(|(index, (value, line))| StreamValue {
-            value,
-            line,
-            unknown: detach && index + 1 == last,
+    let mut values: Vec<StreamValue> = located
+        .iter()
+        .map(|(value, line, unknown)| StreamValue {
+            value: value.clone(),
+            line: *line,
+            unknown: *unknown,
         })
         .collect();
+    if errors {
+        if let Some(message) = error.as_ref() {
+            let line = cursor.line_at(bytes, scanned.error_at + bom, false);
+            let unknown = error_is_unknown(message, bytes, !values.is_empty());
+            values.push(StreamValue {
+                value: error_value(message, &error_path),
+                line,
+                unknown,
+            });
+        }
+        let detach = error.is_none() && detached_values(&values, bytes);
+        if detach {
+            if let Some(last) = values.last_mut() {
+                last.unknown = true;
+            }
+        }
+        return StreamFeed {
+            values,
+            error: None,
+        };
+    }
+    let plain: Vec<Value> = values.iter().map(|item| item.value.clone()).collect();
+    let detach = error.is_none() && detached(&plain, bytes);
+    if detach {
+        if let Some(last) = values.last_mut() {
+            last.unknown = true;
+        }
+    }
     StreamFeed { values, error }
 }
 
-/// Continue a scan at `start`. Indexes are positions in `bytes`.
-pub(crate) fn scan_stream_input(bytes: &[u8], start: usize, line: usize) -> StreamScan {
-    let bom = if start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3
-    } else {
-        0
-    };
-    let origin = if start == 0 { bom } else { start };
-    let scanned = walk_text(&bytes[bom..], origin - bom, line);
-    let shift = |index: usize| index + bom;
-    StreamScan {
-        items: scanned
-            .items
-            .into_iter()
-            .map(|item| (item.value, shift(item.end), item.atom))
-            .collect(),
-        error: scanned.error.as_ref().map(ParseErr::text),
-        incomplete: scanned.incomplete,
-        error_at: shift(scanned.error_at),
-        resume: shift(scanned.resume),
-        resume_line: scanned.resume_line,
+fn shift_bounds(bounds: &[usize], bom: usize) -> Vec<usize> {
+    bounds
+        .iter()
+        .filter_map(|bound| bound.checked_sub(bom))
+        .filter(|bound| *bound > 0)
+        .collect()
+}
+
+fn walk_all(text: &[u8], errors: bool, bounds: &[usize]) -> RawScan {
+    let mut state = StreamState::default();
+    let mut items = Vec::new();
+    loop {
+        let scanned = drive(text, &mut state, true, bounds);
+        items.extend(scanned.items);
+        if scanned.blocked {
+            return RawScan {
+                items,
+                error: None,
+                path: Vec::new(),
+                incomplete: false,
+                blocked: false,
+                error_at: state.index,
+                resume: state.index,
+                resume_line: state.line,
+                index: state.index,
+                line: state.line,
+                column: state.column,
+                stack: Vec::new(),
+            };
+        }
+        let Some(error) = scanned.error else {
+            return RawScan {
+                items,
+                error: None,
+                path: Vec::new(),
+                incomplete: false,
+                blocked: false,
+                error_at: scanned.error_at,
+                resume: scanned.resume,
+                resume_line: scanned.resume_line,
+                index: scanned.index,
+                line: scanned.line,
+                column: scanned.column,
+                stack: Vec::new(),
+            };
+        };
+        if !errors || scanned.incomplete {
+            return RawScan {
+                items,
+                path: scanned.path,
+                error: Some(error),
+                incomplete: scanned.incomplete,
+                blocked: false,
+                error_at: scanned.error_at,
+                resume: scanned.resume,
+                resume_line: scanned.resume_line,
+                index: scanned.index,
+                line: scanned.line,
+                column: scanned.column,
+                stack: Vec::new(),
+            };
+        }
+        let message = error.text();
+        let unknown = error_is_unknown(&message, text, !items.is_empty());
+        items.push(RawItem {
+            value: error_value(&message, &scanned.path),
+            end: scanned.error_at,
+            atom: false,
+            unknown,
+        });
+        if state.index == scanned.error_at && scanned.resume == scanned.error_at {
+            return RawScan {
+                items,
+                error: None,
+                path: Vec::new(),
+                incomplete: false,
+                blocked: false,
+                error_at: scanned.error_at,
+                resume: scanned.resume,
+                resume_line: scanned.resume_line,
+                index: state.index,
+                line: state.line,
+                column: 0,
+                stack: Vec::new(),
+            };
+        }
     }
 }
 
-fn walk_text(text: &[u8], start: usize, line: usize) -> RawScan {
+fn error_value(message: &str, path: &[Value]) -> Value {
+    Value::array(vec![
+        Value::String(message.to_string()),
+        Value::array(path.to_vec()),
+    ])
+}
+
+/// jq names this error `<unknown>` when the whole input is one line and does
+/// not end in whitespace, and a value was already emitted.
+fn error_is_unknown(message: &str, bytes: &[u8], prior: bool) -> bool {
+    prior
+        && message.starts_with("Unfinished JSON term at EOF")
+        && !bytes.contains(&b'\n')
+        && !ends_with_ws(bytes)
+}
+
+fn detached_values(items: &[StreamValue], bytes: &[u8]) -> bool {
+    let values: Vec<Value> = items.iter().map(|item| item.value.clone()).collect();
+    detached(&values, bytes)
+}
+
+/// Parse what is already buffered. `final_eof` is false while more bytes may arrive.
+pub(crate) fn pull_stream(
+    text: &[u8],
+    state: &mut StreamState,
+    final_eof: bool,
+    bounds: &[usize],
+) -> StreamOut {
+    let mut scanned = drive(text, state, final_eof, bounds);
+    let error = scanned.error.as_ref().map(ParseErr::text);
+    let path = std::mem::take(&mut scanned.path);
+    StreamOut {
+        items: scanned
+            .items
+            .into_iter()
+            .map(|item| (item.value, item.end, item.atom, item.unknown))
+            .collect(),
+        error,
+        path,
+        blocked: scanned.blocked,
+        incomplete: scanned.incomplete,
+        resume: scanned.resume,
+        resume_line: scanned.resume_line,
+        error_at: scanned.error_at,
+    }
+}
+
+fn drive(text: &[u8], state: &mut StreamState, final_eof: bool, bounds: &[usize]) -> RawScan {
     let mut walker = Walker {
         parser: Parser::new(text),
         items: Vec::new(),
+        stack: std::mem::take(&mut state.stack),
+        err_path: Vec::new(),
+        final_eof,
+        blocked: false,
     };
-    walker.parser.seek(start, line);
-    walker.scan()
+    walker.parser.set_boundaries(bounds);
+    walker.parser.seek_at(state.index, state.line, state.column);
+    let mut scanned = walker.scan();
+    if scanned.blocked {
+        state.index = scanned.index;
+        state.line = scanned.line;
+        state.column = scanned.column;
+        state.stack = std::mem::take(&mut scanned.stack);
+    } else if scanned.error.is_some() {
+        state.index = scanned.resume;
+        state.line = scanned.resume_line;
+        state.column = 0;
+        state.stack = Vec::new();
+    } else {
+        state.index = scanned.index;
+        state.line = scanned.line;
+        state.column = scanned.column;
+        state.stack = Vec::new();
+    }
+    scanned
 }
 
 impl<'a> Walker<'a> {
     fn scan(mut self) -> RawScan {
         loop {
+            if !self.stack.is_empty() {
+                if self.parser.eof() && !self.final_eof {
+                    self.blocked = true;
+                    return self.finish(None);
+                }
+                let Some(mut frame) = self.stack.pop() else {
+                    continue;
+                };
+                match self.step(&mut frame) {
+                    Ok(Act::Keep) => self.stack.push(frame),
+                    Ok(Act::Nest(child)) => {
+                        self.stack.push(frame);
+                        self.stack.push(child);
+                    }
+                    Ok(Act::Done) => {
+                        if let Some(parent) = self.stack.last_mut() {
+                            parent.note_child();
+                        }
+                    }
+                    Ok(Act::Block) => {
+                        self.stack.push(frame);
+                        self.blocked = true;
+                        return self.finish(None);
+                    }
+                    Err(err) => return self.finish(Some(err)),
+                }
+                continue;
+            }
             self.parser.skip_ws();
             if self.parser.eof() {
+                if !self.final_eof {
+                    self.blocked = true;
+                }
                 return self.finish(None);
             }
-            if let Err(err) = self.one_value() {
-                return self.finish(Some(err));
+            self.err_path.clear();
+            match self.begin_value() {
+                Ok(()) if self.blocked => return self.finish(None),
+                Ok(()) => {}
+                Err(err) => return self.finish(Some(err)),
             }
         }
     }
 
     fn finish(self, error: Option<ParseErr>) -> RawScan {
         let incomplete = error.as_ref().is_some_and(ParseErr::ran_out);
-        let (resume, resume_line) = if error.is_none() || incomplete || self.parser.column() == 0 {
-            (self.parser.index, self.parser.line)
-        } else {
-            skip_rest_of_line(self.parser.src, self.parser.index, self.parser.line)
-        };
+        let (resume, resume_line) =
+            if self.blocked || error.is_none() || incomplete || self.parser.column() == 0 {
+                (self.parser.index, self.parser.line)
+            } else {
+                skip_rest_of_line(self.parser.src, self.parser.index, self.parser.line)
+            };
         RawScan {
             items: self.items,
+            path: self.err_path,
             error,
             incomplete,
+            blocked: self.blocked,
             error_at: self.parser.index,
             resume,
             resume_line,
+            index: self.parser.index,
+            line: self.parser.line,
+            column: self.parser.column(),
+            stack: self.stack,
         }
     }
 
-    fn one_value(&mut self) -> Result<(), ParseErr> {
-        let mut stack = Vec::new();
+    fn begin_value(&mut self) -> Result<(), ParseErr> {
         match self.parser.peek() {
-            None => return Err(self.parser.fail("Unfinished JSON term", true)),
-            Some(']') => return Err(self.parser.bump_fail("Unmatched ']' at the top-level")),
-            Some('}') => return Err(self.parser.bump_fail("Unmatched '}' at the top-level")),
-            Some(',') => return Err(self.parser.bump_fail("Expected value before ','")),
-            Some(':') => {
-                return Err(self.parser.bump_fail("':' not as part of an object"));
-            }
+            None => Err(self.parser.fail("Unfinished JSON term", true)),
+            Some(']') => Err(self.parser.bump_fail("Unmatched ']' at the top-level")),
+            Some('}') => Err(self.parser.bump_fail("Unmatched '}' at the top-level")),
+            Some(',') => Err(self.parser.bump_fail("Expected value before ','")),
+            Some(':') => Err(self.parser.bump_fail("':' not as part of an object")),
             Some('[') => {
                 self.parser.bump();
-                stack.push(new_arr(Vec::new()));
+                self.stack.push(new_arr(Vec::new()));
+                Ok(())
             }
             Some('{') => {
                 self.parser.bump();
-                stack.push(new_obj(Vec::new()));
+                self.stack.push(new_obj(Vec::new()));
+                Ok(())
             }
             Some('"') => {
+                if !self.string_ready() {
+                    self.blocked = true;
+                    return Ok(());
+                }
                 // A string is finished at its closing quote. A bad byte after
                 // it is a separate error, and the string is still a value.
                 let value = Value::String(self.parser.parse_string()?);
                 self.emit_pair(&[], value, false);
                 self.top_glue()?;
-                return Ok(());
+                Ok(())
             }
             Some(_) => {
+                if !self.atom_ready() {
+                    self.blocked = true;
+                    return Ok(());
+                }
                 let value = self.parser.scan_atom()?;
                 self.top_glue()?;
                 let atom = is_atom_value(&value);
                 self.emit_pair(&[], value, atom);
-                return Ok(());
+                Ok(())
             }
         }
-        loop {
-            let Some(mut frame) = stack.pop() else {
-                return Ok(());
-            };
-            match self.step(&mut frame)? {
-                Act::Keep => stack.push(frame),
-                Act::Nest(child) => {
-                    stack.push(frame);
-                    stack.push(child);
-                }
-                Act::Done => {
-                    if let Some(parent) = stack.last_mut() {
-                        parent.note_child();
-                    }
-                }
+    }
+
+    fn string_ready(&self) -> bool {
+        if self.final_eof {
+            return true;
+        }
+        let bytes = self.parser.src;
+        let mut index = self.parser.index + 1;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'"' => return true,
+                b'\\' => index += 2,
+                _ => index += 1,
             }
         }
+        false
+    }
+
+    fn atom_ready(&self) -> bool {
+        if self.final_eof {
+            return true;
+        }
+        let mut index = self.parser.index;
+        while index < self.parser.src.len() {
+            let byte = self.parser.src[index];
+            if matches!(
+                byte,
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
+            ) {
+                return true;
+            }
+            index += 1;
+        }
+        false
     }
 
     /// A top-level atom glued to a bracket or a comma is not a value.
@@ -292,6 +572,9 @@ impl<'a> Walker<'a> {
     fn step_array(&mut self, arr: &mut Arr) -> Result<Act, ParseErr> {
         self.parser.skip_ws();
         if !arr.started {
+            if self.parser.peek().is_none() && !self.final_eof {
+                return Ok(Act::Block);
+            }
             arr.started = true;
             if self.parser.peek() == Some(']') {
                 self.parser.bump();
@@ -299,8 +582,14 @@ impl<'a> Walker<'a> {
                 return Ok(Act::Done);
             }
         }
+        self.mark_arr(arr);
         match self.parser.peek() {
-            None => Err(self.parser.fail("Unfinished JSON term", true)),
+            None => {
+                if !self.final_eof {
+                    return Ok(Act::Block);
+                }
+                Err(self.parser.fail("Unfinished JSON term", true))
+            }
             Some(']') => {
                 if arr.after_comma && arr.held.is_none() {
                     return Err(self.parser.bump_fail("Expected another array element"));
@@ -359,27 +648,44 @@ impl<'a> Walker<'a> {
                         Ok(Act::Nest(new_obj(child)))
                     }
                     Some('"') => {
+                        if !self.string_ready() {
+                            return Ok(Act::Block);
+                        }
                         arr.held = Some(Value::String(self.parser.parse_string()?));
                         arr.after_comma = false;
                         Ok(Act::Keep)
                     }
                     Some(_) => {
+                        if !self.atom_ready() {
+                            return Ok(Act::Block);
+                        }
                         arr.held = Some(self.parser.scan_atom()?);
                         arr.after_comma = false;
                         Ok(Act::Keep)
                     }
-                    None => Err(self.parser.fail("Unfinished JSON term", true)),
+                    None => {
+                        if !self.final_eof {
+                            return Ok(Act::Block);
+                        }
+                        Err(self.parser.fail("Unfinished JSON term", true))
+                    }
                 }
             }
         }
     }
 
     fn step_object(&mut self, obj: &mut Obj) -> Result<Act, ParseErr> {
-        if matches!(obj.stage, ObjStage::Sep) {
-            return self.object_sep(obj);
+        match obj.stage {
+            ObjStage::Sep => return self.object_sep(obj),
+            ObjStage::Value => return self.object_value(obj),
+            ObjStage::Key => {}
         }
+        self.mark_obj(obj, false);
         self.parser.skip_ws();
         if !obj.started {
+            if self.parser.peek().is_none() && !self.final_eof {
+                return Ok(Act::Block);
+            }
             obj.started = true;
             if self.parser.peek() == Some('}') {
                 self.parser.bump();
@@ -387,44 +693,127 @@ impl<'a> Walker<'a> {
                 return Ok(Act::Done);
             }
         }
+        if self.hold_for_token() || !self.colon_ready() {
+            return Ok(Act::Block);
+        }
         let key = self.parse_key(obj.after_comma)?;
         self.parser.expect_colon()?;
+        obj.key = key;
+        obj.stage = ObjStage::Value;
+        self.object_value(obj)
+    }
+
+    fn object_value(&mut self, obj: &mut Obj) -> Result<Act, ParseErr> {
+        self.mark_obj(obj, true);
         self.parser.skip_ws();
         match self.parser.peek() {
-            None => Err(self.parser.fail("Unfinished JSON term", true)),
+            None => {
+                if !self.final_eof {
+                    return Ok(Act::Block);
+                }
+                Err(self.parser.fail("Unfinished JSON term", true))
+            }
             Some('}') => Err(self.parser.bump_fail("Missing value in key:value pair")),
             Some(']') => Err(self
                 .parser
                 .bump_fail("Unmatched ']' in the middle of an object")),
             Some('[') => {
-                obj.key = key;
                 self.parser.bump();
                 Ok(Act::Nest(new_arr(with_key(&obj.path, &obj.key))))
             }
             Some('{') => {
-                obj.key = key;
                 self.parser.bump();
                 Ok(Act::Nest(new_obj(with_key(&obj.path, &obj.key))))
             }
             Some('"') => {
+                if !self.string_ready() {
+                    return Ok(Act::Block);
+                }
                 obj.held = Some(Value::String(self.parser.parse_string()?));
-                obj.key = key;
                 obj.stage = ObjStage::Sep;
                 Ok(Act::Keep)
             }
             Some(_) => {
+                if !self.atom_ready() {
+                    return Ok(Act::Block);
+                }
                 obj.held = Some(self.parser.scan_atom()?);
-                obj.key = key;
                 obj.stage = ObjStage::Sep;
                 Ok(Act::Keep)
             }
         }
     }
 
+    /// The key and the colon that follows it are both in this buffer.
+    fn colon_ready(&self) -> bool {
+        if self.final_eof {
+            return true;
+        }
+        let bytes = self.parser.src;
+        let mut index = self.parser.index;
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b'\n' | b'\r') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return false;
+        }
+        if bytes[index] == b'"' {
+            index += 1;
+            let mut closed = false;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\\' => index += 2,
+                    _ => index += 1,
+                }
+            }
+            if !closed {
+                return false;
+            }
+        } else if matches!(bytes[index], b'{' | b'}' | b'[' | b']' | b',' | b':') {
+            return true;
+        } else {
+            while index < bytes.len()
+                && !matches!(
+                    bytes[index],
+                    b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
+                )
+            {
+                index += 1;
+            }
+            if index >= bytes.len() {
+                return false;
+            }
+        }
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b'\n' | b'\r') {
+            index += 1;
+        }
+        index < bytes.len() && bytes[index] == b':'
+    }
+
+    /// The next key or atom is cut off at the end of this buffer.
+    fn hold_for_token(&self) -> bool {
+        match self.parser.peek() {
+            Some('"') => !self.string_ready(),
+            Some(c) if !matches!(c, '"' | '}' | ']' | ',' | ':' | '[' | '{') => !self.atom_ready(),
+            _ => false,
+        }
+    }
+
     fn object_sep(&mut self, obj: &mut Obj) -> Result<Act, ParseErr> {
+        self.mark_obj(obj, true);
         self.parser.skip_ws();
         match self.parser.peek() {
-            None => Err(self.parser.fail("Unfinished JSON term", true)),
+            None => {
+                if !self.final_eof {
+                    return Ok(Act::Block);
+                }
+                Err(self.parser.fail("Unfinished JSON term", true))
+            }
             Some(',') => {
                 self.parser.bump();
                 if let Some(value) = obj.held.take() {
@@ -512,6 +901,7 @@ impl<'a> Walker<'a> {
             value: item,
             end: self.parser.index,
             atom,
+            unknown: false,
         });
     }
 
@@ -521,7 +911,23 @@ impl<'a> Walker<'a> {
             value: item,
             end: self.parser.index,
             atom: false,
+            unknown: false,
         });
+    }
+
+    fn mark_arr(&mut self, arr: &Arr) {
+        self.err_path = with_index(&arr.path, arr.index);
+    }
+
+    /// `keyed` is the key whose value is being read. Otherwise the slot is null.
+    fn mark_obj(&mut self, obj: &Obj, keyed: bool) {
+        let mut path = obj.path.clone();
+        if keyed {
+            path.push(Value::String(obj.key.clone()));
+        } else {
+            path.push(Value::Null);
+        }
+        self.err_path = path;
     }
 }
 
@@ -588,15 +994,47 @@ fn same_path(left: &Value, right: &Value) -> bool {
 }
 
 fn slurp_feed(
-    located: &[(Value, usize)],
-    detach: bool,
+    located: &[(Value, usize, bool)],
     error: Option<String>,
+    error_path: Vec<Value>,
+    errors: bool,
     bytes: &[u8],
 ) -> StreamFeed {
     let line = bytes.iter().filter(|byte| **byte == b'\n').count();
     if let Some(message) = error {
-        if show_partial(bytes, located, &message) {
-            let items = located.iter().map(|(value, _)| value.clone()).collect();
+        let partial = show_partial(bytes, located, &message);
+        if errors && partial {
+            let items = located.iter().map(|(value, _, _)| value.clone()).collect();
+            return StreamFeed {
+                values: vec![
+                    StreamValue {
+                        value: Value::array(items),
+                        line,
+                        unknown: false,
+                    },
+                    StreamValue {
+                        value: error_value(&message, &error_path),
+                        line: 0,
+                        unknown: error_is_unknown(&message, bytes, !located.is_empty()),
+                    },
+                ],
+                error: None,
+            };
+        }
+        if errors {
+            let mut items: Vec<Value> = located.iter().map(|(value, _, _)| value.clone()).collect();
+            items.push(error_value(&message, &error_path));
+            return StreamFeed {
+                values: vec![StreamValue {
+                    value: Value::array(items),
+                    line,
+                    unknown: false,
+                }],
+                error: None,
+            };
+        }
+        if partial {
+            let items = located.iter().map(|(value, _, _)| value.clone()).collect();
             return StreamFeed {
                 values: vec![StreamValue {
                     value: Value::array(items),
@@ -611,8 +1049,10 @@ fn slurp_feed(
             error: Some(message),
         };
     }
+    let values: Vec<Value> = located.iter().map(|(value, _, _)| value.clone()).collect();
+    let detach = detached(&values, bytes);
     if detach {
-        let mut items: Vec<Value> = located.iter().map(|(value, _)| value.clone()).collect();
+        let mut items: Vec<Value> = located.iter().map(|(value, _, _)| value.clone()).collect();
         let last = items.pop().expect("detached closer");
         return StreamFeed {
             values: vec![
@@ -630,7 +1070,7 @@ fn slurp_feed(
             error: None,
         };
     }
-    let items = located.iter().map(|(value, _)| value.clone()).collect();
+    let items = located.iter().map(|(value, _, _)| value.clone()).collect();
     StreamFeed {
         values: vec![StreamValue {
             value: Value::array(items),
@@ -642,11 +1082,11 @@ fn slurp_feed(
 }
 
 /// A cut-off value that ends on a comma still runs, when every item is a scalar pair.
-fn show_partial(bytes: &[u8], located: &[(Value, usize)], message: &str) -> bool {
+fn show_partial(bytes: &[u8], located: &[(Value, usize, bool)], message: &str) -> bool {
     bytes.last() == Some(&b',')
         && message.starts_with("Unfinished JSON term at EOF")
         && !located.is_empty()
-        && located.iter().all(|(value, _)| scalar_pair(value))
+        && located.iter().all(|(value, _, _)| scalar_pair(value))
 }
 
 fn scalar_pair(value: &Value) -> bool {

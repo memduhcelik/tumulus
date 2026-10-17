@@ -6,11 +6,12 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::fs;
-use std::io::{self};
+use std::fs::{self, File};
+use std::io::{self, Read as IoRead};
 
 use crate::parse::{
-    closer_is_detached, program_stream, scan_input, scan_stream_input, stream_line, LineCursor,
+    closer_is_detached, nul_cut, program_stream_with, pull_stream, scan_input, stream_line,
+    LineCursor, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -37,6 +38,8 @@ pub struct Source {
     pub slurp: bool,
     /// `--stream`. Raw input ignores this and keeps one string per line.
     pub stream: bool,
+    /// `--stream-errors`. A parse error is one more value, and parsing goes on.
+    pub stream_errors: bool,
 }
 
 pub struct SourceGuard;
@@ -89,6 +92,11 @@ pub fn location() -> Option<String> {
 
 pub fn open_failed() -> bool {
     with(|session| session.missing).unwrap_or(false)
+}
+
+/// `--stream` is on, so each value is written before the next read.
+pub fn streaming() -> bool {
+    with(|session| session.stream).unwrap_or(false)
 }
 
 pub fn read_one() -> Read {
@@ -171,6 +179,8 @@ struct Fault {
     message: String,
     name: String,
     line: usize,
+    /// `input` reports this parse error at `<unknown>`.
+    unknown: bool,
 }
 
 struct Cur {
@@ -186,6 +196,7 @@ struct Session {
     raw: bool,
     slurp: bool,
     stream: bool,
+    stream_errors: bool,
     buf: Vec<u8>,
     chunks: Vec<Chunk>,
     scan_at: usize,
@@ -209,6 +220,27 @@ struct Session {
     slurp_done: bool,
     raw_at: usize,
     dead: bool,
+    input_eof: bool,
+    blocked: bool,
+    live: Option<Live>,
+    /// Chunk that the open file is still extending.
+    live_chunk: Option<usize>,
+    staging: VecDeque<Staged>,
+    drive: StreamState,
+    /// The stream value released just before the one still held.
+    prev: Option<Value>,
+}
+
+struct Staged {
+    value: Value,
+    end: usize,
+    atom: bool,
+    unknown: bool,
+}
+
+enum Live {
+    Stdin,
+    File(File),
 }
 
 impl Session {
@@ -224,6 +256,7 @@ impl Session {
             raw: source.raw,
             slurp: source.slurp,
             stream: source.stream,
+            stream_errors: source.stream_errors,
             buf: Vec::new(),
             chunks: Vec::new(),
             scan_at: 0,
@@ -244,6 +277,13 @@ impl Session {
             slurp_done: false,
             raw_at: 0,
             dead: false,
+            input_eof: false,
+            blocked: false,
+            live: None,
+            live_chunk: None,
+            staging: VecDeque::new(),
+            drive: StreamState::default(),
+            prev: None,
         }
     }
 
@@ -275,7 +315,12 @@ impl Session {
                 return Ok(Pulled::Value(item.value));
             }
             if let Some(fault) = self.fault.take() {
-                self.note(&fault.name, fault.line);
+                if fault.unknown {
+                    self.yielded = Some(fault.name);
+                    self.at = "<unknown>".to_string();
+                } else {
+                    self.note(&fault.name, fault.line);
+                }
                 if recover {
                     if let Some((at, line)) = self.staged.take() {
                         self.scan_at = at;
@@ -326,6 +371,7 @@ impl Session {
                     message: scan.error.unwrap_or_else(|| "parse error".to_string()),
                     name,
                     line,
+                    unknown: false,
                 });
                 return Ok(true);
             }
@@ -335,6 +381,7 @@ impl Session {
                     message,
                     name,
                     line,
+                    unknown: false,
                 });
                 self.staged = Some((scan.resume, scan.resume_line));
                 return Ok(true);
@@ -350,63 +397,146 @@ impl Session {
         }
     }
 
-    /// `--stream` waits until every file is in, so a later byte can still
-    /// change the line of an item. A hard error is reported from the bytes
-    /// already read.
+    /// `--stream` parses the bytes already read and returns as soon as one
+    /// item can be printed. A later read can still change a line that jq's
+    /// 4095-byte read has not finished, so that item stays staged.
     fn fill_stream(&mut self) -> Result<bool, String> {
         loop {
-            let scan = scan_stream_input(&self.buf, self.scan_at, self.scan_line);
-            if scan.incomplete {
-                if self.append()? == More::Added {
-                    continue;
-                }
-                self.queue_stream(scan.items, false);
-                let (name, line) = if let Some(name) = self.failed_here.clone() {
-                    (name, 0)
-                } else {
-                    self.place(scan.error_at, false)
-                };
-                self.fault = Some(Fault {
-                    message: scan.error.unwrap_or_else(|| "parse error".to_string()),
-                    name,
-                    line,
-                });
+            self.pull_available();
+            self.release();
+            if !self.pending.is_empty() || self.fault.is_some() {
                 return Ok(true);
             }
-            if let Some(message) = scan.error {
-                self.queue_stream(scan.items, false);
-                let (name, line) = self.place(scan.error_at, false);
-                self.fault = Some(Fault {
-                    message,
-                    name,
-                    line,
-                });
-                self.staged = Some((scan.resume, scan.resume_line));
-                return Ok(true);
+            if self.input_eof {
+                return Ok(false);
             }
-            if self.append()? == More::Added {
-                continue;
+            match self.append()? {
+                More::Added => {}
+                More::Eof => self.input_eof = true,
             }
-            self.queue_stream(scan.items, true);
-            self.scan_at = scan.resume;
-            self.scan_line = scan.resume_line;
-            return Ok(!self.pending.is_empty());
         }
     }
 
-    fn queue_stream(&mut self, items: Vec<(Value, usize, bool)>, ended: bool) {
-        let values: Vec<Value> = items.iter().map(|(value, _, _)| value.clone()).collect();
-        let detach = ended && closer_is_detached(&values, &self.buf);
-        let last = items.len();
-        for (index, (value, end, atom)) in items.into_iter().enumerate() {
-            let (name, line) = self.place(end, atom);
-            self.pending.push_back(Item {
+    fn pull_available(&mut self) {
+        if self.fault.is_some() {
+            return;
+        }
+        let end = nul_cut(&self.buf);
+        if self.drive.index > end {
+            self.drive.index = end;
+        }
+        let bounds: Vec<usize> = self
+            .chunks
+            .iter()
+            .skip(1)
+            .map(|chunk| chunk.parse_start)
+            .filter(|start| *start < end)
+            .collect();
+        let out = pull_stream(&self.buf[..end], &mut self.drive, self.input_eof, &bounds);
+        for (value, at, atom, unknown) in out.items {
+            self.staging.push_back(Staged {
                 value,
-                name,
-                line,
-                unknown: detach && index + 1 == last,
+                end: at,
+                atom,
+                unknown,
             });
         }
+        self.blocked = out.blocked;
+        if out.blocked {
+            return;
+        }
+        let Some(message) = out.error else {
+            return;
+        };
+        if self.stream_errors {
+            let unknown = message.starts_with("Unfinished JSON term at EOF")
+                && !self.buf[..end].contains(&b'\n')
+                && !matches!(self.buf[..end].last(), Some(b' ' | b'\t' | b'\n' | b'\r'))
+                && (self.prev.is_some() || !self.staging.is_empty() || !self.pending.is_empty());
+            let path = Value::array(out.path);
+            self.staging.push_back(Staged {
+                value: Value::array(vec![Value::String(message), path]),
+                end: out.error_at.min(end),
+                atom: false,
+                unknown,
+            });
+            return;
+        }
+        self.release();
+        let (name, line) = if out.incomplete {
+            if let Some(name) = self.failed_here.clone() {
+                (name, 0)
+            } else {
+                self.place(out.error_at.min(end), false)
+            }
+        } else {
+            self.place(out.error_at.min(end), false)
+        };
+        let visible = &self.buf[..nul_cut(&self.buf)];
+        let prior = self.prev.is_some() || !self.pending.is_empty();
+        let unknown = out.incomplete
+            && prior
+            && message.starts_with("Unfinished JSON term at EOF")
+            && !visible.contains(&b'\n')
+            && !matches!(visible.last(), Some(b' ' | b'\t' | b'\n' | b'\r'));
+        self.fault = Some(Fault {
+            message,
+            name,
+            line,
+            unknown,
+        });
+        if !out.incomplete {
+            self.staged = Some((out.resume, out.resume_line));
+        }
+        self.blocked = true;
+    }
+
+    fn release(&mut self) {
+        let finished = self.input_eof && !self.blocked && self.drive.stack_empty();
+        while let Some(front) = self.staging.front() {
+            let hold = !finished && self.staging.len() == 1 && self.might_detach(&front.value);
+            if hold || !self.item_ready(front.end, front.atom) {
+                break;
+            }
+            let item = self.staging.pop_front().expect("staged item");
+            let mut unknown = item.unknown;
+            if finished && self.staging.is_empty() {
+                unknown = unknown || self.pair_detach(&item.value);
+            }
+            let (name, line) = self.place(item.end, item.atom);
+            self.prev = Some(item.value.clone());
+            self.pending.push_back(Item {
+                value: item.value,
+                name,
+                line,
+                unknown,
+            });
+        }
+    }
+
+    fn item_ready(&self, end: usize, atom: bool) -> bool {
+        let Some(index) = self.chunk_index(end) else {
+            return true;
+        };
+        let chunk = &self.chunks[index];
+        let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
+        let file_done = self.input_eof || self.live_chunk != Some(index);
+        chunk.lines.ready(&chunk.raw, raw_end, atom, file_done)
+    }
+
+    fn might_detach(&self, value: &Value) -> bool {
+        let Value::Array(closer) = value else {
+            return false;
+        };
+        closer.len() == 1
+    }
+
+    fn pair_detach(&self, value: &Value) -> bool {
+        let Some(prev) = &self.prev else {
+            return false;
+        };
+        let end = nul_cut(&self.buf);
+        closer_is_detached(&[prev.clone(), value.clone()], &self.buf[..end])
     }
 
     fn pull_raw(&mut self) -> Result<Pulled, String> {
@@ -486,7 +616,13 @@ impl Session {
     }
 
     fn load_stream_slurp(&mut self) {
-        let fed = program_stream(&self.buf, true);
+        let bounds: Vec<usize> = self
+            .chunks
+            .iter()
+            .skip(1)
+            .map(|chunk| chunk.parse_start)
+            .collect();
+        let fed = program_stream_with(&self.buf, true, self.stream_errors, &bounds);
         let name = self
             .cur
             .as_ref()
@@ -505,6 +641,7 @@ impl Session {
                 message,
                 name,
                 line: 0,
+                unknown: false,
             });
         }
     }
@@ -527,6 +664,110 @@ impl Session {
     }
 
     fn append(&mut self) -> Result<More, String> {
+        if self.stream && !self.raw && !self.slurp {
+            return self.append_stream();
+        }
+        self.append_whole()
+    }
+
+    /// Read the next piece of a file. A value can still run on into the next file.
+    fn append_stream(&mut self) -> Result<More, String> {
+        loop {
+            if self.live.is_none() {
+                if self.file_at >= self.files.len() {
+                    return Ok(More::Eof);
+                }
+                let path = self.files[self.file_at].clone();
+                self.file_at += 1;
+                let name = source_name(&path);
+                match open_live(&path)? {
+                    LiveOpen::Reader(live) => self.live = Some(live),
+                    LiveOpen::Missing(reason) => {
+                        eprintln!("jq: error: Could not open file {name}: {reason}");
+                        self.missing = true;
+                        self.failed_here = Some(name.clone());
+                        self.remember_failed(&name);
+                        continue;
+                    }
+                    LiveOpen::Directory => {
+                        if self.dir_pending {
+                            self.flush_dir();
+                        }
+                        self.dir_pending = true;
+                        self.missing = true;
+                        self.failed_here = Some(name.clone());
+                        self.remember_failed(&name);
+                        continue;
+                    }
+                }
+            }
+            let mut tmp = [0u8; 4096];
+            let read = match self.live.as_mut().expect("open stream") {
+                Live::Stdin => IoRead::read(&mut io::stdin(), &mut tmp),
+                Live::File(file) => IoRead::read(file, &mut tmp),
+            };
+            let name = self.live_name();
+            let n = read.map_err(|err| format!("cannot read {name}: {err}"))?;
+            if n == 0 {
+                if let Some(index) = self.live_chunk {
+                    let name = self.chunks[index].name.clone();
+                    let raw = self.chunks[index].raw.clone();
+                    self.remember(&name, &raw);
+                }
+                self.live = None;
+                self.live_chunk = None;
+                if self.file_at >= self.files.len() {
+                    return Ok(More::Eof);
+                }
+                continue;
+            }
+            let name = match self.live_chunk {
+                Some(index) => self.chunks[index].name.clone(),
+                None => self.live_name(),
+            };
+            self.push_stream_bytes(&name, &tmp[..n]);
+            return Ok(More::Added);
+        }
+    }
+
+    fn live_name(&self) -> String {
+        let index = self.file_at.saturating_sub(1);
+        self.files
+            .get(index)
+            .map(|path| source_name(path))
+            .unwrap_or_else(|| "<stdin>".to_string())
+    }
+
+    fn push_stream_bytes(&mut self, name: &str, bytes: &[u8]) {
+        if self.live_chunk.is_none() {
+            if self.dir_pending {
+                self.flush_dir();
+            }
+            self.failed_here = None;
+            let bom = if self.buf.is_empty() && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                3
+            } else {
+                0
+            };
+            let bom = bom.min(bytes.len());
+            let parse_start = self.buf.len();
+            self.buf.extend_from_slice(&bytes[bom..]);
+            self.chunks.push(Chunk {
+                name: name.to_string(),
+                parse_start,
+                raw: bytes.to_vec(),
+                bom,
+                lines: LineCursor::default(),
+            });
+            self.live_chunk = Some(self.chunks.len() - 1);
+            return;
+        }
+        let index = self.live_chunk.expect("live chunk");
+        self.chunks[index].raw.extend_from_slice(bytes);
+        self.buf.extend_from_slice(bytes);
+    }
+
+    fn append_whole(&mut self) -> Result<More, String> {
         loop {
             if self.file_at >= self.files.len() {
                 return Ok(More::Eof);
@@ -689,6 +930,29 @@ fn source_name(path: &str) -> String {
         "<stdin>".to_string()
     } else {
         path.to_string()
+    }
+}
+
+enum LiveOpen {
+    Reader(Live),
+    Missing(String),
+    Directory,
+}
+
+fn open_live(path: &str) -> Result<LiveOpen, String> {
+    if path == "-" {
+        return Ok(LiveOpen::Reader(Live::Stdin));
+    }
+    match File::open(path) {
+        Ok(file) => {
+            if fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                return Ok(LiveOpen::Directory);
+            }
+            Ok(LiveOpen::Reader(Live::File(file)))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LiveOpen::Missing(os_reason(&err))),
+        Err(err) if is_directory(path, &err) => Ok(LiveOpen::Directory),
+        Err(err) => Err(format!("cannot read {path}: {err}")),
     }
 }
 

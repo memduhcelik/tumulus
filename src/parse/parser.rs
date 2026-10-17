@@ -36,6 +36,9 @@ pub(in crate::parse) struct Parser<'a> {
     column: usize,
     /// Nesting of arrays and objects. jq rejects the 257th level.
     pub(in crate::parse) depth: usize,
+    /// First parse-buffer index of each file after the first. A NUL hides the
+    /// rest of its own file, and the next file continues the token.
+    pub(in crate::parse) boundaries: &'a [usize],
 }
 
 impl<'a> Parser<'a> {
@@ -46,7 +49,23 @@ impl<'a> Parser<'a> {
             line: 1,
             column: 0,
             depth: 0,
+            boundaries: &[],
         }
+    }
+
+    pub(in crate::parse) fn set_boundaries(&mut self, boundaries: &'a [usize]) {
+        self.boundaries = boundaries;
+    }
+
+    /// Continue at `index`, keeping the column jq had already counted.
+    pub(in crate::parse) fn seek_at(&mut self, index: usize, line: usize, column: usize) {
+        self.index = index;
+        self.line = line;
+        self.column = column;
+    }
+
+    pub(in crate::parse) fn at_boundary(&self) -> bool {
+        self.boundaries.binary_search(&self.index).is_ok()
     }
 
     pub(in crate::parse) fn eof(&self) -> bool {
