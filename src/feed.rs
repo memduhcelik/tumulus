@@ -10,8 +10,8 @@ use std::fs::{self, File};
 use std::io::{self, Read as IoRead};
 
 use crate::parse::{
-    closer_is_detached, nul_cut, parse_seq, program_stream, program_stream_with, pull_stream,
-    scan_input, stream_line, LineCursor, SeqItem, StreamState,
+    closer_is_detached, finished_on_eof_cut, nul_cut, parse_seq, program_stream,
+    program_stream_with, pull_stream, scan_input, stream_line, LineCursor, SeqItem, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -193,6 +193,7 @@ pub fn read_one() -> Read {
                 eprintln!("jq: ignoring parse error: {message}");
             }
             Ok(Pulled::End) => {
+                session.finish_line();
                 session.mark_break();
                 return Read::Break;
             }
@@ -327,6 +328,8 @@ struct Session {
     piecewise: bool,
     seq_done: bool,
     seq_queue: VecDeque<SeqQueued>,
+    /// The last value was completed in an EOF read that did not end on a newline.
+    cut_at_eof: bool,
 }
 
 enum SeqQueued {
@@ -391,6 +394,7 @@ impl Session {
             prev: None,
             seq_done: false,
             seq_queue: VecDeque::new(),
+            cut_at_eof: false,
         }
     }
 
@@ -907,6 +911,9 @@ impl Session {
                 self.flush_dir();
             }
             self.failed_here = None;
+            // A new file starts the line count over. The previous file's
+            // end-of-file flag does not apply to it.
+            self.cut_at_eof = false;
             let bom = if self.buf.is_empty() && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
                 3
             } else {
@@ -944,6 +951,7 @@ impl Session {
                         self.flush_dir();
                     }
                     self.failed_here = None;
+                    self.cut_at_eof = false;
                     self.remember(&name, &bytes);
                     let bom = if self.buf.is_empty() && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
                         3
@@ -1006,12 +1014,29 @@ impl Session {
     }
 
     fn remember_failed(&mut self, name: &str) {
+        self.cut_at_eof = false;
         self.cur = Some(Cur {
             name: name.to_string(),
             line: 0,
             any_byte: false,
             ended_nl: false,
         });
+    }
+
+    /// The line jq reports once `input` or `inputs` has read past the end.
+    ///
+    /// A value keeps the newlines consumed while it was read. The following
+    /// read is the one that changes the count. `-s` has already taken the
+    /// whole input, so that read leaves 0. Otherwise the count stays at the
+    /// newlines in the current file, unless the last value was completed in
+    /// a final read that did not end on a newline: that read leaves 0.
+    fn finish_line(&mut self) {
+        if self.slurp || self.cut_at_eof {
+            set_input_line(0);
+            return;
+        }
+        let line = self.cur.as_ref().map(|cur| cur.line).unwrap_or(0);
+        set_input_line(line);
     }
 
     fn place(&mut self, end: usize, atom: bool) -> (String, usize) {
@@ -1021,7 +1046,10 @@ impl Session {
         let chunk = &mut self.chunks[index];
         let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
         let line = chunk.lines.line_at(&chunk.raw, raw_end, atom);
-        (chunk.name.clone(), line)
+        let cut = finished_on_eof_cut(&chunk.raw, raw_end);
+        let name = chunk.name.clone();
+        self.cut_at_eof = cut;
+        (name, line)
     }
 
     fn name_at(&self, end: usize) -> String {

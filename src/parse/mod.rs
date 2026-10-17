@@ -582,6 +582,36 @@ fn read_chunk(text: &[u8], start: usize) -> usize {
     end
 }
 
+/// The value ending at `end` was completed in the last read of `bytes`, and
+/// that read did not end on a newline.
+///
+/// `end` is the first byte after the value, or `bytes.len()` when the value
+/// runs to the end of the file. A read that ends on a newline does not count.
+/// A full 4095-byte read with more of the file after it does not count either.
+pub(crate) fn finished_on_eof_cut(bytes: &[u8], end: usize) -> bool {
+    if bytes.is_empty() || end == 0 {
+        return false;
+    }
+    let pos = if end < bytes.len() {
+        end
+    } else {
+        bytes.len() - 1
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        let next = read_chunk(bytes, at);
+        if next == at {
+            break;
+        }
+        if pos < next {
+            let saw_nl = bytes[next - 1] == b'\n';
+            return next == bytes.len() && !saw_nl;
+        }
+        at = next;
+    }
+    false
+}
+
 fn newline_count(text: &[u8]) -> usize {
     text.iter().filter(|byte| **byte == b'\n').count()
 }
@@ -600,7 +630,7 @@ fn is_atom(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{stream_line, LineCursor};
+    use super::{finished_on_eof_cut, stream_line, LineCursor};
 
     fn bytes(len: usize, newline_every: usize) -> Vec<u8> {
         let mut text = vec![b'a'; len];
@@ -666,5 +696,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn eof_cut_is_only_the_last_short_read() {
+        assert!(finished_on_eof_cut(b"1\n2\n3", 5));
+        assert!(!finished_on_eof_cut(b"1\n2\n3\n", 5));
+        assert!(finished_on_eof_cut(b"1\n2\n3 ", 5));
+        assert!(!finished_on_eof_cut(b"1\n2\n3\n ", 5));
+        assert!(!finished_on_eof_cut(b"1\n2\n   ", 3));
+        assert!(!finished_on_eof_cut(b"\n", 1));
+        assert!(finished_on_eof_cut(b"3", 1));
+        assert!(!finished_on_eof_cut(b"1\n", 1));
+        let mut long = vec![b'1'; 4095];
+        long.push(b' ');
+        assert!(!finished_on_eof_cut(&long, 1));
+        assert!(finished_on_eof_cut(&long, 4095));
+        long.push(b'\n');
+        assert!(!finished_on_eof_cut(&long, 4095));
     }
 }

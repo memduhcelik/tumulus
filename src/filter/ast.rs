@@ -264,7 +264,9 @@ pub enum Filter {
     Debug,
     /// `stderr`. Writes the value to stderr without a newline and returns it.
     Stderr,
-    /// `input_line_number`. Newlines the reader has consumed for this value.
+    /// `input_line_number`. Newlines the reader has consumed.
+    /// A later read past the end leaves 0 when the last value was completed
+    /// in a final read that did not end on a newline.
     InputLine,
     /// `builtins`. Every builtin name and arity, in jq's order.
     Builtins,

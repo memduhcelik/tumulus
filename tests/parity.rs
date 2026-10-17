@@ -9569,6 +9569,200 @@ fn report_match_jq() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `input_line_number` after `input` or `inputs` has read past the last value.
+#[test]
+fn input_line_after_end_match_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        (
+            "inputs cut",
+            &["-n", "[inputs,input_line_number]"],
+            b"1\n2\n3",
+        ),
+        (
+            "inputs cut compact",
+            &["-nc", "[inputs,input_line_number]"],
+            b"1\n2\n3",
+        ),
+        (
+            "inputs nl",
+            &["-nc", "[inputs,input_line_number]"],
+            b"1\n2\n3\n",
+        ),
+        (
+            "inputs nl space",
+            &["-nc", "[inputs,input_line_number]"],
+            b"1\n2\n3\n ",
+        ),
+        (
+            "inputs space",
+            &["-nc", "[inputs,input_line_number]"],
+            b"1\n2\n3 ",
+        ),
+        (
+            "inputs ws tail",
+            &["-nc", "[inputs,input_line_number]"],
+            b"1\n2\n   ",
+        ),
+        (
+            "inputs only nl",
+            &["-nc", "[inputs,input_line_number]"],
+            b"\n",
+        ),
+        (
+            "inputs only space",
+            &["-nc", "[inputs,input_line_number]"],
+            b" ",
+        ),
+        ("inputs empty", &["-nc", "[inputs,input_line_number]"], b""),
+        (
+            "inputs pipe",
+            &["-nc", "inputs|[.,input_line_number]"],
+            b"1\n2\n3",
+        ),
+        (
+            "inputs reduce",
+            &[
+                "-nc",
+                "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number",
+            ],
+            b"1\n2\n3",
+        ),
+        (
+            "inputs reduce nl",
+            &[
+                "-nc",
+                "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number",
+            ],
+            b"1\n2\n3\n",
+        ),
+        (
+            "inputs foreach",
+            &[
+                "-nc",
+                "[foreach inputs as $x (0; .+1; input_line_number)], input_line_number",
+            ],
+            b"1\n2\n3",
+        ),
+        (
+            "input try",
+            &[
+                "-nc",
+                "[try (input,input,input,input) catch input_line_number]",
+            ],
+            b"1\n2\n3",
+        ),
+        (
+            "input try nl",
+            &[
+                "-nc",
+                "[try (input,input,input,input) catch input_line_number]",
+            ],
+            b"1\n2\n3\n",
+        ),
+        (
+            "main and inputs",
+            &["-c", "[.,inputs,input_line_number]"],
+            b"1\n2\n3",
+        ),
+        ("raw cut", &["-Rnc", "[inputs,input_line_number]"], b"a\nb"),
+        ("raw nl", &["-Rnc", "[inputs,input_line_number]"], b"a\nb\n"),
+        (
+            "raw space",
+            &["-Rnc", "[inputs,input_line_number]"],
+            b"a\n ",
+        ),
+        (
+            "raw reduce",
+            &[
+                "-Rnc",
+                "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number",
+            ],
+            b"a\nb",
+        ),
+        (
+            "slurp cut",
+            &["-snc", "[inputs,input_line_number]"],
+            b"1\n2",
+        ),
+        (
+            "slurp nl",
+            &["-snc", "[inputs,input_line_number]"],
+            b"1\n2\n",
+        ),
+        (
+            "slurp reduce",
+            &[
+                "-snc",
+                "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number",
+            ],
+            b"1\n2\n",
+        ),
+        (
+            "slurp only nl",
+            &["-snc", "[inputs,input_line_number]"],
+            b"\n",
+        ),
+        (
+            "string cut",
+            &["-nc", "[inputs,input_line_number]"],
+            b"\"a\"\n\"b\"",
+        ),
+        (
+            "array cut",
+            &["-nc", "[inputs,input_line_number]"],
+            b"[1,\n2]",
+        ),
+        (
+            "stream cut",
+            &["-nc", "--stream", "[inputs], input_line_number"],
+            b"1\n2\n3",
+        ),
+        (
+            "stream nl",
+            &["-nc", "--stream", "[inputs], input_line_number"],
+            b"1\n2\n3\n",
+        ),
+        (
+            "seq nl",
+            &["-nc", "--seq", "[inputs,input_line_number]"],
+            b"\x1e1\n\x1e2\n\x1e3\n",
+        ),
+        (
+            "seq cut",
+            &["-nc", "--seq", "[inputs,input_line_number]"],
+            b"\x1e1\n\x1e2\n\x1e3",
+        ),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("line-end-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let done = dir.join("done.json");
+    let full = dir.join("full.json");
+    let empty = dir.join("empty.json");
+    fs::write(&done, b"3\n").unwrap();
+    fs::write(&full, b"1\n2\n").unwrap();
+    fs::write(&empty, b"").unwrap();
+    let prog = "reduce inputs as $x ([]; . + [[$x, input_line_number]]), input_line_number";
+    compare_exact(
+        "two files",
+        &["-nc", prog, full.to_str().unwrap(), done.to_str().unwrap()],
+        b"",
+    );
+    compare_exact(
+        "nl then empty",
+        &["-nc", prog, full.to_str().unwrap(), empty.to_str().unwrap()],
+        b"",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `reverse`, `in`, `bsearch`, `JOIN`, `format`, `fromdateiso8601`, and `todateiso8601`.
 #[test]
 fn search_formats_match_jq() {

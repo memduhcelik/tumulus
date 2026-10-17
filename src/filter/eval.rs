@@ -684,6 +684,95 @@ pub(super) fn eval_fold(
     }
 }
 
+/// One `reduce` or `foreach` step. `true` means the caller asked to stop.
+fn fold_one(
+    item: &Value,
+    pattern: &Pattern,
+    update: &Filter,
+    extract: Option<&Filter>,
+    emit: bool,
+    env: &[(String, Value)],
+    acc: &mut Value,
+    lookup: &mut Option<super::update::ObjIndex>,
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    let mut stop = false;
+    let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
+        if stop {
+            return Ok(());
+        }
+        let child = child_scope(frame, env);
+        // `foreach` can reuse the accumulator when the step it emits
+        // is that accumulator. The caller has to be finished with the
+        // value before the next step.
+        let accelerated = if !emit || super::update::foreach_can_accelerate(update) {
+            match super::update::accelerate_reduce(update, acc, &child, lookup) {
+                Ok(true) => true,
+                Ok(false) => {
+                    *lookup = None;
+                    false
+                }
+                Err(failure) => return Err(failure),
+            }
+        } else {
+            false
+        };
+        if accelerated {
+            if emit && deliver(acc, extract, &child, sink)? {
+                stop = true;
+            }
+            return Ok(());
+        }
+        let (updates, update_err) = parts(eval_in(update, acc, &child));
+        if emit {
+            if let Some(extract) = extract {
+                for value in &updates {
+                    match eval_in(extract, value, &child) {
+                        Ok(more) => {
+                            for one in &more {
+                                if sink(one) {
+                                    stop = true;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(mut failure) => {
+                            for one in &failure.partial {
+                                if sink(one) {
+                                    stop = true;
+                                    return Ok(());
+                                }
+                            }
+                            failure.partial.clear();
+                            return Err(failure);
+                        }
+                    }
+                }
+            } else {
+                for value in &updates {
+                    if sink(value) {
+                        stop = true;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some(failure) = update_err {
+            return Err(failure);
+        }
+        *acc = match updates.last() {
+            Some(value) => value.clone(),
+            None => Value::Null,
+        };
+        *lookup = None;
+        Ok(())
+    });
+    if let Err(failure) = stepped {
+        return Err(failure);
+    }
+    Ok(stop)
+}
+
 /// `true` means a consumer asked to stop. Values already handed to `sink`
 /// are not repeated in an error. `sink` returns `true` to stop.
 pub(super) fn fold_into(
@@ -707,89 +796,61 @@ pub(super) fn fold_into(
     for (index, init_value) in inits.iter().enumerate() {
         let null_input = Value::Null;
         let stream_input = if index == 0 { input } else { &null_input };
-        let (items, stream_err) = parts(eval_in(stream, stream_input, env));
         let mut acc = init_value.clone();
         // Reused while the accumulator stays one object. A slow step replaces
         // the value, and the next fast step builds the index again.
         let mut lookup = None;
-        for item in &items {
-            let mut stop = false;
-            let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
-                if stop {
-                    return Ok(());
-                }
-                let child = child_scope(frame, env);
-                // `foreach` can reuse the accumulator when the step it emits
-                // is that accumulator. The caller has to be finished with the
-                // value before the next step.
-                let accelerated = if !emit || super::update::foreach_can_accelerate(update) {
-                    match super::update::accelerate_reduce(update, &mut acc, &child, &mut lookup) {
-                        Ok(true) => true,
-                        Ok(false) => {
-                            lookup = None;
-                            false
-                        }
-                        Err(failure) => return Err(failure),
-                    }
-                } else {
-                    false
-                };
-                if accelerated {
-                    if emit && deliver(&acc, extract, &child, sink)? {
-                        stop = true;
-                    }
-                    return Ok(());
-                }
-                let (updates, update_err) = parts(eval_in(update, &acc, &child));
-                if emit {
-                    if let Some(extract) = extract {
-                        for value in &updates {
-                            match eval_in(extract, value, &child) {
-                                Ok(more) => {
-                                    for one in &more {
-                                        if sink(one) {
-                                            stop = true;
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                                Err(mut failure) => {
-                                    for one in &failure.partial {
-                                        if sink(one) {
-                                            stop = true;
-                                            return Ok(());
-                                        }
-                                    }
-                                    failure.partial.clear();
-                                    return Err(failure);
-                                }
-                            }
-                        }
-                    } else {
-                        for value in &updates {
-                            if sink(value) {
-                                stop = true;
-                                return Ok(());
-                            }
+        let mut stream_err = None;
+        let mut stop = false;
+        // `inputs` is read one value at a time. The update sees that value's
+        // line, and the read past the end runs only after the update.
+        if matches!(stream, Filter::Inputs) {
+            while !stop {
+                match crate::feed::read_one() {
+                    crate::feed::Read::Value(item) => {
+                        if fold_one(
+                            &item,
+                            pattern,
+                            update,
+                            extract,
+                            emit,
+                            env,
+                            &mut acc,
+                            &mut lookup,
+                            sink,
+                        )? {
+                            stop = true;
                         }
                     }
+                    crate::feed::Read::Break => break,
+                    crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => {
+                        stream_err = Some(fail(message));
+                        break;
+                    }
                 }
-                if let Some(failure) = update_err {
-                    return Err(failure);
-                }
-                acc = match updates.last() {
-                    Some(value) => value.clone(),
-                    None => Value::Null,
-                };
-                lookup = None;
-                Ok(())
-            });
-            if let Err(failure) = stepped {
-                return Err(failure);
             }
-            if stop {
-                return Ok(true);
+        } else {
+            let (items, err) = parts(eval_in(stream, stream_input, env));
+            stream_err = err;
+            for item in &items {
+                if fold_one(
+                    item,
+                    pattern,
+                    update,
+                    extract,
+                    emit,
+                    env,
+                    &mut acc,
+                    &mut lookup,
+                    sink,
+                )? {
+                    stop = true;
+                    break;
+                }
             }
+        }
+        if stop {
+            return Ok(true);
         }
         if let Some(failure) = stream_err {
             return Err(failure);
