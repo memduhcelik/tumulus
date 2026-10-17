@@ -1228,8 +1228,118 @@ fn run(
             };
             run(&indexed, input, path, line, input_gen, ctx)
         }
+        // The extract is a path on the state. A computed state cannot be indexed.
+        Filter::Foreach {
+            stream,
+            pattern,
+            init,
+            update,
+            extract,
+        } => run_foreach(
+            stream,
+            pattern,
+            init,
+            update,
+            extract.as_deref(),
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+        ),
         other => run_fallback(other, input, path, line, ctx),
     }
+}
+
+/// `foreach` in a path. The stream and the update run as values when they
+/// are not themselves paths. The extract runs on each state, and a state
+/// that was not reached through the input refuses an index.
+fn run_foreach(
+    stream: &Filter,
+    pattern: &Pattern,
+    init: &Filter,
+    update: &Filter,
+    extract: Option<&Filter>,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let identity = Filter::Identity;
+    let extract = extract.unwrap_or(&identity);
+    let init_line = Cell::new(line.get());
+    let inits = run(init, input, path, &init_line, input_gen, ctx)?;
+    let mut out = Vec::new();
+    for (index, init_state) in inits.into_iter().enumerate() {
+        let null_input = Value::Null;
+        let stream_input = if index == 0 { input } else { &null_input };
+        let (items, stream_err) = parts(eval_in(stream, stream_input, ctx.env));
+        let mut state = init_state;
+        for item in &items {
+            let mut step_err: Option<PathErr> = None;
+            let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
+                if step_err.is_some() {
+                    return Ok(());
+                }
+                let child_env = child_scope(frame, ctx.env);
+                let child = Ctx {
+                    root: ctx.root,
+                    next: ctx.next,
+                    env: &child_env,
+                    pbinds: ctx.pbinds,
+                };
+                let gen = if state.carrier { state.value_gen } else { 0 };
+                let cell = Cell::new(gen);
+                let updates = match run(update, &state.value, &state.path, &cell, gen, &child) {
+                    Ok(updates) => updates,
+                    Err(err) => {
+                        step_err = Some(attach(std::mem::take(&mut out), err));
+                        return Ok(());
+                    }
+                };
+                if updates.is_empty() {
+                    let kept = state.path.clone();
+                    let lineage = state.line;
+                    state = constant(Value::Null, &kept, lineage, ctx.root);
+                    return Ok(());
+                }
+                for (at, upd) in updates.iter().enumerate() {
+                    let ext_gen = if upd.carrier { upd.value_gen } else { 0 };
+                    let ext_line = Cell::new(ext_gen);
+                    match run(extract, &upd.value, &upd.path, &ext_line, ext_gen, &child) {
+                        Ok(more) => out.extend(more),
+                        Err(err) => {
+                            step_err = Some(attach(std::mem::take(&mut out), err));
+                            return Ok(());
+                        }
+                    }
+                    if at + 1 == updates.len() {
+                        state = upd.clone();
+                    }
+                }
+                Ok(())
+            });
+            if let Some(err) = step_err {
+                return Err(err);
+            }
+            if let Err(failure) = matched {
+                return Err(PathErr {
+                    partial: out,
+                    message: failure.message,
+                    caught: failure.caught,
+                });
+            }
+        }
+        if let Some(failure) = stream_err {
+            return Err(PathErr {
+                partial: out,
+                message: failure.message,
+                caught: failure.caught,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn run_call(

@@ -850,14 +850,14 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "implode" | "utf8bytelength" | "todate" | "fromdate" | "gmtime" | "localtime"
         | "mktime" | "now" | "add" | "to_entries" | "from_entries" | "input" | "inputs"
         | "input_filename" | "env" | "sort" | "unique" | "min" | "max" | "values" | "nulls"
-        | "booleans" | "numbers" | "strings" | "arrays" | "objects" | "iterables" | "scalars" => {
-            arity == 0
-        }
+        | "booleans" | "numbers" | "strings" | "arrays" | "objects" | "iterables" | "scalars"
+        | "tostream" => arity == 0,
         "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
         "has" | "select" | "map" | "map_values" | "join" | "ltrimstr" | "rtrimstr"
         | "startswith" | "endswith" | "index" | "rindex" | "indices" | "split" | "contains"
         | "inside" | "isempty" | "strftime" | "strflocaltime" | "strptime" | "path" | "getpath"
-        | "delpaths" | "del" | "repeat" | "walk" | "with_entries" => arity == 1,
+        | "delpaths" | "del" | "repeat" | "walk" | "with_entries" | "fromstream"
+        | "truncate_stream" => arity == 1,
         "paths" | "first" | "last" | "error" | "flatten" => arity <= 1,
         "any" | "all" => arity <= 2,
         "IN" | "INDEX" => arity == 1 || arity == 2,
@@ -1086,6 +1086,9 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "until" => Filter::Until(args.next().expect("cond"), args.next().expect("next")),
         "while" => Filter::While(args.next().expect("cond"), args.next().expect("update")),
         "setpath" => Filter::SetPath(args.next().expect("path"), args.next().expect("value")),
+        "tostream" => compile_stream(TOSTREAM),
+        "fromstream" => with_stream_arg(FROMSTREAM, args.next().expect("fromstream")),
+        "truncate_stream" => with_stream_arg(TRUNCATE_STREAM, args.next().expect("truncate")),
         _ => match math::kind(name).expect("math builtin") {
             Kind::Unary(op) => Filter::Math1(op),
             Kind::Abs => Filter::Abs,
@@ -1098,6 +1101,37 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
             ),
         },
     }
+}
+
+/// jq's `tostream`. Paths of scalars come out first, then one closer for each container.
+const TOSTREAM: &str =
+    "path(def r: (.[]?|r), .; r) as $p | getpath($p) | reduce path(.[]?) as $q ([$p, .]; [$p+$q])";
+
+/// jq's `fromstream`. The call at the end is replaced with the real argument.
+const FROMSTREAM: &str = "def fromstream(i): {x: null, e: false} as $init | foreach i as $i ($init; if .e then $init else . end | if $i|length == 2 then setpath([\"e\"]; $i[0]|length==0) | setpath([\"x\"]+$i[0]; $i[1]) else setpath([\"e\"]; $i[0]|length==1) end; if .e then .x else empty end); fromstream(null)";
+
+/// jq's `truncate_stream`. The argument runs on `null`, and `.` is only the depth.
+const TRUNCATE_STREAM: &str = "def truncate_stream(stream): . as $n | null | stream | . as $input | if (.[0]|length) > $n then setpath([0];$input[0][$n:]) else empty end; truncate_stream(null)";
+
+fn compile_stream(source: &str) -> Filter {
+    match compile(source) {
+        Ok(filter) => filter,
+        Err(ProgramError::Report(text)) => panic!("stream builtin failed to compile: {text}"),
+        Err(ProgramError::Syntax) => panic!("stream builtin failed to compile"),
+    }
+}
+
+fn with_stream_arg(source: &str, arg: Box<Filter>) -> Filter {
+    let mut filter = compile_stream(source);
+    let Filter::Define { rest, .. } = &mut filter else {
+        panic!("stream builtin is not a definition");
+    };
+    let Filter::Call { args, .. } = rest.as_mut() else {
+        panic!("stream builtin is not a call");
+    };
+    args.clear();
+    args.push(*arg);
+    filter
 }
 
 pub(super) fn pattern_names(pattern: &Pattern, out: &mut Vec<String>) {

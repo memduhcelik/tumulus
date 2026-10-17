@@ -2,6 +2,7 @@
 
 mod atom;
 mod parser;
+mod stream;
 mod string;
 mod value;
 
@@ -12,6 +13,9 @@ use crate::print::{self, Style};
 use crate::value::Value;
 
 use parser::Parser;
+
+pub(crate) use stream::{closer_is_detached, scan_stream_input};
+pub use stream::{program_stream, StreamFeed, StreamValue};
 
 /// Bytes that are not UTF-8 become U+FFFD, the way a JSON string does.
 pub(crate) fn repair_utf8(bytes: &[u8]) -> String {
@@ -194,7 +198,11 @@ fn stop(
 }
 
 /// The next value after a hard error starts on the following line.
-fn skip_rest_of_line(text: &[u8], mut index: usize, mut line: usize) -> (usize, usize) {
+pub(in crate::parse) fn skip_rest_of_line(
+    text: &[u8],
+    mut index: usize,
+    mut line: usize,
+) -> (usize, usize) {
     while index < text.len() && text[index] != b'\n' {
         index += 1;
     }
@@ -295,7 +303,7 @@ fn newline_count(text: &[u8]) -> usize {
     text.iter().filter(|byte| **byte == b'\n').count()
 }
 
-fn split_bom(bytes: &[u8]) -> (usize, &[u8]) {
+pub(in crate::parse) fn split_bom(bytes: &[u8]) -> (usize, &[u8]) {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         (3, &bytes[3..])
     } else {

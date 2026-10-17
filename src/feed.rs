@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self};
 
-use crate::parse::{scan_input, stream_line, LineCursor};
+use crate::parse::{
+    closer_is_detached, program_stream, scan_input, scan_stream_input, stream_line, LineCursor,
+};
 use crate::value::Value;
 use crate::Error;
 
@@ -33,6 +35,8 @@ pub struct Source {
     pub files: Vec<String>,
     pub raw: bool,
     pub slurp: bool,
+    /// `--stream`. Raw input ignores this and keeps one string per line.
+    pub stream: bool,
 }
 
 pub struct SourceGuard;
@@ -159,6 +163,8 @@ struct Item {
     value: Value,
     name: String,
     line: usize,
+    /// A final scalar closer. jq names that error `<unknown>`.
+    unknown: bool,
 }
 
 struct Fault {
@@ -179,6 +185,7 @@ struct Session {
     file_at: usize,
     raw: bool,
     slurp: bool,
+    stream: bool,
     buf: Vec<u8>,
     chunks: Vec<Chunk>,
     scan_at: usize,
@@ -216,6 +223,7 @@ impl Session {
             file_at: 0,
             raw: source.raw,
             slurp: source.slurp,
+            stream: source.stream,
             buf: Vec::new(),
             chunks: Vec::new(),
             scan_at: 0,
@@ -258,7 +266,12 @@ impl Session {
     fn pull_json(&mut self, recover: bool) -> Result<Pulled, String> {
         loop {
             if let Some(item) = self.pending.pop_front() {
-                self.note(&item.name, item.line);
+                if item.unknown {
+                    self.yielded = Some(item.name);
+                    self.at = "<unknown>".to_string();
+                } else {
+                    self.note(&item.name, item.line);
+                }
                 return Ok(Pulled::Value(item.value));
             }
             if let Some(fault) = self.fault.take() {
@@ -284,11 +297,19 @@ impl Session {
         if !self.pending.is_empty() || self.fault.is_some() {
             return Ok(true);
         }
+        if self.stream {
+            return self.fill_stream();
+        }
         loop {
             let scan = scan_input(&self.buf, self.scan_at, self.scan_line);
             for (value, end) in scan.values {
                 let (name, line) = self.place(end, is_atom(&value));
-                self.pending.push_back(Item { value, name, line });
+                self.pending.push_back(Item {
+                    value,
+                    name,
+                    line,
+                    unknown: false,
+                });
             }
             if scan.incomplete {
                 self.scan_at = scan.restart;
@@ -329,6 +350,65 @@ impl Session {
         }
     }
 
+    /// `--stream` waits until every file is in, so a later byte can still
+    /// change the line of an item. A hard error is reported from the bytes
+    /// already read.
+    fn fill_stream(&mut self) -> Result<bool, String> {
+        loop {
+            let scan = scan_stream_input(&self.buf, self.scan_at, self.scan_line);
+            if scan.incomplete {
+                if self.append()? == More::Added {
+                    continue;
+                }
+                self.queue_stream(scan.items, false);
+                let (name, line) = if let Some(name) = self.failed_here.clone() {
+                    (name, 0)
+                } else {
+                    self.place(scan.error_at, false)
+                };
+                self.fault = Some(Fault {
+                    message: scan.error.unwrap_or_else(|| "parse error".to_string()),
+                    name,
+                    line,
+                });
+                return Ok(true);
+            }
+            if let Some(message) = scan.error {
+                self.queue_stream(scan.items, false);
+                let (name, line) = self.place(scan.error_at, false);
+                self.fault = Some(Fault {
+                    message,
+                    name,
+                    line,
+                });
+                self.staged = Some((scan.resume, scan.resume_line));
+                return Ok(true);
+            }
+            if self.append()? == More::Added {
+                continue;
+            }
+            self.queue_stream(scan.items, true);
+            self.scan_at = scan.resume;
+            self.scan_line = scan.resume_line;
+            return Ok(!self.pending.is_empty());
+        }
+    }
+
+    fn queue_stream(&mut self, items: Vec<(Value, usize, bool)>, ended: bool) {
+        let values: Vec<Value> = items.iter().map(|(value, _, _)| value.clone()).collect();
+        let detach = ended && closer_is_detached(&values, &self.buf);
+        let last = items.len();
+        for (index, (value, end, atom)) in items.into_iter().enumerate() {
+            let (name, line) = self.place(end, atom);
+            self.pending.push_back(Item {
+                value,
+                name,
+                line,
+                unknown: detach && index + 1 == last,
+            });
+        }
+    }
+
     fn pull_raw(&mut self) -> Result<Pulled, String> {
         let mut pending = Vec::new();
         loop {
@@ -363,7 +443,7 @@ impl Session {
 
     fn pull_slurp(&mut self, from_input: bool) -> Result<Pulled, String> {
         if self.slurp_done {
-            return Ok(Pulled::End);
+            return self.pop_slurp();
         }
         while self.append()? == More::Added {}
         if from_input {
@@ -379,6 +459,10 @@ impl Session {
                 self.note(&name, line);
             }
             return Ok(Pulled::Value(Value::String(decode(&self.buf))));
+        }
+        if self.stream {
+            self.load_stream_slurp();
+            return self.pop_slurp();
         }
         let scan = scan_input(&self.buf, 0, 1);
         if let Some(message) = scan.error {
@@ -399,6 +483,47 @@ impl Session {
             self.note(&name, line);
         }
         Ok(Pulled::Value(Value::array(items)))
+    }
+
+    fn load_stream_slurp(&mut self) {
+        let fed = program_stream(&self.buf, true);
+        let name = self
+            .cur
+            .as_ref()
+            .map(|cur| cur.name.clone())
+            .unwrap_or_else(|| "<stdin>".to_string());
+        for value in fed.values {
+            self.pending.push_back(Item {
+                value: value.value,
+                name: name.clone(),
+                line: value.line,
+                unknown: value.unknown,
+            });
+        }
+        if let Some(message) = fed.error {
+            self.fault = Some(Fault {
+                message,
+                name,
+                line: 0,
+            });
+        }
+    }
+
+    fn pop_slurp(&mut self) -> Result<Pulled, String> {
+        if let Some(item) = self.pending.pop_front() {
+            if item.unknown {
+                self.yielded = Some(item.name);
+                self.at = "<unknown>".to_string();
+            } else {
+                self.note(&item.name, item.line);
+            }
+            return Ok(Pulled::Value(item.value));
+        }
+        if let Some(fault) = self.fault.take() {
+            self.note(&fault.name, fault.line);
+            return Ok(Pulled::Parse(fault.message));
+        }
+        Ok(Pulled::End)
     }
 
     fn append(&mut self) -> Result<More, String> {

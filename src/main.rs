@@ -5,8 +5,8 @@ use std::process;
 
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
-    parse_stream, reads_input, render, set_environ, set_unknown, Error, Failure, Filter, Indent,
-    Layout, MainNext, ProgramError, Source, Style, Value,
+    parse_stream, program_stream, reads_input, render, set_environ, set_unknown, Error, Failure,
+    Filter, Indent, Layout, MainNext, ProgramError, Source, Style, Value,
 };
 
 fn main() {
@@ -81,7 +81,18 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     } else if options.raw_input {
         apply_raw(&options.files, options.style, &program, &env, &mut run, out)?;
     } else if options.slurp {
-        apply_slurp(&options.files, options.style, &program, &env, &mut run, out)?;
+        apply_slurp(
+            &options.files,
+            options.style,
+            options.stream,
+            &program,
+            &env,
+            &mut run,
+            out,
+        )?;
+    } else if options.stream {
+        // The same reader as `inputs`, so a value can run on into the next file.
+        apply_shared(&options, &program, &env, &mut run, out)?;
     } else {
         apply_values(&options.files, options.style, &program, &env, &mut run, out)?;
     }
@@ -221,6 +232,7 @@ fn apply_shared(
         files: options.files.clone(),
         raw: options.raw_input,
         slurp: options.slurp,
+        stream: options.stream && !options.raw_input,
     });
     let mut failed = false;
     if options.null_input {
@@ -348,6 +360,7 @@ fn finish_input(missing: bool, failed: bool) -> i32 {
 fn apply_slurp(
     files: &[String],
     style: Style,
+    stream: bool,
     program: &Filter,
     env: &[(String, Value)],
     run: &mut Run,
@@ -368,7 +381,11 @@ fn apply_slurp(
             Opened::Bytes(bytes) => {
                 at.line = newline_count(&bytes);
                 buf.extend_from_slice(&bytes);
-                if let Some(message) = committed_parse_error(&buf) {
+                if let Some(message) = if stream {
+                    committed_stream_error(&buf)
+                } else {
+                    committed_parse_error(&buf)
+                } {
                     early = Some(message);
                     break;
                 }
@@ -378,6 +395,25 @@ fn apply_slurp(
     if let Some(message) = early {
         eprintln!("jq: parse error: {message}");
         run.status = finish_input(missing, true);
+        return Ok(());
+    }
+    if stream {
+        let fed = program_stream(&buf, true);
+        let mut failed = false;
+        for item in &fed.values {
+            let place = if item.unknown {
+                "<unknown>".to_string()
+            } else {
+                format!("{}:{}", at.source, item.line)
+            };
+            failed = emit_at(program, &item.value, env, style, &place, run, out)?;
+        }
+        if let Some(message) = fed.error {
+            eprintln!("jq: parse error: {message}");
+            run.status = finish_input(missing, true);
+            return Ok(());
+        }
+        run.status = finish_input(missing, failed);
         return Ok(());
     }
     let parsed = parse_stream(&buf)?;
@@ -390,6 +426,17 @@ fn apply_slurp(
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
     run.status = finish_input(missing, failed);
     Ok(())
+}
+
+/// A parse error jq would raise before asking for another file.
+/// An error at EOF can still be repaired by the next file's bytes.
+fn committed_stream_error(bytes: &[u8]) -> Option<String> {
+    let message = program_stream(bytes, true).error?;
+    if message.contains(" at EOF ") {
+        None
+    } else {
+        Some(message)
+    }
 }
 
 /// One string of every opened file, including a trailing newline.
@@ -509,11 +556,31 @@ fn emit(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<bool, Error> {
+    emit_at(
+        program,
+        input,
+        env,
+        style,
+        &format!("{source}:{line}"),
+        run,
+        out,
+    )
+}
+
+fn emit_at(
+    program: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    style: Style,
+    at: &str,
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<bool, Error> {
     match run_program(program, input, env, style, run, out)? {
         Ok(()) => Ok(false),
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
-            report_error(&format!("{source}:{line}"), &failure);
+            report_error(at, &failure);
             Ok(true)
         }
     }
@@ -613,6 +680,7 @@ struct Options {
     slurp: bool,
     raw_input: bool,
     exit_status: bool,
+    stream: bool,
     program: Program,
     files: Vec<String>,
     named: Vec<(String, Value)>,
@@ -633,6 +701,7 @@ struct Flags {
     raw_input: bool,
     exit_status: bool,
     from_file: bool,
+    stream: bool,
 }
 
 fn options() -> Result<Options, Error> {
@@ -644,6 +713,7 @@ fn options() -> Result<Options, Error> {
         raw_input: false,
         exit_status: false,
         from_file: false,
+        stream: false,
     };
     let mut named = Vec::new();
     let mut positional = Vec::new();
@@ -746,6 +816,7 @@ fn options() -> Result<Options, Error> {
             "-s" | "--slurp" => flags.slurp = true,
             "-e" | "--exit-status" => flags.exit_status = true,
             "-R" | "--raw-input" => flags.raw_input = true,
+            "--stream" => flags.stream = true,
             // The file name is the first operand, not the next argument.
             "-f" | "--from-file" => flags.from_file = true,
             "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
@@ -780,6 +851,7 @@ fn options() -> Result<Options, Error> {
         slurp: flags.slurp,
         raw_input: flags.raw_input,
         exit_status: flags.exit_status,
+        stream: flags.stream,
         program,
         files,
         named,

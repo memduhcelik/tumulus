@@ -18,6 +18,8 @@ pub use feed::{
 pub use filter::{
     compile, compile_with, eval, eval_stream, eval_with, reads_input, Failure, Filter, ProgramError,
 };
-pub use parse::{parse_stream, write_input, LocatedValue, ParsedStream};
+pub use parse::{
+    parse_stream, program_stream, write_input, LocatedValue, ParsedStream, StreamFeed, StreamValue,
+};
 pub use print::{render, Indent, Layout, Style};
 pub use value::Value;

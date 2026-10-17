@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`tostream` writes each value as path items. A scalar, or an empty array or object, is one pair of the path and the value. Any other container is the items inside it, then one closer naming its last child. `fromstream(stream)` builds the values back. The argument is the stream. A closer whose path has one component emits the value so far and starts again. A value with no closer is not emitted. `truncate_stream(stream)` keeps items whose path is longer than the input and drops that many leading components. The argument runs on `null`. `--stream` reads input as those items, including ones finished before a cut-off value. `-s` gathers them into one array. A final closer that names a scalar, when the input does not end in whitespace, is a second value. `-R` still reads lines. With `--stream`, a value continues from one file into the next, and nesting is not stopped at 256. Each file is still read to the end before the first item is printed. `--stream-errors` is still rejected.
+
 `paths` records each path while it walks the value. Comparing two numbers uses the digits already in the text. `sort_by` and `[paths]` keep the same values.
 
 ## 0.8.0

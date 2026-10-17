@@ -118,7 +118,7 @@ impl<'a> Parser<'a> {
         Ok(Value::object(items))
     }
 
-    fn expect_colon(&mut self) -> Result<(), ParseErr> {
+    pub(in crate::parse) fn expect_colon(&mut self) -> Result<(), ParseErr> {
         self.skip_ws();
         match self.peek() {
             Some(':') => {
@@ -132,7 +132,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn bad_key(&mut self) -> ParseErr {
+    pub(in crate::parse) fn bad_key(&mut self) -> ParseErr {
         self.skip_ws();
         match self.peek() {
             Some(':') => self.bump_fail("Object keys must be strings"),
@@ -146,24 +146,33 @@ impl<'a> Parser<'a> {
     /// A value showed up where a comma was required. Point at the end of that
     /// value: the closing quote of a string, the opening bracket of a container,
     /// or the byte that ends an atom.
-    fn expected_separator(&mut self) -> ParseErr {
+    pub(in crate::parse) fn expected_separator(&mut self) -> ParseErr {
+        self.expected_separator_phrase("Expected separator between values")
+    }
+
+    /// `--stream` says "Expected a separator between values".
+    pub(in crate::parse) fn expected_stream_separator(&mut self) -> ParseErr {
+        self.expected_separator_phrase("Expected a separator between values")
+    }
+
+    fn expected_separator_phrase(&mut self, phrase: &'static str) -> ParseErr {
         match self.peek() {
             Some('[' | '{') => {
                 self.bump();
-                self.fail("Expected separator between values", false)
+                self.fail(phrase, false)
             }
             Some('"') => match self.parse_string() {
                 Err(err) => err,
-                Ok(_) => self.fail("Expected separator between values", false),
+                Ok(_) => self.fail(phrase, false),
             },
             Some(_) => match self.scan_atom() {
                 Err(err) => err,
                 Ok(_) => {
                     if self.eof() {
-                        self.fail("Expected separator between values", true)
+                        self.fail(phrase, true)
                     } else {
                         self.bump();
-                        self.fail("Expected separator between values", false)
+                        self.fail(phrase, false)
                     }
                 }
             },

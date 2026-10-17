@@ -8757,3 +8757,236 @@ fn type_filters_match_jq() {
         compare_exact(name, &["-n", "-c", "--", program], input);
     }
 }
+
+#[test]
+fn streaming_match_jq() {
+    require_jq();
+
+    let programs = [
+        ("stream null", "null | tostream"),
+        ("stream array", "[1,2] | tostream"),
+        ("stream nested", "[[1,2],[3]] | tostream"),
+        ("stream object", r#"{"b":1,"a":[2,{}]} | tostream"#),
+        ("stream empty array", "[] | tostream"),
+        ("stream empty object", "{} | tostream"),
+        ("stream nested empty", "[[]] | tostream"),
+        ("stream deeper", "[1,[2,[]],3] | tostream"),
+        ("stream object nest", r#"{"a":{"b":{}}} | tostream"#),
+        ("stream nan", "nan | tostream"),
+        ("stream neg zero", "-0 | tostream"),
+        ("stream decimal", "1.50 | tostream"),
+        ("stream empty", "empty | tostream"),
+        (
+            "stream round trip",
+            "[fromstream(1 | tostream), fromstream([1,2] | tostream), fromstream([[1,2],[3]] | tostream), fromstream({} | tostream), fromstream([] | tostream)]",
+        ),
+        ("stream rebuild", "fromstream([[0],1], [[1],2], [[1]])"),
+        ("stream no closer", "fromstream([[0],1])"),
+        (
+            "stream closer resets",
+            "fromstream([[0,0],1], [[0,1],2], [[0]], [[1,0],3], [[1,0]], [[1]])",
+        ),
+        ("stream root replaces", "fromstream([[0],1], [[],2])"),
+        ("stream number length", "fromstream([1])"),
+        ("stream extra element", "fromstream([[0],1,99], [[1]])"),
+        ("stream hole", "fromstream([[2],9], [[2]])"),
+        ("stream add path", "try fromstream([1,2]) catch ."),
+        ("stream index number", "try fromstream(1) catch ."),
+        ("stream boolean length", "try fromstream(false) catch ."),
+        ("stream index array", "try fromstream([[[0]],1]) catch ."),
+        ("stream string index", r#"try fromstream("ab") catch ."#),
+        ("stream null path", "fromstream([null,1])"),
+        (
+            "stream partial then error",
+            r#"try fromstream([[],1], error("z")) catch ."#,
+        ),
+        ("stream first stops", r#"first(fromstream([[],1], error("z")))"#),
+        ("stream shadow fromstream", "def fromstream(s): 9; fromstream(1)"),
+        ("stream shadow tostream", "def tostream: 7; 1 | tostream"),
+        ("stream path tostream", "try path(tostream) catch ."),
+        ("stream path fromstream", "try path(fromstream([[],1])) catch ."),
+        ("stream path fromstream bad", "try path(fromstream(1)) catch ."),
+        (
+            "stream truncate one",
+            "1 | truncate_stream([[1,2],[3]] | tostream)",
+        ),
+        (
+            "stream truncate zero",
+            "0 | truncate_stream([[1,2],[3]] | tostream)",
+        ),
+        (
+            "stream truncate none",
+            "2 | truncate_stream([[1,2],[3]] | tostream)",
+        ),
+        (
+            "stream truncate negative",
+            "-1 | truncate_stream([[1,2],[3]] | tostream)",
+        ),
+        (
+            "stream truncate fraction",
+            "1.5 | truncate_stream([[1,2],[3]] | tostream)",
+        ),
+        (
+            "stream truncate null",
+            "null | truncate_stream([1,2] | tostream)",
+        ),
+        ("stream truncate scalar", "truncate_stream(1 | tostream)"),
+        (
+            "stream truncate string depth",
+            r#""a" | truncate_stream([1,2] | tostream)"#,
+        ),
+        (
+            "stream truncate object item",
+            r#"try (1 | truncate_stream({"a":1})) catch ."#,
+        ),
+        (
+            "stream truncate number item",
+            "try (null | truncate_stream([1,2])) catch .",
+        ),
+        (
+            "stream truncate bool depth",
+            "try (true | truncate_stream([1,2] | tostream)) catch .",
+        ),
+        (
+            "stream truncate ignores input",
+            "[1,2] | tostream | truncate_stream(.)",
+        ),
+        (
+            "stream truncate runs on null",
+            r#"{"a":1} | truncate_stream(. | tostream)"#,
+        ),
+        ("stream tostream arity", "tostream(1)"),
+        ("stream fromstream arity", "fromstream"),
+        ("stream truncate arity", "truncate_stream"),
+        ("stream truncate arity two", "truncate_stream(1;2)"),
+    ];
+    for (name, program) in programs {
+        compare_exact(name, &["-n", "-c", "--", program], b"");
+    }
+
+    let cases: Vec<(&str, &[&str], &[u8])> = vec![
+        (
+            "stream option nested",
+            &["-c", "--stream", "."],
+            b"[[1,2],[3]]",
+        ),
+        ("stream option scalars", &["-c", "--stream", "."], b"1\n2\n"),
+        ("stream option cut off", &["-c", "--stream", "."], b"[1,"),
+        (
+            "stream option open number",
+            &["-c", "--stream", "."],
+            b"[1,2",
+        ),
+        ("stream option comma", &["-c", "--stream", "."], b"[1,2,]"),
+        (
+            "stream option object comma",
+            &["-c", "--stream", "."],
+            b"{\"a\":1,}",
+        ),
+        ("stream option top bracket", &["-c", "--stream", "."], b"1]"),
+        (
+            "stream option duplicates",
+            &["-c", "--stream", "."],
+            b"{\"a\":1,\"a\":2}",
+        ),
+        ("stream option pretty", &["--stream"], b"1"),
+        (
+            "stream slurp scalars",
+            &["-c", "--stream", "-s", "."],
+            b"1\n2\n",
+        ),
+        (
+            "stream slurp detached",
+            &["-c", "--stream", "-s", "."],
+            b"[1,2]",
+        ),
+        (
+            "stream slurp joined",
+            &["-c", "--stream", "-s", "."],
+            b"[1,2]\n",
+        ),
+        (
+            "stream slurp partial",
+            &["-c", "--stream", "-s", "."],
+            b"[1,",
+        ),
+        (
+            "stream slurp container",
+            &["-c", "--stream", "-s", "."],
+            b"[[],",
+        ),
+        (
+            "stream raw wins",
+            &["-c", "--stream", "-R", "."],
+            b"ab\ncd\n",
+        ),
+        ("stream null input", &["-nc", "--stream", "."], b"[1,2]"),
+        (
+            "stream null inputs",
+            &["-nc", "--stream", "inputs"],
+            b"[[1,2],[3]]",
+        ),
+        (
+            "stream inputs skip",
+            &["-c", "--stream", "inputs"],
+            b"[1,2]\n[3]",
+        ),
+        ("stream input break", &["-c", "--stream", "input"], b"[1,2]"),
+        ("stream exit empty", &["-c", "--stream", "-e", "."], b""),
+        ("stream exit null", &["-c", "--stream", "-e", "."], b"null"),
+        (
+            "stream error lines",
+            &["-c", "--stream", r#"error("z")"#],
+            b"[\n1,\n2]",
+        ),
+        (
+            "stream error detached",
+            &["-c", "--stream", r#"error("z")"#],
+            b"[1,2]",
+        ),
+        (
+            "stream error closed",
+            &["-c", "--stream", r#"error("z")"#],
+            b"[1,2]\n",
+        ),
+        (
+            "stream slurp error",
+            &["-c", "--stream", "-s", r#"error("z")"#],
+            b"[1,2]",
+        ),
+        ("stream colon", &["-c", "--stream", "."], b":"),
+        ("stream string tail", &["-c", "--stream", "."], b"\"\"]"),
+        ("stream separator word", &["-c", "--stream", "."], b"[1["),
+        ("stream bad key", &["-c", "--stream", "."], b"{1]"),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    let mut deep = vec![b'['; 300];
+    deep.push(b'0');
+    deep.extend(std::iter::repeat(b']').take(300));
+    compare_exact("stream deep", &["-c", "--stream", "length"], &deep);
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("stream-span-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let left = dir.join("left.json");
+    let right = dir.join("right.json");
+    fs::write(&left, b"[1,").unwrap();
+    fs::write(&right, b"2]").unwrap();
+    compare_exact(
+        "stream spans files",
+        &[
+            "-c",
+            "--stream",
+            ".",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+        b"",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
