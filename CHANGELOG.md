@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
+
+Released on 2026-10-17.
 
 `tostream` writes each value as path items. A scalar, or an empty array or object, is one pair of the path and the value. Any other container is the items inside it, then one closer naming its last child. `fromstream(stream)` builds the values back. The argument is the stream. A closer whose path has one component emits the value so far and starts again. A value with no closer is not emitted. `truncate_stream(stream)` keeps items whose path is longer than the input and drops that many leading components. The argument runs on `null`. `--stream` reads input as those items, including ones finished before a cut-off value, and prints each finished item while the rest of the input is still being read. `-s` gathers them into one array. A final closer that names a scalar, when the input does not end in whitespace, is a second value. `-R` still reads lines. With `--stream`, a value continues from one file into the next, and nesting is not stopped at 256. `--stream-errors` parses the same way and turns a parse error into one value, `[message, path]`, then keeps reading. On macOS, a NUL with no newline after it ends the JSON input, and the bytes after it are ignored. On Linux, and on macOS when a newline follows, the NUL ends the token before it. A number keeps that text. `true`, `false`, `null`, and a token that starts on a NUL are invalid. `-R` still keeps that byte in the line.
 
