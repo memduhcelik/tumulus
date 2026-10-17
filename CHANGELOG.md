@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+`test`, `match`, and `capture` follow jq. One argument takes a string or an array `[regex]` or `[regex, flags]`. Two arguments take the pattern and the flags. The flags are `g`, `i`, `m`, `n`, `p`, `s`, `l`, and `x`. `g` finds every non-overlapping match. `i` ignores case. `m` lets `.` match a newline. `s` does not. `p` turns on both, and `.` follows `m`. `n` drops empty matches. `l` keeps the longest match. `x` ignores whitespace and comments in the pattern. A bad value, a bad flag, or a pattern that does not compile fails the way jq fails, and the exit status is 5. Values already produced are kept. `first` and `limit` do not read a later pattern. `scan`, `splits`, `sub`, `gsub`, and `split` with two filters are still rejected. Of the 447 programs in jq 1.7.1's test file, 440 still come out the same.
+
+A failure while a function accepts a value is caught by `try` in that function. `def f: try (1 + "a") catch .; f` yields the message instead of exiting 5.
+
 `label $name | expr` and `break $name` leave the labeled expression. Values already produced stay. `break` raises `{"__jq": n}`, counted from 0 as labels are entered, including across inputs. `try` and `?` can catch it. A label catches its own number when nothing else does. A `break` with no visible label fails to compile with `$*label-name is not defined`, and the exit status is 3. A function that is never called is not checked. `break` keeps the label that is visible where it is written.
 
 `as`, `reduce`, and `foreach` accept `?//` patterns. The next pattern runs when the current one cannot match, or when the rest of the expression fails. A name that pattern did not bind is null. `halt` is not tried again. The last failure is kept, and the exit status is 5.

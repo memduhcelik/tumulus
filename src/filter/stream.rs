@@ -258,6 +258,14 @@ fn drive(
         ),
         Filter::Label { slot, body } => drive_label(*slot, body, input, env, emit),
         Filter::Break { slot, .. } => Err(eval::break_failure(*slot)),
+        Filter::MatchImpl {
+            regex,
+            flags,
+            testing,
+        } => drive_match_impl(regex, flags, *testing, input, env, emit),
+        Filter::StreamBind { expr, name, body } => {
+            drive_stream_bind(expr, name, body, input, env, emit)
+        }
         Filter::Call { .. } | Filter::Param(_) => {
             let mut forward = |value| emit.call(&value);
             super::machine::run(filter, input, env, &mut forward)
@@ -392,6 +400,195 @@ fn for_each(
         return Err(err);
     }
     result
+}
+
+/// One boolean, or one array of matches, per flags value and regex value.
+/// Flags are the outer loop. `on_value` returning true reads nothing further.
+pub(super) fn visit_match_impl(
+    regex: &Filter,
+    flags: &Filter,
+    testing: bool,
+    input: &Value,
+    env: &[(String, Value)],
+    mut on_value: impl FnMut(&Value) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let stopped = Cell::new(false);
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let mut on_flag = |flag: &Value| {
+        if stopped.get() {
+            return true;
+        }
+        let result = visit_regex(regex, flag, testing, input, env, &mut on_value, &stopped);
+        match result {
+            Ok(stop) => stop,
+            Err(err) => {
+                *failure.borrow_mut() = Some(err);
+                true
+            }
+        }
+    };
+    let on_flag = Emit {
+        f: RefCell::new(&mut on_flag),
+    };
+    let result = drive(flags, input, env, &on_flag);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    Ok(stopped.get() || result?)
+}
+
+fn visit_regex(
+    regex: &Filter,
+    flag: &Value,
+    testing: bool,
+    input: &Value,
+    env: &[(String, Value)],
+    on_value: &mut impl FnMut(&Value) -> Result<bool, Failure>,
+    stopped: &Cell<bool>,
+) -> Result<bool, Failure> {
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let mut on_regex = |pattern: &Value| {
+        if stopped.get() {
+            return true;
+        }
+        match super::re::apply_pair(input, pattern, flag, testing) {
+            Ok(value) => match on_value(&value) {
+                Ok(stop) => {
+                    if stop {
+                        stopped.set(true);
+                    }
+                    stop
+                }
+                Err(err) => {
+                    *failure.borrow_mut() = Some(err);
+                    true
+                }
+            },
+            Err(err) => {
+                *failure.borrow_mut() = Some(err);
+                true
+            }
+        }
+    };
+    let on_regex = Emit {
+        f: RefCell::new(&mut on_regex),
+    };
+    let result = drive(regex, input, env, &on_regex);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    result
+}
+
+fn drive_match_impl(
+    regex: &Filter,
+    flags: &Filter,
+    testing: bool,
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    visit_match_impl(regex, flags, testing, input, env, |value| {
+        Ok(emit.call(value))
+    })
+}
+
+/// Each value of `filter`, stopping when `on_value` stops or fails.
+/// A later value is not read after that.
+pub(super) fn for_each_value(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    mut on_value: impl FnMut(&Value) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let mut on_one = |value: &Value| match on_value(value) {
+        Ok(stop) => stop,
+        Err(err) => {
+            *failure.borrow_mut() = Some(err);
+            true
+        }
+    };
+    let emit = Emit {
+        f: RefCell::new(&mut on_one),
+    };
+    let result = drive(filter, input, env, &emit);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    result
+}
+
+/// Each value of `expr` is bound, then `body` runs. The next value waits
+/// until `body` has finished and the consumer still wants more.
+pub(super) fn visit_stream_bind(
+    expr: &Filter,
+    name: &str,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    mut on_value: impl FnMut(&Value) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let stopped = Cell::new(false);
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let mut on_expr = |value: &Value| {
+        if stopped.get() {
+            return true;
+        }
+        let child = eval::child_scope(&[(name.to_string(), value.clone())], env);
+        let inner: RefCell<Option<Failure>> = RefCell::new(None);
+        let mut on_body = |produced: &Value| match on_value(produced) {
+            Ok(stop) => {
+                if stop {
+                    stopped.set(true);
+                }
+                stop
+            }
+            Err(err) => {
+                *inner.borrow_mut() = Some(err);
+                true
+            }
+        };
+        let on_body = Emit {
+            f: RefCell::new(&mut on_body),
+        };
+        let result = drive(body, input, &child, &on_body);
+        if let Some(err) = inner.into_inner() {
+            *failure.borrow_mut() = Some(err);
+            return true;
+        }
+        match result {
+            Ok(stop) => {
+                if stop {
+                    stopped.set(true);
+                }
+                stop
+            }
+            Err(err) => {
+                *failure.borrow_mut() = Some(err);
+                true
+            }
+        }
+    };
+    let on_expr = Emit {
+        f: RefCell::new(&mut on_expr),
+    };
+    let result = drive(expr, input, env, &on_expr);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    Ok(stopped.get() || result?)
+}
+
+fn drive_stream_bind(
+    expr: &Filter,
+    name: &str,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    visit_stream_bind(expr, name, body, input, env, |value| Ok(emit.call(value)))
 }
 
 fn drive_label(

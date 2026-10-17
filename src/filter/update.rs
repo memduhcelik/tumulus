@@ -1254,6 +1254,14 @@ fn run(
             input_gen,
             ctx,
         ),
+        Filter::StreamBind { expr, name, body } => {
+            run_stream_bind(expr, name, body, input, path, line, input_gen, ctx)
+        }
+        Filter::MatchImpl {
+            regex,
+            flags,
+            testing,
+        } => run_match_value(regex, flags, *testing, input, path, line, ctx),
         other => run_fallback(other, input, path, line, ctx),
     }
 }
@@ -1764,6 +1772,136 @@ fn split_err(mut err: PathErr) -> (Vec<POut>, Failure) {
     )
 }
 
+/// One argument of `match`, `test`, or `capture`. The next value is not read
+/// when the body fails, which is how `path` stops on the match array.
+fn run_stream_bind(
+    expr: &Filter,
+    name: &str,
+    body: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let mut out = Vec::new();
+    let mut path_err: Option<PathErr> = None;
+    let result = stream::for_each_value(expr, input, ctx.env, |value| {
+        let child_env = child_scope(&[(name.to_string(), value.clone())], ctx.env);
+        let child = Ctx {
+            root: ctx.root,
+            next: ctx.next,
+            env: &child_env,
+            pbinds: ctx.pbinds,
+        };
+        match run(body, input, path, line, input_gen, &child) {
+            Ok(more) => {
+                out.extend(more);
+                Ok(false)
+            }
+            Err(err) => {
+                path_err = Some(attach(std::mem::take(&mut out), err));
+                Ok(true)
+            }
+        }
+    });
+    if let Some(err) = path_err {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(path_from(out, failure)),
+    }
+}
+
+/// `match` is a search piped into `.[]`. Iterate the array before the next
+/// pattern runs, so a path error names that array.
+fn run_match_pipe(
+    regex: &Filter,
+    flags: &Filter,
+    testing: bool,
+    right: &Filter,
+    input: &Value,
+    path: &[Step],
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let mut out = Vec::new();
+    let mut path_err: Option<PathErr> = None;
+    let result = stream::visit_match_impl(regex, flags, testing, input, ctx.env, |value| {
+        let cell = Cell::new(0);
+        match run(right, value, path, &cell, 0, ctx) {
+            Ok(more) => {
+                out.extend(more);
+                Ok(false)
+            }
+            Err(err) => {
+                path_err = Some(err);
+                Ok(true)
+            }
+        }
+    });
+    if let Some(err) = path_err {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(path_from(out, failure)),
+    }
+}
+
+/// `test` yields a boolean. That boolean is not a path.
+fn run_match_value(
+    regex: &Filter,
+    flags: &Filter,
+    testing: bool,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let mut out = Vec::new();
+    let mut path_err: Option<PathErr> = None;
+    let result = stream::visit_match_impl(regex, flags, testing, input, ctx.env, |value| {
+        let made = constant(value.clone(), path, line.get(), ctx.root);
+        match path_steps(ctx.root, made) {
+            Ok(steps) => {
+                out.push(POut {
+                    value: value.clone(),
+                    path: steps,
+                    value_gen: line.get(),
+                    line: line.get(),
+                    carrier: true,
+                    force_broken: false,
+                });
+                Ok(false)
+            }
+            Err(broken) => {
+                path_err = Some(bare(format!(
+                    "Invalid path expression with result {}",
+                    clipped(&broken, 29)
+                )));
+                Ok(true)
+            }
+        }
+    });
+    if let Some(err) = path_err {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(path_from(out, failure)),
+    }
+}
+
+fn path_from(partial: Vec<POut>, failure: Failure) -> PathErr {
+    PathErr {
+        partial,
+        message: failure.message,
+        caught: failure.caught,
+        stop: failure.stop,
+    }
+}
+
 fn finish_outs(out: Vec<POut>, err: Option<Failure>) -> Result<Vec<POut>, PathErr> {
     match err {
         Some(failure) => Err(PathErr {
@@ -2174,6 +2312,14 @@ fn run_pipe(
     input_gen: u64,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
+    if let Filter::MatchImpl {
+        regex,
+        flags,
+        testing,
+    } = left
+    {
+        return run_match_pipe(regex, flags, *testing, right, input, path, ctx);
+    }
     let left_cell = Cell::new(line.get());
     let (lefts, left_err) = match run(left, input, path, &left_cell, input_gen, ctx) {
         Ok(outs) => (outs, None),

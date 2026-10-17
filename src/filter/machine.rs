@@ -47,6 +47,8 @@ enum Body {
     Walk(Walk),
     /// `inputs`. One value is read each time this frame is stepped.
     Inputs,
+    MatchRun(MatchRun),
+    StreamRun(StreamRun),
 }
 
 struct Run {
@@ -265,6 +267,35 @@ struct Walk {
     cut_child: bool,
 }
 
+/// One regex/flags pair at a time. The flags filter stays put while every
+/// regex value for that flag is searched.
+struct MatchRun {
+    regex: Rc<Filter>,
+    flags: Rc<Filter>,
+    testing: bool,
+    input: Value,
+    env: Rc<func::EnvLink>,
+    scope: Rc<ScopeNode>,
+    /// 0 start the flags filter, 1 reading flags, 2 reading a regex.
+    phase: u8,
+    flag: Option<Value>,
+    started: bool,
+}
+
+/// One value of `expr`, then `body`. The next value is read only after `body`
+/// finishes and the consumer still wants more.
+struct StreamRun {
+    expr: Rc<Filter>,
+    name: String,
+    body: Rc<Filter>,
+    input: Value,
+    env: Rc<func::EnvLink>,
+    scope: Rc<ScopeNode>,
+    /// 0 start `expr`, 1 reading `expr`, 2 running `body`.
+    phase: u8,
+    started: bool,
+}
+
 enum Act {
     Cont,
     Value(Value),
@@ -311,8 +342,18 @@ fn drive_stack(
             Act::Cont => {}
             Act::Value(value) => {
                 let parent = machine.stack[index].parent;
-                if give(machine, parent, value, emit)? {
-                    return Ok(true);
+                match give(machine, parent, value, emit) {
+                    Up::Go(true) => return Ok(true),
+                    Up::Go(false) => {}
+                    // A frame rejected the value. That frame fails the way a
+                    // child failure does, so `try` inside a function can catch it.
+                    Up::Fail { index, failure } => {
+                        let parent = machine.stack[index as usize].parent;
+                        machine.stack.truncate(index as usize);
+                        if let Some(stopped) = failed(machine, parent, failure, emit)? {
+                            return Ok(stopped);
+                        }
+                    }
                 }
             }
             Act::Done => {
@@ -355,6 +396,8 @@ fn install_top(machine: &Machine, index: usize) {
         Body::Dots(_) | Body::Inputs => None,
         Body::Recur(recur) => Some(&recur.scope),
         Body::Walk(walk) => Some(&walk.scope),
+        Body::MatchRun(run) => Some(&run.scope),
+        Body::StreamRun(run) => Some(&run.scope),
     };
     if let Some(scope) = scope {
         func::install_scope(Rc::clone(scope));
@@ -430,6 +473,8 @@ fn step(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Body::Recur(_) => step_recur(machine, index),
         Body::Walk(_) => step_walk(machine, index),
         Body::Inputs => step_inputs(machine),
+        Body::MatchRun(_) => step_match_run(machine, index),
+        Body::StreamRun(_) => step_stream_run(machine, index),
     }
 }
 
@@ -757,6 +802,37 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             }));
             Ok(Act::Cont)
         }
+        Filter::MatchImpl {
+            regex,
+            flags,
+            testing,
+        } => {
+            machine.stack[index].body = Box::new(Body::MatchRun(MatchRun {
+                regex: Rc::new((**regex).clone()),
+                flags: Rc::new((**flags).clone()),
+                testing: *testing,
+                input,
+                env,
+                scope,
+                phase: 0,
+                flag: None,
+                started: false,
+            }));
+            Ok(Act::Cont)
+        }
+        Filter::StreamBind { expr, name, body } => {
+            machine.stack[index].body = Box::new(Body::StreamRun(StreamRun {
+                expr: Rc::new((**expr).clone()),
+                name: name.clone(),
+                body: Rc::new((**body).clone()),
+                input,
+                env,
+                scope,
+                phase: 0,
+                started: false,
+            }));
+            Ok(Act::Cont)
+        }
         other => fallback(machine, index, other, &input, &env),
     }
 }
@@ -1005,6 +1081,145 @@ fn send_once(machine: &mut Machine, index: usize, value: Value) -> Result<Act, F
     Ok(Act::Value(value))
 }
 
+fn step_match_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let started = match &*machine.stack[index].body {
+        Body::MatchRun(run) => run.started,
+        _ => true,
+    };
+    if started {
+        return Ok(Act::Cont);
+    }
+    let (flags, input, env, scope) = match &*machine.stack[index].body {
+        Body::MatchRun(run) => (
+            Rc::clone(&run.flags),
+            run.input.clone(),
+            Rc::clone(&run.env),
+            Rc::clone(&run.scope),
+        ),
+        _ => unreachable!("match"),
+    };
+    if let Body::MatchRun(run) = &mut *machine.stack[index].body {
+        run.started = true;
+        run.phase = 1;
+    }
+    push_run(machine, index, flags, input, env, scope);
+    Ok(Act::Cont)
+}
+
+fn step_stream_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
+    let started = match &*machine.stack[index].body {
+        Body::StreamRun(run) => run.started,
+        _ => true,
+    };
+    if started {
+        return Ok(Act::Cont);
+    }
+    let (expr, input, env, scope) = match &*machine.stack[index].body {
+        Body::StreamRun(run) => (
+            Rc::clone(&run.expr),
+            run.input.clone(),
+            Rc::clone(&run.env),
+            Rc::clone(&run.scope),
+        ),
+        _ => unreachable!("stream bind"),
+    };
+    if let Body::StreamRun(run) = &mut *machine.stack[index].body {
+        run.started = true;
+        run.phase = 1;
+    }
+    push_run(machine, index, expr, input, env, scope);
+    Ok(Act::Cont)
+}
+
+fn accept_match(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let phase = match &*machine.stack[index].body {
+        Body::MatchRun(run) => run.phase,
+        _ => 0,
+    };
+    if phase == 1 {
+        let (regex, input, env, scope) = match &*machine.stack[index].body {
+            Body::MatchRun(run) => (
+                Rc::clone(&run.regex),
+                run.input.clone(),
+                Rc::clone(&run.env),
+                Rc::clone(&run.scope),
+            ),
+            _ => unreachable!("match"),
+        };
+        if let Body::MatchRun(run) = &mut *machine.stack[index].body {
+            run.flag = Some(value);
+            run.phase = 2;
+        }
+        push_run(machine, index, regex, input, env, scope);
+        return Ok(Taken::Spawn);
+    }
+    let (testing, flag, input) = match &*machine.stack[index].body {
+        Body::MatchRun(run) => (
+            run.testing,
+            run.flag.clone().unwrap_or(Value::Null),
+            run.input.clone(),
+        ),
+        _ => unreachable!("match"),
+    };
+    let produced = super::re::apply_pair(&input, &value, &flag, testing)?;
+    Ok(Taken::Send(produced))
+}
+
+fn accept_stream(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let phase = match &*machine.stack[index].body {
+        Body::StreamRun(run) => run.phase,
+        _ => 0,
+    };
+    if phase != 1 {
+        return Ok(Taken::Send(value));
+    }
+    let (name, body, input, env, scope) = match &*machine.stack[index].body {
+        Body::StreamRun(run) => (
+            run.name.clone(),
+            Rc::clone(&run.body),
+            run.input.clone(),
+            Rc::clone(&run.env),
+            Rc::clone(&run.scope),
+        ),
+        _ => unreachable!("stream bind"),
+    };
+    if let Body::StreamRun(run) = &mut *machine.stack[index].body {
+        run.phase = 2;
+    }
+    let env = func::EnvLink::child(vec![(name, value)], &env);
+    push_run(machine, index, body, input, env, scope);
+    Ok(Taken::Spawn)
+}
+
+fn done_match(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let phase = match &*machine.stack[index].body {
+        Body::MatchRun(run) => run.phase,
+        _ => 1,
+    };
+    if phase == 2 {
+        if let Body::MatchRun(run) = &mut *machine.stack[index].body {
+            run.phase = 1;
+            run.flag = None;
+        }
+        return Ok(DoneAct::Stay);
+    }
+    Ok(DoneAct::Finish)
+}
+
+fn done_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let phase = match &*machine.stack[index].body {
+        Body::StreamRun(run) => run.phase,
+        _ => 1,
+    };
+    if phase == 2 {
+        if let Body::StreamRun(run) = &mut *machine.stack[index].body {
+            run.phase = 1;
+        }
+        return Ok(DoneAct::Stay);
+    }
+    Ok(DoneAct::Finish)
+}
+
 fn push_run(
     machine: &mut Machine,
     parent: usize,
@@ -1028,29 +1243,44 @@ fn push_run(
     });
 }
 
+enum Up {
+    Go(bool),
+    /// `index` is the frame whose accept failed.
+    Fail {
+        index: u32,
+        failure: Failure,
+    },
+}
+
 fn give(
     machine: &mut Machine,
     mut parent: u32,
     mut value: Value,
     emit: &mut dyn FnMut(Value) -> bool,
-) -> Result<bool, Failure> {
+) -> Up {
     loop {
         if parent == ROOT {
-            return Ok(emit(value));
+            return Up::Go(emit(value));
         }
         let index = parent as usize;
-        match accept(machine, index, value)? {
-            Taken::Keep => return Ok(false),
-            Taken::Send(next) => {
+        match accept(machine, index, value) {
+            Ok(Taken::Keep) => return Up::Go(false),
+            Ok(Taken::Send(next)) => {
                 parent = machine.stack[index].parent;
                 value = next;
             }
-            Taken::Spawn => return Ok(false),
-            Taken::Cut(next) => {
+            Ok(Taken::Spawn) => return Up::Go(false),
+            Ok(Taken::Cut(next)) => {
                 let next_parent = machine.stack[index].parent;
                 machine.stack.truncate(index + 1);
                 parent = next_parent;
                 value = next;
+            }
+            Err(failure) => {
+                return Up::Fail {
+                    index: index as u32,
+                    failure,
+                }
             }
         }
     }
@@ -1117,6 +1347,8 @@ fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Fa
         Body::Run(_) | Body::Dots(_) | Body::Recur(_) | Body::Inputs => Ok(Taken::Send(value)),
         Body::Nest(_) => nest_accept(machine, index, value),
         Body::Walk(_) => walk_accept(machine, index, value),
+        Body::MatchRun(_) => accept_match(machine, index, value),
+        Body::StreamRun(_) => accept_stream(machine, index, value),
     }
 }
 
@@ -1213,6 +1445,8 @@ fn on_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
         Body::Nest(_) => nest_child_done(machine, index),
         Body::Run(_) | Body::Dots(_) | Body::Recur(_) | Body::Inputs => Ok(DoneAct::Finish),
         Body::Walk(_) => walk_done(machine, index),
+        Body::MatchRun(_) => done_match(machine, index),
+        Body::StreamRun(_) => done_stream(machine, index),
     }
 }
 
@@ -1403,6 +1637,7 @@ fn halt_kind(machine: &Machine, index: usize) -> Halt {
         Body::If(ifs) if ifs.phase == 0 => Halt::IfCond,
         Body::Call(call) if call.pulling => Halt::CallPull,
         Body::Nest(_) => Halt::Nest,
+        Body::MatchRun(_) | Body::StreamRun(_) => Halt::Drop,
         _ => Halt::Drop,
     }
 }

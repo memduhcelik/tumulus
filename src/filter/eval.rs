@@ -264,6 +264,9 @@ pub(super) fn produce(
         Filter::Unresolved { name, arity, .. } => {
             Err(fail(format!("{name}/{arity} is not defined")))
         }
+        Filter::MatchImpl { .. } | Filter::StreamBind { .. } => {
+            super::stream::collect(filter, input, env)
+        }
     }
 }
 

@@ -371,6 +371,22 @@ pub enum Filter {
         arity: usize,
         args: Vec<Filter>,
     },
+    /// `_match_impl`. One value per regex and flags pair. `testing` yields a
+    /// boolean. Otherwise the value is an array of match objects. The flags
+    /// filter is the outer loop. The next pair is not run once a consumer stops.
+    MatchImpl {
+        regex: Box<Filter>,
+        flags: Box<Filter>,
+        testing: bool,
+    },
+    /// Bind each value of `expr` and run `body`, and do not read the next
+    /// value once `body` stops or fails. `match`, `test`, and `capture`
+    /// with one argument use this so a later argument is not touched.
+    StreamBind {
+        expr: Box<Filter>,
+        name: String,
+        body: Box<Filter>,
+    },
 }
 
 /// A parameter of a user function. `$name` is bound before the body runs.

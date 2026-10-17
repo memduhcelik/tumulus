@@ -198,6 +198,8 @@ pub fn reads_input(filter: &Filter) -> bool {
             Filter::If { cond, yes, no } => walk(cond, seen) || walk(yes, seen) || walk(no, seen),
             Filter::Label { body, .. } => walk(body, seen),
             Filter::Break { .. } => false,
+            Filter::MatchImpl { regex, flags, .. } => walk(regex, seen) || walk(flags, seen),
+            Filter::StreamBind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
             Filter::Bind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
             Filter::Reduce {
                 stream,
@@ -623,6 +625,16 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         }
         Filter::Label { body, .. } => check_vars(body, scope),
         Filter::Break { .. } => Ok(()),
+        Filter::MatchImpl { regex, flags, .. } => {
+            check_vars(regex, scope)?;
+            check_vars(flags, scope)
+        }
+        Filter::StreamBind { expr, name, body } => {
+            check_vars(expr, scope)?;
+            let mut inner = scope.to_vec();
+            inner.push(name.clone());
+            check_vars(body, &inner)
+        }
     }
 }
 
@@ -932,6 +944,14 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
             at, name, arity, ..
         } => errors.push((*at, format!("{name}/{arity} is not defined"))),
         Filter::Label { body, .. } => walk_defs(body, seen, errors),
+        Filter::MatchImpl { regex, flags, .. } => {
+            walk_defs(regex, seen, errors);
+            walk_defs(flags, seen, errors);
+        }
+        Filter::StreamBind { expr, body, .. } => {
+            walk_defs(expr, seen, errors);
+            walk_defs(body, seen, errors);
+        }
         Filter::Break {
             slot: None,
             at,
@@ -1044,6 +1064,7 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "get_search_list" => arity == 0,
         "debug" => arity <= 1,
         "in" | "bsearch" | "format" => arity == 1,
+        "match" | "test" | "capture" => arity == 1 || arity == 2,
         "JOIN" => (2..=4).contains(&arity),
         "any" | "all" => arity <= 2,
         "IN" | "INDEX" => arity == 1 || arity == 2,
@@ -1104,6 +1125,135 @@ fn type_is_not(kind: &str) -> Filter {
         op: Op::Ne,
         left: Box::new(Filter::Type),
         right: Box::new(Filter::Literal(Value::String(kind.to_string()))),
+    }
+}
+
+/// `match`, `test`, and `capture` as jq defines them. One argument binds
+/// `$val` and may pass an array through. Two arguments call the search.
+/// `match` then iterates the array of match objects.
+fn regex_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
+    let mut args = args.into_iter();
+    let regex = args.next().expect("regex");
+    match args.next() {
+        Some(flags) => regex_two(name, regex, flags),
+        None => regex_one(name, regex),
+    }
+}
+
+fn regex_two(name: &str, regex: Box<Filter>, flags: Box<Filter>) -> Filter {
+    let search = Filter::MatchImpl {
+        regex,
+        flags,
+        testing: name == "test",
+    };
+    if name == "test" {
+        return search;
+    }
+    let matched = Filter::Pipe(Box::new(search), Box::new(Filter::Iterate));
+    if name == "match" {
+        return matched;
+    }
+    Filter::Pipe(Box::new(matched), Box::new(capture_reduce()))
+}
+
+fn regex_one(name: &str, arg: Box<Filter>) -> Filter {
+    let val = || Box::new(Filter::Var("val".to_string()));
+    let vt = || Box::new(Filter::Var("vt".to_string()));
+    let string_type = Filter::Literal(Value::String("string".to_string()));
+    let array_type = Filter::Literal(Value::String("array".to_string()));
+    let is_string = Filter::Bin {
+        op: Op::Eq,
+        left: vt(),
+        right: Box::new(string_type),
+    };
+    let is_array = Filter::Bin {
+        op: Op::Eq,
+        left: vt(),
+        right: Box::new(array_type),
+    };
+    let length = Filter::Pipe(val(), Box::new(Filter::Length));
+    let longer = Filter::Bin {
+        op: Op::Gt,
+        left: Box::new(length.clone()),
+        right: Box::new(Filter::Literal(Value::Number("1".to_string()))),
+    };
+    let nonempty = Filter::Bin {
+        op: Op::Gt,
+        left: Box::new(length),
+        right: Box::new(Filter::Literal(Value::Number("0".to_string()))),
+    };
+    let none = || Box::new(Filter::Literal(Value::Null));
+    let at = |index: &str| {
+        Box::new(Filter::At {
+            base: val(),
+            key: Box::new(Filter::Literal(Value::Number(index.to_string()))),
+            optional: false,
+        })
+    };
+    let call = |regex, flags| regex_two(name, regex, flags);
+    let body = Filter::If {
+        cond: Box::new(is_string),
+        yes: Box::new(call(val(), none())),
+        no: Box::new(Filter::If {
+            cond: Box::new(Filter::And(Box::new(is_array.clone()), Box::new(longer))),
+            yes: Box::new(call(at("0"), at("1"))),
+            no: Box::new(Filter::If {
+                cond: Box::new(Filter::And(Box::new(is_array), Box::new(nonempty))),
+                yes: Box::new(call(at("0"), none())),
+                no: Box::new(Filter::Raise(Box::new(Filter::Bin {
+                    op: Op::Add,
+                    left: vt(),
+                    right: Box::new(Filter::Literal(Value::String(
+                        " not a string or array".to_string(),
+                    ))),
+                }))),
+            }),
+        }),
+    };
+    let typed = Filter::Bind {
+        expr: Box::new(Filter::Pipe(val(), Box::new(Filter::Type))),
+        pattern: Pattern::Var("vt".to_string()),
+        alts: Vec::new(),
+        body: Box::new(body),
+    };
+    Filter::StreamBind {
+        expr: arg,
+        name: "val".to_string(),
+        body: Box::new(typed),
+    }
+}
+
+/// Named captures, in the order jq's `capture` reduce walks them.
+fn capture_reduce() -> Filter {
+    let named = Filter::Select(Box::new(Filter::Bin {
+        op: Op::Ne,
+        left: Box::new(Filter::Field("name".to_string())),
+        right: Box::new(Filter::Literal(Value::Null)),
+    }));
+    let pair = Filter::Object(vec![ObjField::Pair {
+        key: Box::new(Filter::Field("name".to_string())),
+        value: Box::new(Filter::Field("string".to_string())),
+    }]);
+    let stream = Filter::Pipe(
+        Box::new(Filter::Pipe(
+            Box::new(Filter::Pipe(
+                Box::new(Filter::Field("captures".to_string())),
+                Box::new(Filter::Iterate),
+            )),
+            Box::new(named),
+        )),
+        Box::new(pair),
+    );
+    Filter::Reduce {
+        stream: Box::new(stream),
+        pattern: Pattern::Var("pair".to_string()),
+        alts: Vec::new(),
+        init: Box::new(Filter::Literal(Value::object(Vec::new()))),
+        update: Box::new(Filter::Bin {
+            op: Op::Add,
+            left: Box::new(Filter::Identity),
+            right: Box::new(Filter::Var("pair".to_string())),
+        }),
     }
 }
 
@@ -1298,6 +1448,7 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "fromdateiso8601" => compile_stream(FROM_ISO),
         "todateiso8601" => compile_stream(TO_ISO),
         "JOIN" => with_call_args(join_source(args.len()), unbox_keep(args)),
+        "match" | "test" | "capture" => regex_builtin(name, args.collect()),
         "halt_error" => match args.next() {
             None => compile_stream(HALT_ERROR),
             Some(code) => Filter::HaltError(code),
@@ -3610,9 +3761,20 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Define { .. }
         | Filter::Call { .. }
         | Filter::Param(_)
-        | Filter::Unresolved { .. } => true,
+        | Filter::Unresolved { .. }
+        | Filter::MatchImpl { .. }
+        | Filter::StreamBind { .. } => true,
         Filter::Optional(inner) => forbids_call(inner),
-        Filter::Pipe(_, right) => call_blocked(right),
+        Filter::Pipe(left, right) => regex_shape(left) || call_blocked(right),
+        _ => false,
+    }
+}
+
+/// `match`, `test`, and `capture` do not return a function.
+fn regex_shape(filter: &Filter) -> bool {
+    match filter {
+        Filter::MatchImpl { .. } | Filter::StreamBind { .. } => true,
+        Filter::Pipe(left, _) => regex_shape(left),
         _ => false,
     }
 }

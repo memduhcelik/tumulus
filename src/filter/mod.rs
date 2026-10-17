@@ -8,6 +8,7 @@ mod machine;
 mod modules;
 mod names;
 mod parse;
+mod re;
 mod sort;
 mod stream;
 mod update;

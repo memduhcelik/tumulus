@@ -11,3 +11,11 @@ repository = "https://github.com/memduhcelik/tumulus"
 [profile.test]
 opt-level = 3
 debug = 0
+
+# jq's patterns are Oniguruma's Perl NG syntax. 6.9.5 still searches for the
+# longest alternative; later releases return the first one. `generate` would
+# run bindgen, so the published bindings are used instead. `onig_sys` is pinned
+# so a later update does not replace that library.
+[dependencies]
+onig = { version = "=6.1.0", default-features = false }
+onig_sys = { version = "=69.5.1", default-features = false }
