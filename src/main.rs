@@ -1,13 +1,15 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
     parse_stream, program_stream, program_stream_with, reads_input, render, set_dump_flags,
-    set_environ, set_input_line, set_library_paths, set_prog_origin, set_unknown, Error, Failure,
-    Filter, Indent, Layout, MainNext, ProgramError, Source, Style, Value,
+    set_environ, set_import_origin, set_input_line, set_library_paths, set_prog_origin,
+    set_unknown, Error, Failure, Filter, Indent, Layout, MainNext, ProgramError, Source, Style,
+    Value,
 };
 
 fn main() {
@@ -44,6 +46,30 @@ fn reset_sigpipe() {
     }
 }
 
+/// Directory of a `-f` file, as given. A relative path is joined to the working
+/// directory and is not canonicalized, so `..` in `search` follows a symlink.
+/// A command-line program has no file directory.
+fn import_base(program: &Program) -> Option<PathBuf> {
+    let Program::File(path) = program else {
+        return None;
+    };
+    let path = Path::new(path);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            if parent.is_absolute() {
+                Some(parent.to_path_buf())
+            } else {
+                Some(
+                    env::current_dir()
+                        .map(|cwd| cwd.join(parent))
+                        .unwrap_or_else(|_| parent.to_path_buf()),
+                )
+            }
+        }
+        _ => env::current_dir().ok(),
+    }
+}
+
 /// Directory of a `-f` program, or the current directory when the program is an argument.
 fn program_origin(program: &Program) -> String {
     let fallback = || {
@@ -77,6 +103,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     };
     let scope = defined_names(&options.named);
     set_library_paths(options.libraries.clone());
+    set_import_origin(import_base(&options.program));
     let program = match compile_with(&source, &scope) {
         Ok(program) => program,
         Err(ProgramError::Syntax) => {

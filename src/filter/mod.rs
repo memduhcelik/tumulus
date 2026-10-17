@@ -15,6 +15,7 @@ mod value;
 
 pub use ast::*;
 pub use eval::{eval, eval_stream, eval_with};
+pub use modules::set_import_origin;
 pub use parse::{compile, compile_with, reads_input};
 
 use eval::*;

@@ -17,7 +17,8 @@ pub use feed::{
     streaming, MainNext, Source, SourceGuard,
 };
 pub use filter::{
-    compile, compile_with, eval, eval_stream, eval_with, reads_input, Failure, Filter, ProgramError,
+    compile, compile_with, eval, eval_stream, eval_with, reads_input, set_import_origin, Failure,
+    Filter, ProgramError,
 };
 pub use parse::{
     parse_stream, program_stream, program_stream_with, write_input, LocatedValue, ParsedStream,

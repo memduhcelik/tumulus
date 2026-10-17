@@ -10049,7 +10049,7 @@ fn compare_module(name: &str, cwd: &Path, home: &Path, args: &[&str], input: &[u
             .wait_with_output()
             .unwrap_or_else(|err| panic!("{name}: wait {program}: {err}"))
     };
-    let drop_home = name == "no home";
+    let drop_home = name == "no home" || name == "no home search";
     let got = go(bin, drop_home);
     let expected = go("jq", drop_home);
     assert_eq!(
@@ -10071,5 +10071,360 @@ fn compare_module(name: &str, cwd: &Path, home: &Path, args: &[&str], input: &[u
         expected.status.code(),
         "{name}: status\n{}",
         String::from_utf8_lossy(&got.stderr)
+    );
+}
+
+#[test]
+fn search_key_matches_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("searchkey");
+    let home = dir.join("home");
+    let root = dir.join("root");
+    let sdir = root.join("sdir");
+    let sother = root.join("sother");
+    let prog = root.join("prog");
+    let away = root.join("away");
+    let decoy = root.join("decoy");
+    let decoy_nest = decoy.join("nested");
+    let real = root.join("real");
+    let real_sub = real.join("sub");
+    for path in [
+        home.join(".jq"),
+        sdir.join("pkg"),
+        sdir.join("foo"),
+        sother.clone(),
+        prog.join("nest"),
+        prog.join("elsewhere"),
+        away.clone(),
+        decoy_nest.clone(),
+        decoy.join("nest"),
+        decoy.join("sother"),
+        decoy.join("elsewhere"),
+        real_sub.clone(),
+    ] {
+        fs::create_dir_all(&path).unwrap();
+    }
+    fs::write(home.join(".jq").join("foo.jq"), "def h: \"fromhome\";\n").unwrap();
+    fs::write(home.join(".jq").join("homeonly.jq"), "def h: \"home\";\n").unwrap();
+    fs::write(root.join("foo.jq"), "def f: \"root\";\n").unwrap();
+    fs::write(sdir.join("foo.jq"), "def f: \"sdir\";\n").unwrap();
+    fs::write(sdir.join("foo").join("foo.jq"), "def f: \"dirform\";\n").unwrap();
+    fs::write(sdir.join("num.json"), "1\n").unwrap();
+    fs::write(sdir.join("pkg").join("pkg.jq"), "def p: \"pkg\";\n").unwrap();
+    fs::write(sdir.join("onlycwd.jq"), "def z: 1;\n").unwrap();
+    fs::write(
+        sdir.join("uses.jq"),
+        "import \"side\" as s {search: \"../sother\"}; def k: s::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("lookdot.jq"),
+        "import \"foo\" as foo {search: \".\"}; def k: foo::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("looksl.jq"),
+        "import \"foo\" as foo {search: \"./\"}; def k: foo::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("mid.jq"),
+        "import \"foo\" as foo {search: \".\", extra: 1}; def k: foo::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("incm.jq"),
+        "include \"foo\" {search: \"./\", extra: 1}; def k: f;\n",
+    )
+    .unwrap();
+    fs::write(
+        sdir.join("arr.jq"),
+        "import \"foo\" as foo {search: [\"../sdir\", \"../sother\"]}; def k: foo::f;\n",
+    )
+    .unwrap();
+    fs::write(sother.join("foo.jq"), "def f: \"sother\";\n").unwrap();
+    fs::write(sother.join("side.jq"), "def f: \"side\";\n").unwrap();
+    fs::write(sother.join("num.json"), "9\n").unwrap();
+    fs::write(
+        decoy.join("sother").join("side.jq"),
+        "def f: \"decoyside\";\n",
+    )
+    .unwrap();
+    fs::write(decoy.join("nest").join("foo.jq"), "def f: \"decoynest\";\n").unwrap();
+    fs::write(
+        decoy.join("elsewhere").join("foo.jq"),
+        "def f: \"elsewhere\";\n",
+    )
+    .unwrap();
+    fs::write(prog.join("foo.jq"), "def f: \"prog\";\n").unwrap();
+    fs::write(prog.join("num.json"), "9\n").unwrap();
+    fs::write(prog.join("nest").join("foo.jq"), "def f: \"nest\";\n").unwrap();
+    fs::write(away.join("foo.jq"), "def f: \"away\";\n").unwrap();
+    fs::write(
+        prog.join("main.jq"),
+        "import \"foo\" as foo {search: \"../sdir\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("dot.jq"),
+        "import \"foo\" as foo {search: \".\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("sl.jq"),
+        "import \"foo\" as foo {search: \"./\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("em.jq"),
+        "import \"foo\" as foo {search: \"\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("nestp.jq"),
+        "import \"foo\" as foo {search: \"nest\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(prog.join("inc.jq"), "include \"foo\" {search: \"./\"}; f\n").unwrap();
+    fs::write(
+        prog.join("data.jq"),
+        "import \"num\" as $n {search: \"./\"}; $n\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("dataup.jq"),
+        "import \"num\" as $n {search: \"../sdir\"}; $n\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("arr.jq"),
+        "import \"foo\" as foo {search: [\".\", \"nest\"]}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("arr2.jq"),
+        "import \"foo\" as foo {search: [\"elsewhere\", \"nest\"]}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(
+        prog.join("elsep.jq"),
+        "import \"foo\" as foo {search: \"elsewhere\"}; foo::f\n",
+    )
+    .unwrap();
+    fs::write(real.join("foo.jq"), "def f: \"real\";\n").unwrap();
+    fs::write(real_sub.join("foo.jq"), "def f: \"sub\";\n").unwrap();
+    fs::write(
+        real_sub.join("up.jq"),
+        "import \"foo\" as foo {search: \"..\"}; foo::f\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("real/sub", root.join("linksub")).unwrap();
+    std::os::unix::fs::symlink("real/sub/up.jq", root.join("up-link.jq")).unwrap();
+
+    let cli = [
+        ("sdir", r#"import "foo" as foo {search: "sdir"}; foo::f"#),
+        (
+            "sother",
+            r#"import "foo" as foo {search: "sother"}; foo::f"#,
+        ),
+        ("dot", r#"import "foo" as foo {search: "."}; foo::f"#),
+        ("slash", r#"import "foo" as foo {search: "./"}; foo::f"#),
+        ("empty", r#"import "foo" as foo {search: ""}; foo::f"#),
+        ("dotdot", r#"import "foo" as foo {search: "./."}; foo::f"#),
+        ("include", r#"include "foo" {search: "sdir"}; f"#),
+        ("data", r#"import "num" as $n {search: "sdir"}; $n"#),
+        (
+            "missing",
+            r#"import "foo" as foo {search: "missing"}; foo::f"#,
+        ),
+        ("number", r#"import "foo" as foo {search: 1}; foo::f"#),
+        ("null", r#"import "foo" as foo {search: null}; foo::f"#),
+        ("empty arr", r#"import "foo" as foo {search: []}; foo::f"#),
+        ("false", r#"import "foo" as foo {search: false}; foo::f"#),
+        (
+            "object",
+            r#"import "foo" as foo {search: {"a": 1}}; foo::f"#,
+        ),
+        (
+            "arr skip",
+            r#"import "foo" as foo {search: [1, null, false, "sdir"]}; foo::f"#,
+        ),
+        (
+            "arr first",
+            r#"import "foo" as foo {search: ["sother", "sdir"]}; foo::f"#,
+        ),
+        (
+            "arr second",
+            r#"import "foo" as foo {search: ["missing", "sdir"]}; foo::f"#,
+        ),
+        (
+            "up same",
+            r#"import "foo" as foo {search: "sdir/../sdir"}; foo::f"#,
+        ),
+        ("tilde", r#"import "homeonly" as h {search: "~/.jq"}; h::h"#),
+        (
+            "dollar",
+            r#"import "foo" as foo {search: "$ORIGIN"}; foo::f"#,
+        ),
+        ("pkg", r#"import "pkg" as p {search: "sdir"}; p::p"#),
+        ("escape", r#"import "a/../b" as b {search: "sdir"}; 1"#),
+        ("no key", r#"import "foo" as foo; foo::f"#),
+    ];
+    for (name, program) in cli {
+        compare_module(name, &root, &home, &["-n", program], b"");
+    }
+    let sdir_s = sdir.to_str().unwrap().to_string();
+    let sother_s = sother.to_str().unwrap().to_string();
+    compare_module(
+        "search beats -L",
+        &root,
+        &home,
+        &[
+            "-n",
+            "-L",
+            &sother_s,
+            r#"import "foo" as foo {search: "sdir"}; foo::f"#,
+        ],
+        b"",
+    );
+    compare_module(
+        "cwd beats -L",
+        &root,
+        &home,
+        &["-n", "-L", &sdir_s, r#"import "foo" as foo; foo::f"#],
+        b"",
+    );
+    let absolute = format!(
+        "import \"foo\" as foo {{search: \"{}\"}}; foo::f",
+        sdir.display()
+    );
+    compare_module("absolute", &away, &home, &["-n", &absolute], b"");
+    compare_module(
+        "cli up from prog",
+        &prog,
+        &home,
+        &["-n", r#"import "foo" as foo {search: "../sdir"}; foo::f"#],
+        b"",
+    );
+    compare_module(
+        "cli up from root",
+        &root,
+        &home,
+        &["-n", r#"import "foo" as foo {search: "../sdir"}; foo::f"#],
+        b"",
+    );
+    compare_module(
+        "nested side",
+        &decoy_nest,
+        &home,
+        &["-n", r#"import "uses" as u {search: "../../sdir"}; u::k"#],
+        b"",
+    );
+    compare_module(
+        "nested dot",
+        &away,
+        &home,
+        &["-n", r#"import "lookdot" as m {search: "../sdir"}; m::k"#],
+        b"",
+    );
+    compare_module(
+        "nested slash",
+        &away,
+        &home,
+        &["-n", r#"import "looksl" as m {search: "../sdir"}; m::k"#],
+        b"",
+    );
+
+    let files = [
+        "main.jq",
+        "dot.jq",
+        "sl.jq",
+        "em.jq",
+        "nestp.jq",
+        "inc.jq",
+        "data.jq",
+        "dataup.jq",
+        "arr.jq",
+        "arr2.jq",
+        "elsep.jq",
+    ];
+    for cwd in [&root, &prog, &away, &decoy] {
+        for file in files {
+            let path = prog.join(file);
+            let text = path.to_str().unwrap().to_string();
+            let label = format!("f {file} {}", cwd.file_name().unwrap().to_string_lossy());
+            compare_module(&label, cwd, &home, &["-n", "-f", &text], b"");
+        }
+    }
+    compare_module(
+        "f rel slash",
+        &root,
+        &home,
+        &["-n", "-f", "prog/sl.jq"],
+        b"",
+    );
+    compare_module(
+        "f rel dot",
+        &away,
+        &home,
+        &["-n", "-f", "../prog/dot.jq"],
+        b"",
+    );
+
+    compare_module(
+        "meta mid",
+        &away,
+        &home,
+        &["-nc", "-L", &sdir_s, r#""mid"|modulemeta"#],
+        b"",
+    );
+    compare_module(
+        "meta inc",
+        &away,
+        &home,
+        &["-nc", "-L", &sdir_s, r#""incm"|modulemeta"#],
+        b"",
+    );
+    compare_module(
+        "meta arr",
+        &away,
+        &home,
+        &["-nc", "-L", &sdir_s, r#""arr"|modulemeta"#],
+        b"",
+    );
+    compare_module(
+        "meta cwd skipped",
+        &sdir,
+        &home,
+        &["-nc", r#""onlycwd"|modulemeta"#],
+        b"",
+    );
+    compare_module(
+        "meta home not cwd",
+        &sdir,
+        &home,
+        &["-nc", r#""foo"|modulemeta"#],
+        b"",
+    );
+    compare_module(
+        "import still sees cwd",
+        &sdir,
+        &home,
+        &["-n", r#"import "onlycwd" as o; o::z"#],
+        b"",
+    );
+
+    let link = root.join("linksub").join("up.jq");
+    let link_s = link.to_str().unwrap().to_string();
+    compare_module("sym dir", &root, &home, &["-n", "-f", &link_s], b"");
+    let up = root.join("up-link.jq");
+    let up_s = up.to_str().unwrap().to_string();
+    compare_module("sym file", &root, &home, &["-n", "-f", &up_s], b"");
+    compare_module(
+        "no home search",
+        &away,
+        &home,
+        &["-n", r#"import "foo" as foo {search: "~/.jq"}; foo::f"#],
+        b"",
     );
 }

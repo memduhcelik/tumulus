@@ -913,6 +913,18 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
     }
 }
 
+/// `None` when the metadata has no `search` key. `Some` replaces the path,
+/// including a null or a number, which then finds nothing.
+fn search_override(meta: Option<&Value>) -> Option<Value> {
+    let Some(Value::Object(items)) = meta else {
+        return None;
+    };
+    items
+        .iter()
+        .find(|(key, _)| key == "search")
+        .map(|(_, value)| value.clone())
+}
+
 fn dep_record(meta: Option<Value>, alias: Option<&str>, data: bool, rel: &str) -> Value {
     let mut pairs = match &meta {
         Some(Value::Object(items)) => items.iter().cloned().collect(),
@@ -1435,6 +1447,8 @@ struct PendingImport {
     /// `None` is `include`.
     alias: Option<String>,
     data: bool,
+    /// `None` keeps the working directory and the library path.
+    search: Option<Value>,
 }
 
 enum Ready {
@@ -1587,6 +1601,7 @@ impl<'a> Parser<'a> {
         if !self.eat(';') {
             return Err(ProgramError::Syntax);
         }
+        let search = search_override(meta.as_ref());
         self.deps
             .push(dep_record(meta.clone(), Some(&alias), data, &path));
         if !self.link && data {
@@ -1596,6 +1611,7 @@ impl<'a> Parser<'a> {
             path,
             alias: Some(alias),
             data,
+            search,
         });
         Ok(())
     }
@@ -1610,11 +1626,13 @@ impl<'a> Parser<'a> {
         if !self.eat(';') {
             return Err(ProgramError::Syntax);
         }
+        let search = search_override(meta.as_ref());
         self.deps.push(dep_record(meta, None, false, &path));
         self.pending.push(PendingImport {
             path,
             alias: None,
             data: false,
+            search,
         });
         Ok(())
     }
@@ -1630,9 +1648,9 @@ impl<'a> Parser<'a> {
         let mut ready = Vec::new();
         for item in &pending {
             let loaded = if item.data {
-                super::modules::load_data(&item.path).map(Ready::Data)
+                super::modules::load_data(&item.path, item.search.as_ref()).map(Ready::Data)
             } else {
-                super::modules::load_code(&item.path).map(Ready::Code)
+                super::modules::load_code(&item.path, item.search.as_ref()).map(Ready::Code)
             };
             match loaded {
                 Ok(value) => ready.push(value),
