@@ -1387,6 +1387,7 @@ fn note(failure: &mut Failure) -> Failure {
         partial: Vec::new(),
         message: std::mem::take(&mut failure.message),
         caught: failure.caught.take(),
+        stop: failure.stop.take(),
     }
 }
 
@@ -2022,6 +2023,7 @@ fn index_pairs(
                             partial,
                             message,
                             caught,
+                            stop: failure.stop.clone(),
                         });
                     }
                 }
@@ -2031,6 +2033,7 @@ fn index_pairs(
             partial,
             message,
             caught,
+            stop: failure.stop,
         });
     }
     let mut out = Vec::new();
@@ -2040,7 +2043,7 @@ fn index_pairs(
                 Ok(got) => out.extend(got),
                 Err(mut failure) => {
                     out.extend(std::mem::take(&mut failure.partial));
-                    if !optional {
+                    if failure.stop.is_some() || !optional {
                         return Err(eval::with_partial(out, failure));
                     }
                 }
@@ -2091,6 +2094,9 @@ fn finish_try_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
     let Some(failure) = err else {
         return queue_out(machine, index, partial, None);
     };
+    if failure.stop.is_some() {
+        return Ok(DoneAct::Fail(eval::with_partial(partial, failure)));
+    }
     let handler = match &*machine.stack[index].body {
         Body::Nest(Nest {
             kind: Kind::Try { handler, .. },

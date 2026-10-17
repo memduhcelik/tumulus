@@ -71,6 +71,7 @@ pub(super) fn produce(
         Filter::Recurse => Ok(recurse(input)),
         Filter::Optional(inner) => match eval_in(inner, input, env) {
             Ok(values) => Ok(values),
+            Err(failure) if failure.stop.is_some() => Err(failure),
             Err(failure) => Ok(failure.partial),
         },
         Filter::Pipe(left, right) => super::stream::pipe_values(left, right, input, env),
@@ -211,6 +212,9 @@ pub(super) fn produce(
             Ok(from_f64(math::fma(x, y, z)))
         }),
         Filter::Abs => eval_abs(input),
+        Filter::NumTest(kind) => super::builtin::eval_num_test(*kind, input),
+        Filter::Halt => Err(super::builtin::stop_quiet()),
+        Filter::HaltError(code) => super::builtin::eval_halt_error(code, input, env),
         Filter::Pow10 => Err(raise(Value::String(
             "Error: pow10/0 not found at build time".to_string(),
         ))),
@@ -528,6 +532,7 @@ pub(super) fn fail(message: String) -> Failure {
         partial: Vec::new(),
         message,
         caught: None,
+        stop: None,
     }
 }
 
@@ -536,6 +541,7 @@ pub(super) fn fresh(partial: Vec<Value>, message: String) -> Failure {
         partial,
         message,
         caught: None,
+        stop: None,
     }
 }
 
@@ -1090,6 +1096,7 @@ pub(super) fn expand_pieces(
                                 partial: partial.into_iter().map(Value::String).collect(),
                                 message,
                                 caught,
+                                stop: failure.stop.clone(),
                             });
                         }
                     }
@@ -1098,6 +1105,7 @@ pub(super) fn expand_pieces(
                     partial: partial.into_iter().map(Value::String).collect(),
                     message,
                     caught,
+                    stop: failure.stop,
                 })
             }
         },
@@ -1250,6 +1258,7 @@ pub(super) fn eval_at(
                                 partial,
                                 message,
                                 caught,
+                                stop: failure.stop.clone(),
                             });
                         }
                     }
@@ -1259,6 +1268,7 @@ pub(super) fn eval_at(
                 partial,
                 message,
                 caught,
+                stop: failure.stop,
             });
         }
     };
@@ -1269,7 +1279,7 @@ pub(super) fn eval_at(
                 Ok(got) => out.extend(got),
                 Err(mut failure) => {
                     out.extend(std::mem::take(&mut failure.partial));
-                    if !optional {
+                    if failure.stop.is_some() || !optional {
                         return Err(with_partial(out, failure));
                     }
                 }

@@ -22,6 +22,101 @@ pub(super) fn raise(value: Value) -> Failure {
         partial: Vec::new(),
         message,
         caught: Some(value),
+        stop: None,
+    }
+}
+
+pub(super) fn eval_num_test(kind: NumTest, input: &Value) -> Result<Vec<Value>, Failure> {
+    let flag = match input {
+        Value::Number(text) => {
+            let n = number::f64_of(text);
+            match kind {
+                NumTest::Nan => n.is_nan(),
+                NumTest::Infinite => n.is_infinite(),
+                NumTest::Normal => n.is_normal(),
+            }
+        }
+        _ => false,
+    };
+    Ok(vec![Value::Bool(flag)])
+}
+
+/// `halt`. The input is not printed.
+pub(super) fn stop_quiet() -> Failure {
+    Failure {
+        partial: Vec::new(),
+        message: String::new(),
+        caught: None,
+        stop: Some(Stop {
+            code: 0,
+            stderr: Vec::new(),
+        }),
+    }
+}
+
+/// A C cast to `int`, then the low 8 bits. A negative result is status 0.
+/// Out-of-range values follow the host, the same way jq's cast does.
+fn halt_code(n: f64) -> i32 {
+    let code = number::c_cast_i32(n);
+    if code < 0 {
+        0
+    } else {
+        code & 255
+    }
+}
+
+/// Strings are written raw. `null` writes nothing. Anything else is compact JSON and a newline.
+fn halt_bytes(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::String(text) => text.as_bytes().to_vec(),
+        other => {
+            let style = crate::print::Style {
+                layout: crate::print::Layout::Compact,
+                raw: false,
+                join: false,
+                ascii: false,
+                sort_keys: false,
+            };
+            let mut bytes = crate::print::render(other, style).into_bytes();
+            bytes.push(b'\n');
+            bytes
+        }
+    }
+}
+
+fn stop_with(code: i32, value: &Value) -> Failure {
+    Failure {
+        partial: Vec::new(),
+        message: String::new(),
+        caught: None,
+        stop: Some(Stop {
+            code,
+            stderr: halt_bytes(value),
+        }),
+    }
+}
+
+/// `halt_error(code)`. The first number stops the program. The stderr text is the input.
+pub(super) fn eval_halt_error(
+    code: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (values, err) = parts(eval_in(code, input, env));
+    if let Some(value) = values.into_iter().next() {
+        let Value::Number(text) = &value else {
+            return Err(fail(format!(
+                "{} ({}) halt_error/1: number required",
+                input.type_name(),
+                shown(input)
+            )));
+        };
+        return Err(stop_with(halt_code(number::f64_of(text)), input));
+    }
+    match err {
+        Some(failure) => Err(failure),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -52,6 +147,9 @@ pub(super) fn eval_try(
         Ok(values) => return Ok(values),
         Err(failure) => failure,
     };
+    if failure.stop.is_some() {
+        return Err(failure);
+    }
     let Some(handler) = handler else {
         return Ok(failure.partial);
     };

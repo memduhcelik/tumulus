@@ -9114,3 +9114,261 @@ fn saw_stream_output_before_close(program: &str, payload: &[u8]) -> bool {
     let _ = reader.join();
     printed
 }
+
+/// `pick`, `transpose`, both `combinations`, `isnan`, `isinfinite`,
+/// `isnormal`, `halt`, and both `halt_error` forms.
+#[test]
+fn eight_match_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("isnan zero", &["-c", "isnan"], b"0\n"),
+        ("isnan one", &["-c", "isnan"], b"1\n"),
+        ("isnan nan", &["-c", "isnan"], b"nan\n"),
+        ("isnan null", &["-c", "isnan"], b"null\n"),
+        ("isnan text", &["-c", "isnan"], b"\"x\"\n"),
+        ("isnan array", &["-c", "isnan"], b"[1]\n"),
+        ("isnan object", &["-c", "isnan"], b"{}\n"),
+        ("isnan bool", &["-c", "isnan"], b"true\n"),
+        ("isnan neg zero", &["-nc", "(-0)|isnan"], b""),
+        ("isnan inf", &["-nc", "infinite|isnan"], b""),
+        ("isinfinite inf", &["-nc", "infinite|isinfinite"], b""),
+        ("isinfinite ninf", &["-nc", "(-infinite)|isinfinite"], b""),
+        ("isinfinite nan", &["-nc", "nan|isinfinite"], b""),
+        ("isinfinite one", &["-nc", "1|isinfinite"], b""),
+        ("isinfinite null", &["-nc", "null|isinfinite"], b""),
+        ("isnormal one", &["-nc", "1|isnormal"], b""),
+        ("isnormal zero", &["-nc", "0|isnormal"], b""),
+        ("isnormal neg zero", &["-nc", "(-0)|isnormal"], b""),
+        ("isnormal nan", &["-nc", "nan|isnormal"], b""),
+        ("isnormal inf", &["-nc", "infinite|isnormal"], b""),
+        ("isnormal sub", &["-nc", "1e-320|isnormal"], b""),
+        (
+            "isnormal min",
+            &["-nc", "2.2250738585072014e-308|isnormal"],
+            b"",
+        ),
+        ("isnormal plain", &["-nc", "1e-307|isnormal"], b""),
+        ("isnan fromjson", &["-c", "fromjson|isnan"], b"\"nan\"\n"),
+        (
+            "isnan fromjson digits",
+            &["-c", "fromjson|isnan"],
+            b"\"nan1234\"\n",
+        ),
+        ("isnan mod", &["-nc", "[nan % 1, 1 % nan | isnan]"], b""),
+        ("isnan empty", &["-nc", "empty|isnan"], b""),
+        ("isnan arity", &["-nc", "isnan(1)"], b""),
+        ("halt plain", &["-nc", "1, halt, 2"], b""),
+        ("halt only", &["-nc", "halt"], b""),
+        ("halt pipe", &["-nc", "1 | halt, 2"], b""),
+        ("halt array", &["-nc", "[1, halt, 2]"], b""),
+        ("halt object", &["-nc", "{a: halt}"], b""),
+        ("halt try", &["-nc", "try (1, halt) catch \"c\""], b""),
+        ("halt optional", &["-nc", "halt?"], b""),
+        ("halt empty", &["-nc", "empty|halt"], b""),
+        ("halt exit", &["-ne", "halt"], b""),
+        ("halt false exit", &["-ne", "false, halt"], b""),
+        ("halt null exit", &["-ne", "null, halt"], b""),
+        ("halt shadow", &["-nc", "def halt: 9; halt"], b""),
+        ("halt arity", &["-nc", "halt(1)"], b""),
+        ("halt input", &["-c", "halt"], b"7\n"),
+        ("herr string", &["-nc", "\"boom\"|halt_error"], b""),
+        ("herr number", &["-nc", "1|halt_error"], b""),
+        ("herr null", &["-nc", "null|halt_error"], b""),
+        ("herr false", &["-nc", "false|halt_error"], b""),
+        ("herr object", &["-nc", "{a:1}|halt_error"], b""),
+        ("herr array", &["-nc", "[1,2]|halt_error"], b""),
+        ("herr empty string", &["-nc", "\"\"|halt_error"], b""),
+        ("herr newline", &["-nc", "\"hello\\n\"|halt_error"], b""),
+        ("herr plain string", &["-nc", "\"hello\"|halt_error"], b""),
+        ("herr code", &["-nc", "\"boom\"|halt_error(3)"], b""),
+        ("herr code zero", &["-ne", "\"z\"|halt_error(0)"], b""),
+        ("herr trunc", &["-nc", "\"z\"|halt_error(1.9)"], b""),
+        ("herr neg", &["-nc", "\"z\"|halt_error(-1)"], b""),
+        ("herr wide", &["-nc", "\"z\"|halt_error(300)"], b""),
+        ("herr byte", &["-nc", "\"z\"|halt_error(256)"], b""),
+        ("herr nan code", &["-nc", "\"z\"|halt_error(nan)"], b""),
+        ("herr inf code", &["-nc", "\"z\"|halt_error(infinite)"], b""),
+        (
+            "herr ninf code",
+            &["-nc", "\"z\"|halt_error(-infinite)"],
+            b"",
+        ),
+        ("herr big", &["-nc", "\"z\"|halt_error(1e20)"], b""),
+        (
+            "herr int max",
+            &["-nc", "\"z\"|halt_error(2147483648)"],
+            b"",
+        ),
+        ("herr bad code", &["-nc", "\"z\"|halt_error(\"x\")"], b""),
+        ("herr bad input", &["-nc", "1|halt_error(\"x\")"], b""),
+        ("herr null code", &["-nc", "\"z\"|halt_error(null, 1)"], b""),
+        (
+            "herr caught",
+            &["-nc", "try (\"z\"|halt_error(\"x\")) catch ."],
+            b"",
+        ),
+        (
+            "herr try",
+            &["-nc", "try (1, \"e\"|halt_error) catch \"c\""],
+            b"",
+        ),
+        ("herr optional", &["-nc", "(\"z\"|halt_error)?"], b""),
+        ("herr length", &["-nc", "\"ab\"|halt_error(length)"], b""),
+        ("herr before", &["-nc", "1, (\"e\"|halt_error), 2"], b""),
+        ("herr empty in", &["-nc", "empty|halt_error"], b""),
+        ("herr empty code", &["-nc", "\"z\"|halt_error(empty)"], b""),
+        (
+            "herr stream",
+            &["-nc", "\"z\"|halt_error(1, error(\"no\"))"],
+            b"",
+        ),
+        ("herr nan value", &["-nc", "nan|halt_error"], b""),
+        ("herr inf value", &["-nc", "infinite|halt_error"], b""),
+        ("herr neg zero", &["-nc", "(-0)|halt_error"], b""),
+        ("herr pretty", &["{b:1,a:2}|halt_error"], b"null\n"),
+        ("herr raw", &["-r", "halt_error"], b"\"hi\"\n"),
+        ("herr join", &["-j", "halt_error"], b"{\"a\":1}\n"),
+        ("herr sort", &["-S", "halt_error"], b"{\"b\":1,\"a\":2}\n"),
+        ("herr nul", &["-nc", "\"a\\u0000b\"|halt_error"], b""),
+        (
+            "herr shadow",
+            &["-nc", "def halt_error: 9; halt_error"],
+            b"",
+        ),
+        (
+            "herr shadow code",
+            &["-nc", "def halt_error: 9; \"z\"|halt_error(3)"],
+            b"",
+        ),
+        ("herr arity", &["-nc", "halt_error(1;2)"], b""),
+        ("herr two lines", &["-c", "halt_error"], b"1\n2\n"),
+        ("pick nest", &["-c", "pick(.a.b.c)"], b"null\n"),
+        ("pick first", &["-c", "pick(first)"], b"[1,2]\n"),
+        (
+            "pick first twice",
+            &["-c", "pick(first|first)"],
+            b"[[10,20],30]\n",
+        ),
+        ("pick last", &["-c", "try pick(last) catch ."], b"[1,2]\n"),
+        (
+            "pick keys",
+            &["-c", "pick(.a, .b)"],
+            b"{\"a\":1,\"b\":2,\"c\":3}\n",
+        ),
+        ("pick missing", &["-c", "pick(.no)"], b"{\"a\":1}\n"),
+        ("pick empty", &["-c", "pick(empty)"], b"{\"a\":1}\n"),
+        ("pick ident", &["-c", "pick(.)"], b"{\"a\":1}\n"),
+        ("pick index", &["-c", "pick(.[1])"], b"[0,1,2]\n"),
+        ("pick indexes", &["-c", "pick(.[2], .[0])"], b"[0,1,2,3]\n"),
+        (
+            "pick deep",
+            &["-c", "pick(.a.b, .a)"],
+            b"{\"a\":{\"b\":1,\"c\":2}}\n",
+        ),
+        (
+            "pick shallow",
+            &["-c", "pick(.a, .a.b)"],
+            b"{\"a\":{\"b\":1,\"c\":2}}\n",
+        ),
+        ("pick string", &["-c", "pick(.[1:3])"], b"\"abcd\"\n"),
+        (
+            "pick error",
+            &["-c", "try pick(error(\"z\")) catch ."],
+            b"1\n",
+        ),
+        ("pick number", &["-c", "pick(.a)"], b"1\n"),
+        ("pick halt", &["-nc", "pick(halt)"], b""),
+        ("pick arity", &["-nc", "pick"], b""),
+        (
+            "pick shadow",
+            &["-nc", "def path(f): 1; {\"a\":1}|pick(.a)"],
+            b"",
+        ),
+        ("transpose jagged", &["-c", "transpose"], b"[[1],[2,3]]\n"),
+        ("transpose empty", &["-c", "transpose"], b"[]\n"),
+        ("transpose row", &["-c", "transpose"], b"[[1,2,3]]\n"),
+        ("transpose square", &["-c", "transpose"], b"[[1,2],[3,4]]\n"),
+        ("transpose pad", &["-c", "transpose"], b"[[],[1,2]]\n"),
+        ("transpose number", &["-c", "try transpose catch ."], b"1\n"),
+        ("transpose object", &["-c", "transpose"], b"{}\n"),
+        (
+            "transpose three",
+            &["-c", "transpose"],
+            b"[[1,2,3],[4],[5,6]]\n",
+        ),
+        (
+            "transpose shadow",
+            &["-nc", "def max: \"no\"; [[1,2],[3,4]]|transpose"],
+            b"",
+        ),
+        ("transpose arity", &["-nc", "transpose(1)"], b""),
+        ("comb empty", &["-c", "combinations"], b"[]\n"),
+        ("comb one", &["-c", "combinations"], b"[[1,2]]\n"),
+        ("comb two", &["-c", "combinations"], b"[[1,2],[3,4]]\n"),
+        (
+            "comb three",
+            &["-c", "[combinations]"],
+            b"[[1],[2,3],[4]]\n",
+        ),
+        ("comb hole", &["-c", "combinations"], b"[[1],[],[2]]\n"),
+        ("comb number", &["-c", "try combinations catch ."], b"1\n"),
+        ("comb null", &["-c", "combinations"], b"null\n"),
+        ("comb n zero", &["-c", "combinations(0)"], b"[1,2]\n"),
+        ("comb n one", &["-c", "combinations(1)"], b"[1,2]\n"),
+        ("comb n two", &["-c", "[combinations(2)]"], b"[1,2]\n"),
+        ("comb n neg", &["-c", "combinations(-1)"], b"[1,2]\n"),
+        (
+            "comb n length",
+            &["-c", "combinations(length)"],
+            b"[1,2,3]\n",
+        ),
+        ("comb n stream", &["-c", "[combinations(1,2)]"], b"[1,2]\n"),
+        ("comb n empty", &["-c", "combinations(empty)"], b"[1,2]\n"),
+        (
+            "comb n string",
+            &["-c", "try combinations(\"a\") catch ."],
+            b"[1]\n",
+        ),
+        ("comb rows", &["-c", "try combinations catch ."], b"[1,2]\n"),
+        (
+            "comb shadow",
+            &["-nc", "def range(x): 7; [1,2]|combinations(2)"],
+            b"",
+        ),
+        ("comb arity", &["-nc", "combinations(1;2)"], b""),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("halt-span-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let left = dir.join("left.json");
+    let right = dir.join("right.json");
+    fs::write(&left, b"1\n").unwrap();
+    fs::write(&right, b"2\n").unwrap();
+    compare_exact(
+        "halt files",
+        &[
+            "-c",
+            "halt",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+        b"",
+    );
+    compare_exact(
+        "halt_error files",
+        &[
+            "-c",
+            "halt_error",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+        b"",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

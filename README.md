@@ -104,11 +104,13 @@ Each side of a slice is an expression, so a variable, arithmetic, or a call work
 
 A missing file is named and the other files are still read. The exit status is 2. A filter that hits the wrong kind of value uses jq's message. The exit status is 5 when that value is the last one, and 0 when a later value is fine. Output already produced is kept, and later values are still run. On one input, a cut-off final value still prints the complete values before it, then jq's parse error, and exits 5.
 
+`isnan` is true for `nan` and false for every other value, including one that is not a number. `isinfinite` is true for an infinite number. `isnormal` is true for a finite number other than zero or a subnormal. `halt` stops the program with status 0 and writes nothing more. `halt_error` stops with status 5. `halt_error(code)` uses the first number `code` yields. The fraction is dropped. A negative number or `nan` is status 0. A number that fits in 32 bits keeps its low eight bits. A number that does not fit follows the host C cast, so a huge positive code is 255 on macOS and 0 on Linux. The input is written to stderr. A string is written as its bytes, `null` writes nothing, and any other value is compact JSON plus a newline. `-c`, `-r`, `-j`, `-S`, and `-a` do not change that text. `try` does not catch `halt` or `halt_error`. `pick(paths)` copies each of those paths onto a value that starts as null. `transpose` turns the rows of an array into columns and fills a short row with null. `combinations` takes one element from each array in the input. `combinations(n)` repeats the input once for every value `range(n)` yields.
+
 ## What does not work yet
 
 Filters past the list above are rejected. A call to a name or a number of arguments this version does not define fails with jq's `name/n is not defined` message and the exit status is 3. Anything else that this version does not parse is `tumulus: syntax error`, also exit status 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too.
 
-`split` with two filters is rejected that way. jq splits a string on a regular expression there. `fromjson | isnan` is rejected because `isnan` is not defined. jq runs that program.
+`split` with two filters is rejected that way. jq splits a string on a regular expression there.
 
 `strftime`, `strflocaltime`, and `strptime` reject a format letter other than the ones above. The message names the letter and the exit status is 5.
 

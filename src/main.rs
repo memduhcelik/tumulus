@@ -108,6 +108,8 @@ struct Run {
     produced: bool,
     /// The last value written was `null` or `false`.
     last_false: bool,
+    /// `halt` or `halt_error` already chose the status.
+    stopped: bool,
 }
 
 impl Run {
@@ -117,15 +119,17 @@ impl Run {
             missing: false,
             produced: false,
             last_false: false,
+            stopped: false,
         }
     }
 }
 
 /// `-e` replaces a successful exit. No output is 4. A last `null` or
 /// `false` is 1. Any other value, including `0` and `""`, stays 0.
-/// Status 2, 3, and 5 are left as they are.
+/// Status 2, 3, and 5 are left as they are. `halt` and `halt_error` are too,
+/// including a status of 0.
 fn apply_exit_status(run: &mut Run, enabled: bool) {
-    if !enabled || run.status != 0 {
+    if !enabled || run.status != 0 || run.stopped {
         return;
     }
     run.status = if !run.produced {
@@ -142,6 +146,8 @@ struct Outcome {
     halt: bool,
     /// The last value in this input ran without a filter error.
     clear_failure: bool,
+    /// `halt` or `halt_error` chose `status`, including 0.
+    jq_halt: bool,
 }
 
 fn apply_values(
@@ -154,6 +160,9 @@ fn apply_values(
 ) -> Result<(), Error> {
     if files.is_empty() {
         let outcome = apply(&read_stdin()?, style, program, "<stdin>", env, run, out)?;
+        if outcome.jq_halt {
+            run.stopped = true;
+        }
         run.status = outcome.status;
         return Ok(());
     }
@@ -162,6 +171,11 @@ fn apply_values(
             Ok(bytes) => {
                 let source = if path == "-" { "<stdin>" } else { path };
                 let outcome = apply(&bytes, style, program, source, env, run, out)?;
+                if outcome.jq_halt {
+                    run.stopped = true;
+                    run.status = outcome.status;
+                    break;
+                }
                 if outcome.status != 0 {
                     run.status = outcome.status;
                 } else if outcome.clear_failure && run.status == 5 && !run.missing {
@@ -202,6 +216,14 @@ fn apply(
             Ok(()) => failed = false,
             Err(failure) => {
                 write_values(&failure.partial, style, run, out)?;
+                if let Some(code) = take_stop(&failure) {
+                    return Ok(Outcome {
+                        status: code,
+                        halt: true,
+                        clear_failure: false,
+                        jq_halt: true,
+                    });
+                }
                 report_error(&format!("{source}:{}", item.line), &failure);
                 failed = true;
             }
@@ -213,12 +235,14 @@ fn apply(
             status: 5,
             halt: true,
             clear_failure: false,
+            jq_halt: false,
         });
     }
     Ok(Outcome {
         status: if failed { 5 } else { 0 },
         halt: false,
         clear_failure: !failed && !parsed.values.is_empty(),
+        jq_halt: false,
     })
 }
 
@@ -252,6 +276,9 @@ fn apply_shared(
         )?;
     } else {
         loop {
+            if run.stopped {
+                break;
+            }
             match next_main()? {
                 MainNext::Eof => break,
                 MainNext::Parse(message) => {
@@ -268,6 +295,8 @@ fn apply_shared(
     // A file that could not be opened wins over a filter or parse failure.
     run.status = if open_failed() {
         2
+    } else if run.stopped {
+        run.status
     } else if failed {
         5
     } else {
@@ -287,8 +316,10 @@ fn apply_null(
         Ok(()) => run.status = 0,
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
-            report_error("<unknown>", &failure);
-            run.status = 5;
+            if !note_stop(&failure, run) {
+                report_error("<unknown>", &failure);
+                run.status = 5;
+            }
         }
     }
     Ok(())
@@ -414,6 +445,9 @@ fn apply_slurp(
         let fed = program_stream_with(&buf, true, stream_errors, &bounds);
         let mut failed = false;
         for item in &fed.values {
+            if run.stopped {
+                break;
+            }
             let place = if item.unknown {
                 "<unknown>".to_string()
             } else {
@@ -426,7 +460,7 @@ fn apply_slurp(
             run.status = finish_input(missing, true);
             return Ok(());
         }
-        run.status = finish_input(missing, failed);
+        run.status = stopped_status(run, missing, failed);
         return Ok(());
     }
     let parsed = parse_stream(&buf)?;
@@ -437,7 +471,7 @@ fn apply_slurp(
     }
     let input = Value::array(parsed.values.into_iter().map(|item| item.value).collect());
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
-    run.status = finish_input(missing, failed);
+    run.status = stopped_status(run, missing, failed);
     Ok(())
 }
 
@@ -480,7 +514,7 @@ fn apply_raw_slurp(
     }
     let input = Value::String(decode_raw(&buf));
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
-    run.status = finish_input(missing, failed);
+    run.status = stopped_status(run, missing, failed);
     Ok(())
 }
 
@@ -531,6 +565,10 @@ fn apply_raw(
                             run,
                             out,
                         )?;
+                        if run.stopped {
+                            stop = true;
+                            break;
+                        }
                         if one_left {
                             stop = true;
                             break;
@@ -555,8 +593,19 @@ fn apply_raw(
             out,
         )?;
     }
-    run.status = finish_input(missing, last_failed);
+    run.status = stopped_status(run, missing, last_failed);
     Ok(())
+}
+
+/// A missing file still wins. `halt` keeps the status it chose.
+fn stopped_status(run: &Run, missing: bool, failed: bool) -> i32 {
+    if missing {
+        2
+    } else if run.stopped {
+        run.status
+    } else {
+        finish_input(missing, failed)
+    }
 }
 
 fn emit(
@@ -593,7 +642,9 @@ fn emit_at(
         Ok(()) => Ok(false),
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
-            report_error(at, &failure);
+            if !note_stop(&failure, run) {
+                report_error(at, &failure);
+            }
             Ok(true)
         }
     }
@@ -621,6 +672,24 @@ fn run_program(
         return Err(err);
     }
     Ok(result)
+}
+
+/// `halt` and `halt_error` write their own stderr and choose the status.
+fn take_stop(failure: &Failure) -> Option<i32> {
+    let stop = failure.stop.as_ref()?;
+    let mut err = io::stderr();
+    let _ = err.write_all(&stop.stderr);
+    let _ = err.flush();
+    Some(stop.code)
+}
+
+fn note_stop(failure: &Failure, run: &mut Run) -> bool {
+    let Some(code) = take_stop(failure) else {
+        return false;
+    };
+    run.stopped = true;
+    run.status = code;
+    true
 }
 
 fn report_error(at: &str, failure: &Failure) {

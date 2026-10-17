@@ -60,6 +60,8 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Math1(_)
             | Filter::Abs
             | Filter::Pow10
+            | Filter::NumTest(_)
+            | Filter::Halt
             | Filter::Error
             | Filter::First(None)
             | Filter::Last(None)
@@ -111,6 +113,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::StrfLocalTime(inner)
             | Filter::StrpTime(inner)
             | Filter::Raise(inner)
+            | Filter::HaltError(inner)
             | Filter::PathOf(inner)
             | Filter::GetPath(inner)
             | Filter::DelPaths(inner)
@@ -266,6 +269,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Math1(_)
         | Filter::Abs
         | Filter::Pow10
+        | Filter::NumTest(_)
+        | Filter::Halt
         | Filter::Error
         | Filter::First(None)
         | Filter::Last(None)
@@ -333,7 +338,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::StrfTime(inner)
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
-        | Filter::Raise(inner) => check_vars(inner, scope),
+        | Filter::Raise(inner)
+        | Filter::HaltError(inner) => check_vars(inner, scope),
         Filter::Flatten(inner) => match inner {
             Some(inner) => check_vars(inner, scope),
             None => Ok(()),
@@ -595,6 +601,8 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Math1(_)
         | Filter::Abs
         | Filter::Pow10
+        | Filter::NumTest(_)
+        | Filter::Halt
         | Filter::Error
         | Filter::First(None)
         | Filter::Last(None)
@@ -661,6 +669,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
         | Filter::Raise(inner)
+        | Filter::HaltError(inner)
         | Filter::PathOf(inner)
         | Filter::GetPath(inner)
         | Filter::DelPaths(inner)
@@ -858,7 +867,11 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "inside" | "isempty" | "strftime" | "strflocaltime" | "strptime" | "path" | "getpath"
         | "delpaths" | "del" | "repeat" | "walk" | "with_entries" | "fromstream"
         | "truncate_stream" => arity == 1,
-        "paths" | "first" | "last" | "error" | "flatten" => arity <= 1,
+        "paths" | "first" | "last" | "error" | "flatten" | "halt_error" | "combinations" => {
+            arity <= 1
+        }
+        "pick" => arity == 1,
+        "isnan" | "isinfinite" | "isnormal" | "halt" | "transpose" => arity == 0,
         "any" | "all" => arity <= 2,
         "IN" | "INDEX" => arity == 1 || arity == 2,
         "recurse" => arity <= 2,
@@ -1087,6 +1100,20 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "while" => Filter::While(args.next().expect("cond"), args.next().expect("update")),
         "setpath" => Filter::SetPath(args.next().expect("path"), args.next().expect("value")),
         "tostream" => compile_stream(TOSTREAM),
+        "isnan" => Filter::NumTest(NumTest::Nan),
+        "isinfinite" => Filter::NumTest(NumTest::Infinite),
+        "isnormal" => Filter::NumTest(NumTest::Normal),
+        "halt" => Filter::Halt,
+        "halt_error" => match args.next() {
+            None => compile_stream(HALT_ERROR),
+            Some(code) => Filter::HaltError(code),
+        },
+        "pick" => with_stream_arg(PICK, args.next().expect("pick")),
+        "transpose" => compile_stream(TRANSPOSE),
+        "combinations" => match args.next() {
+            None => compile_stream(COMBINATIONS),
+            Some(count) => with_stream_arg(COMBINATIONS_N, count),
+        },
         "fromstream" => with_stream_arg(FROMSTREAM, args.next().expect("fromstream")),
         "truncate_stream" => with_stream_arg(TRUNCATE_STREAM, args.next().expect("truncate")),
         _ => match math::kind(name).expect("math builtin") {
@@ -1102,6 +1129,23 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         },
     }
 }
+
+/// `halt_error` with no argument is exit status 5.
+const HALT_ERROR: &str = "def halt_error: halt_error(5); halt_error";
+
+/// jq's `pick`. Each path is copied onto a value that starts as null.
+const PICK: &str = "def pick(pathexps): . as $in | reduce path(pathexps) as $a (null; setpath($a; $in|getpath($a))); pick(null)";
+
+/// jq's `transpose`. Short rows are padded with null.
+const TRANSPOSE: &str =
+    "def transpose: [range(0; map(length)|max // 0) as $i | [.[][$i]]]; transpose";
+
+/// jq's `combinations`. One array from each input array, the first array varying slowest.
+const COMBINATIONS: &str = "def combinations: if length == 0 then [] else .[0][] as $x | (.[1:] | combinations) as $y | [$x] + $y end; combinations";
+
+/// jq's `combinations(n)`. `n` is a filter. The input is repeated once per value `range` yields.
+const COMBINATIONS_N: &str =
+    "def combinations(n): . as $dot | [range(n) | $dot] | combinations; combinations(null)";
 
 /// jq's `tostream`. Paths of scalars come out first, then one closer for each container.
 const TOSTREAM: &str =

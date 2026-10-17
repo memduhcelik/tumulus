@@ -254,6 +254,12 @@ pub enum Filter {
     Abs,
     /// Raises `Error: pow10/0 not found at build time`.
     Pow10,
+    /// `isnan`, `isinfinite`, or `isnormal`. A value that is not a number is false.
+    NumTest(NumTest),
+    /// `halt`. Stops the program with status 0 and writes nothing to stderr.
+    Halt,
+    /// `halt_error(code)`. `code` runs on the input. The first number stops the program.
+    HaltError(Box<Filter>),
     /// `error` with no argument. Raises the current input.
     Error,
     /// `error(expr)`. A call written after it is a syntax error.
@@ -431,6 +437,22 @@ pub enum ArrayIndex {
     OutOfRange,
 }
 
+/// `isnan`, `isinfinite`, or `isnormal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumTest {
+    Nan,
+    Infinite,
+    Normal,
+}
+
+/// `halt` or `halt_error`. `try` does not catch it.
+#[derive(Clone, Debug)]
+pub struct Stop {
+    pub code: i32,
+    /// Stderr bytes. Empty writes nothing.
+    pub stderr: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct Failure {
     pub partial: Vec<Value>,
@@ -438,4 +460,6 @@ pub struct Failure {
     /// Set when `error` raised this value. Builtin failures leave it empty,
     /// and `catch` receives the message text.
     pub caught: Option<Value>,
+    /// Set by `halt` and `halt_error`. Other failures leave it empty.
+    pub stop: Option<Stop>,
 }

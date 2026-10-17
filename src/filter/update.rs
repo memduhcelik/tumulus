@@ -13,7 +13,7 @@ use super::{
     add_values, bare_fail, canonical_number, child_scope, clipped, div_values, eval_in, fail,
     finish, fresh, mul_values, parts, put, rem_values, require_slice_index, shown,
     slice as slice_value, slice_range, sub_values, truthy, walk_slice_pairs, with_partial,
-    ArrayIndex, Failure, Filter, ObjField, Op, PatField, Pattern, UpdateOp,
+    ArrayIndex, Failure, Filter, ObjField, Op, PatField, Pattern, Stop, UpdateOp,
 };
 
 enum Found {
@@ -1010,6 +1010,7 @@ struct PathErr {
     partial: Vec<POut>,
     message: String,
     caught: Option<Value>,
+    stop: Option<Stop>,
 }
 
 /// A name bound while walking a path. The body loads it as that path.
@@ -1328,6 +1329,7 @@ fn run_foreach(
                     partial: out,
                     message: failure.message,
                     caught: failure.caught,
+                    stop: failure.stop,
                 });
             }
         }
@@ -1336,6 +1338,7 @@ fn run_foreach(
                 partial: out,
                 message: failure.message,
                 caught: failure.caught,
+                stop: failure.stop,
             });
         }
     }
@@ -1377,6 +1380,7 @@ fn run_call(
                     partial: Vec::new(),
                     message: err.message,
                     caught: err.caught,
+                    stop: err.stop,
                 })
             }
         }
@@ -1387,6 +1391,7 @@ fn run_call(
             partial: out,
             message: failure.message,
             caught: failure.caught,
+            stop: failure.stop,
         }),
     }
 }
@@ -1727,6 +1732,7 @@ fn bare(message: String) -> PathErr {
         partial: Vec::new(),
         message,
         caught: None,
+        stop: None,
     }
 }
 
@@ -1736,6 +1742,7 @@ fn attach(mut done: Vec<POut>, err: PathErr) -> PathErr {
         partial: done,
         message: err.message,
         caught: err.caught,
+        stop: err.stop,
     }
 }
 
@@ -1746,6 +1753,7 @@ fn split_err(mut err: PathErr) -> (Vec<POut>, Failure) {
             partial: Vec::new(),
             message: err.message,
             caught: err.caught,
+            stop: err.stop,
         },
     )
 }
@@ -1756,6 +1764,7 @@ fn finish_outs(out: Vec<POut>, err: Option<Failure>) -> Result<Vec<POut>, PathEr
             partial: out,
             message: failure.message,
             caught: failure.caught,
+            stop: failure.stop,
         }),
         None => Ok(out),
     }
@@ -1939,6 +1948,7 @@ fn run_slice(
             partial: outs,
             message: failure.message,
             caught: failure.caught,
+            stop: failure.stop,
         }),
     }
 }
@@ -2108,6 +2118,7 @@ fn nth_path(
             partial: Vec::new(),
             message: err.message,
             caught: err.caught,
+            stop: err.stop,
         }),
     }
 }
@@ -2124,6 +2135,7 @@ fn truthy_at(
             partial: Vec::new(),
             message: failure.message,
             caught: failure.caught,
+            stop: failure.stop,
         }),
     }
 }
@@ -2226,6 +2238,7 @@ fn run_alt(
                 partial,
                 message: err.message,
                 caught: err.caught,
+                stop: err.stop,
             })
         }
         Ok(lefts) => {
@@ -2285,6 +2298,7 @@ fn run_bool(
                     partial: out,
                     message: err.message,
                     caught: err.caught,
+                    stop: err.stop,
                 });
             }
         }
@@ -2424,14 +2438,15 @@ fn run_at(
                     let _ = message;
                 }
                 Err(message) => {
-                    let (message, caught) = match key_err.clone() {
-                        Some(failure) => (failure.message, failure.caught),
-                        None => (message, None),
+                    let (message, caught, stop) = match key_err.clone() {
+                        Some(failure) => (failure.message, failure.caught, failure.stop),
+                        None => (message, None, None),
                     };
                     return Err(PathErr {
                         partial: out,
                         message,
                         caught,
+                        stop,
                     });
                 }
             }
@@ -2654,6 +2669,7 @@ fn run_fallback(
                 partial,
                 message: failure.message,
                 caught: failure.caught,
+                stop: failure.stop,
             })
         }
     }
@@ -3671,6 +3687,7 @@ fn run_getpath(
                     partial: out,
                     message,
                     caught: None,
+                    stop: None,
                 })
             }
         }
