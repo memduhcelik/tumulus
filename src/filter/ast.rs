@@ -268,6 +268,10 @@ pub enum Filter {
     InputLine,
     /// `builtins`. Every builtin name and arity, in jq's order.
     Builtins,
+    /// `get_search_list`. `-L` paths, or the default list when `-L` was not set.
+    SearchList,
+    /// `modulemeta`. The input is the module name.
+    ModuleMeta,
     /// `get_jq_origin`. Directory of the invoked executable.
     JqOrigin,
     /// `get_prog_origin`. Directory of the `-f` program, or the current directory.

@@ -23,6 +23,8 @@ thread_local! {
     static DUMP_ASCII: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DUMP_SORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROG_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
+    /// `None` is jq's default list. `Some` is the `-L` list, which replaces it.
+    static LIBRARIES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// What `input` got from the stream.
@@ -100,6 +102,24 @@ pub fn dump_flags() -> (bool, bool) {
 
 pub fn set_prog_origin(origin: String) {
     PROG_ORIGIN.with(|slot| *slot.borrow_mut() = origin);
+}
+
+/// `None` restores `~/.jq`, `$ORIGIN/../lib/jq`, and `$ORIGIN/../lib`.
+/// `Some` is what `-L` stored, in order, and nothing else.
+pub fn set_library_paths(paths: Option<Vec<String>>) {
+    LIBRARIES.with(|slot| *slot.borrow_mut() = paths);
+}
+
+pub fn library_paths() -> Vec<String> {
+    LIBRARIES.with(|slot| {
+        slot.borrow().clone().unwrap_or_else(|| {
+            vec![
+                "~/.jq".to_string(),
+                "$ORIGIN/../lib/jq".to_string(),
+                "$ORIGIN/../lib".to_string(),
+            ]
+        })
+    })
 }
 
 pub fn prog_origin() -> String {

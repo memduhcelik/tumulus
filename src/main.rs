@@ -6,8 +6,8 @@ use std::process;
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
     parse_stream, program_stream, program_stream_with, reads_input, render, set_dump_flags,
-    set_environ, set_input_line, set_prog_origin, set_unknown, Error, Failure, Filter, Indent,
-    Layout, MainNext, ProgramError, Source, Style, Value,
+    set_environ, set_input_line, set_library_paths, set_prog_origin, set_unknown, Error, Failure,
+    Filter, Indent, Layout, MainNext, ProgramError, Source, Style, Value,
 };
 
 fn main() {
@@ -76,6 +76,7 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
         },
     };
     let scope = defined_names(&options.named);
+    set_library_paths(options.libraries.clone());
     let program = match compile_with(&source, &scope) {
         Ok(program) => program,
         Err(ProgramError::Syntax) => {
@@ -796,6 +797,8 @@ struct Options {
     exit_status: bool,
     stream: bool,
     stream_errors: bool,
+    /// `None` keeps jq's default module path. `Some` is every `-L`.
+    libraries: Option<Vec<String>>,
     program: Program,
     files: Vec<String>,
     named: Vec<(String, Value)>,
@@ -818,6 +821,7 @@ struct Flags {
     from_file: bool,
     stream: bool,
     stream_errors: bool,
+    libraries: Option<Vec<String>>,
 }
 
 fn options() -> Result<Options, Error> {
@@ -831,6 +835,7 @@ fn options() -> Result<Options, Error> {
         from_file: false,
         stream: false,
         stream_errors: false,
+        libraries: None,
     };
     let mut named = Vec::new();
     let mut positional = Vec::new();
@@ -850,6 +855,27 @@ fn options() -> Result<Options, Error> {
             end = true;
             index += 1;
             continue;
+        }
+        if arg == "-L" {
+            let Some(path) = args.get(index + 1) else {
+                jq_usage("-L takes a parameter: (e.g. -L /search/path or -L/search/path)");
+            };
+            index += 2;
+            flags
+                .libraries
+                .get_or_insert_with(Vec::new)
+                .push(library_directory(path));
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("-L") {
+            if !path.is_empty() {
+                index += 1;
+                flags
+                    .libraries
+                    .get_or_insert_with(Vec::new)
+                    .push(library_directory(path));
+                continue;
+            }
         }
         if arg == "--indent" {
             let Some(value) = args.get(index + 1) else {
@@ -978,7 +1004,16 @@ fn options() -> Result<Options, Error> {
         files,
         named,
         positional,
+        libraries: flags.libraries,
     })
+}
+
+/// An existing directory, including one reached through a symlink, is its
+/// canonical path. A path that cannot be resolved stays as written.
+fn library_directory(text: &str) -> String {
+    fs::canonicalize(text)
+        .map(|full| full.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| text.to_string())
 }
 
 fn push_operand(

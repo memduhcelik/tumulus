@@ -219,6 +219,8 @@ pub(super) fn produce(
         Filter::Stderr => super::builtin::eval_stderr(input),
         Filter::InputLine => Ok(vec![crate::feed::input_line_value()]),
         Filter::Builtins => Ok(vec![super::builtin::builtins_value()]),
+        Filter::SearchList => Ok(vec![super::modules::search_list_value()]),
+        Filter::ModuleMeta => super::modules::eval_module_meta(input),
         Filter::JqOrigin => Ok(vec![Value::String(crate::feed::jq_origin())]),
         Filter::ProgOrigin => Ok(vec![Value::String(crate::feed::prog_origin())]),
         Filter::FormatBy(name) => super::builtin::eval_format_by(name, input, env),

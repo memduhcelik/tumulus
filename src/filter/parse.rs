@@ -14,6 +14,33 @@ use super::value::{apply_op, put};
 
 thread_local! {
     static REACHED: RefCell<Option<HashSet<usize>>> = RefCell::new(None);
+    /// File shown in a compile error. Empty means `<top-level>`.
+    static PLACE: RefCell<String> = RefCell::new(String::new());
+}
+
+struct PlaceGuard(String);
+
+impl Drop for PlaceGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        PLACE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+fn enter_place(label: &str) -> PlaceGuard {
+    let previous = PLACE.with(|slot| slot.replace(label.to_string()));
+    PlaceGuard(previous)
+}
+
+fn place_label() -> String {
+    PLACE.with(|slot| {
+        let current = slot.borrow();
+        if current.is_empty() {
+            "<top-level>".to_string()
+        } else {
+            current.clone()
+        }
+    })
 }
 
 pub fn compile(source: &str) -> Result<Filter, ProgramError> {
@@ -66,6 +93,8 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Stderr
             | Filter::InputLine
             | Filter::Builtins
+            | Filter::SearchList
+            | Filter::ModuleMeta
             | Filter::JqOrigin
             | Filter::ProgOrigin
             | Filter::Error
@@ -213,30 +242,81 @@ pub fn reads_input(filter: &Filter) -> bool {
 
 /// `scope` names variables that are already bound, ahead of the program.
 pub fn compile_with(source: &str, scope: &[String]) -> Result<Filter, ProgramError> {
-    let mut parser = Parser {
-        src: source,
-        index: 0,
-        reject_block: false,
-        reject_try: false,
-        suffix_question: false,
-        scopes: vec![PScope {
-            funcs: Vec::new(),
-            params: Vec::new(),
-        }],
-    };
-    parser.skip_ws();
-    let filter = parser.parse_pipe()?;
+    super::modules::clear_cache();
+    let _place = enter_place("<top-level>");
+    finish_program(source, scope, true)
+}
+
+/// Compile one library file. Definitions keep their data imports.
+pub(super) fn compile_module_source(
+    source: &str,
+    place: &str,
+) -> Result<Vec<super::modules::Export>, ProgramError> {
+    let _place = enter_place(place);
+    let mut parser = Parser::open(source, true);
+    let filter = parser.parse_program()?;
     parser.skip_ws();
     if !parser.eof() {
         return Err(ProgramError::Syntax);
     }
-    let (errors, reached) = undefined_calls(&filter);
+    check_finished(
+        source,
+        &["ARGS".to_string(), "ENV".to_string()],
+        &parser.data_names,
+        &filter,
+    )?;
+    let binds = parser.data.clone();
+    for exp in &parser.exports {
+        let body = (**exp.func.body.borrow()).clone();
+        *exp.func.body.borrow_mut() = Rc::new(super::modules::wrap_data(body, &binds));
+    }
+    Ok(parser.exports)
+}
+
+/// `modulemeta`. Imports are recorded and not loaded. A syntax error is returned.
+pub(super) fn describe_module(source: &str, place: &str) -> Result<Value, ProgramError> {
+    let _place = enter_place(place);
+    let mut parser = Parser::open(source, false);
+    let filter = parser.parse_program()?;
+    parser.skip_ws();
+    if !parser.eof() {
+        return Err(ProgramError::Syntax);
+    }
+    // Undefined names are not an error here. The header, imports, and defs are.
+    let _ = filter;
+    Ok(parser.meta_value())
+}
+
+fn finish_program(source: &str, scope: &[String], link: bool) -> Result<Filter, ProgramError> {
+    let mut parser = Parser::open(source, link);
+    let filter = parser.parse_program()?;
+    parser.skip_ws();
+    if !parser.eof() {
+        return Err(ProgramError::Syntax);
+    }
+    if parser.tail_missing {
+        return Err(ProgramError::Report(
+            "jq: error: Top-level program not given (try \".\")\njq: 1 compile error\n".to_string(),
+        ));
+    }
+    check_finished(source, scope, &parser.data_names, &filter)?;
+    Ok(filter)
+}
+
+fn check_finished(
+    source: &str,
+    scope: &[String],
+    data_names: &[String],
+    filter: &Filter,
+) -> Result<(), ProgramError> {
+    let (errors, reached) = undefined_calls(filter);
     if !errors.is_empty() {
         return Err(report_calls(source, &errors));
     }
     let _reached = set_reached(reached);
-    check_vars(&filter, scope)?;
-    Ok(filter)
+    let mut names = scope.to_vec();
+    names.extend(data_names.iter().cloned());
+    check_vars(filter, &names)
 }
 
 pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
@@ -282,6 +362,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Stderr
         | Filter::InputLine
         | Filter::Builtins
+        | Filter::SearchList
+        | Filter::ModuleMeta
         | Filter::JqOrigin
         | Filter::ProgOrigin
         | Filter::Error
@@ -621,6 +703,8 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Stderr
         | Filter::InputLine
         | Filter::Builtins
+        | Filter::SearchList
+        | Filter::ModuleMeta
         | Filter::JqOrigin
         | Filter::ProgOrigin
         | Filter::Error
@@ -829,6 +913,27 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
     }
 }
 
+fn dep_record(meta: Option<Value>, alias: Option<&str>, data: bool, rel: &str) -> Value {
+    let mut pairs = match &meta {
+        Some(Value::Object(items)) => items.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    if let Some(alias) = alias {
+        super::value::put(
+            &mut pairs,
+            "as".to_string(),
+            Value::String(alias.to_string()),
+        );
+    }
+    super::value::put(&mut pairs, "is_data".to_string(), Value::Bool(data));
+    super::value::put(
+        &mut pairs,
+        "relpath".to_string(),
+        Value::String(rel.to_string()),
+    );
+    Value::object(pairs)
+}
+
 fn report_calls(source: &str, errors: &[(usize, String)]) -> ProgramError {
     if errors.len() == 1 {
         return report_at(source, errors[0].0, &errors[0].1);
@@ -837,7 +942,8 @@ fn report_calls(source: &str, errors: &[(usize, String)]) -> ProgramError {
     for (at, message) in errors {
         let (line_no, line, column) = line_at(source, *at);
         text.push_str(&format!(
-            "jq: error: {message} at <top-level>, line {line_no}:\n{line}"
+            "jq: error: {message} at {}, line {line_no}:\n{line}",
+            place_label()
         ));
         text.push_str(&" ".repeat(column));
         text.push('\n');
@@ -894,7 +1000,8 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         "pick" => arity == 1,
         "isnan" | "isinfinite" | "isnormal" | "isfinite" | "halt" | "transpose" | "stderr"
         | "input_line_number" | "builtins" | "finites" | "normals" | "get_jq_origin"
-        | "get_prog_origin" | "reverse" | "fromdateiso8601" | "todateiso8601" => arity == 0,
+        | "get_prog_origin" | "reverse" | "fromdateiso8601" | "todateiso8601" | "modulemeta"
+        | "get_search_list" => arity == 0,
         "debug" => arity <= 1,
         "in" | "bsearch" | "format" => arity == 1,
         "JOIN" => (2..=4).contains(&arity),
@@ -1138,6 +1245,8 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "stderr" => Filter::Stderr,
         "input_line_number" => Filter::InputLine,
         "builtins" => Filter::Builtins,
+        "get_search_list" => Filter::SearchList,
+        "modulemeta" => Filter::ModuleMeta,
         "finites" => compile_stream(FINITES),
         "normals" => compile_stream(NORMALS),
         "get_jq_origin" => Filter::JqOrigin,
@@ -1303,6 +1412,81 @@ pub(super) struct Parser<'a> {
     suffix_question: bool,
     /// Inner scopes are at the back. Each `def` body gets its own scope.
     scopes: Vec<PScope>,
+    /// Load `import` and `include`. `modulemeta` only records them.
+    link: bool,
+    /// `module` header, if the file has one.
+    meta: Option<Value>,
+    /// Import records, in source order.
+    deps: Vec<Value>,
+    /// Top-level definitions, in source order.
+    exports: Vec<super::modules::Export>,
+    /// Data imports. `$name::name` reads these.
+    data_names: Vec<String>,
+    /// Values bound around a linked module's definitions.
+    data: Vec<(String, Value)>,
+    /// The file ended on a top-level `def` or directive, with no filter after it.
+    tail_missing: bool,
+    /// Imports and includes, loaded after the whole preamble is read.
+    pending: Vec<PendingImport>,
+}
+
+struct PendingImport {
+    path: String,
+    /// `None` is `include`.
+    alias: Option<String>,
+    data: bool,
+}
+
+enum Ready {
+    Data(Value),
+    Code(Rc<Vec<super::modules::Export>>),
+}
+
+impl<'a> Parser<'a> {
+    fn open(src: &'a str, link: bool) -> Self {
+        Parser {
+            src,
+            index: 0,
+            reject_block: false,
+            reject_try: false,
+            suffix_question: false,
+            scopes: vec![PScope {
+                funcs: Vec::new(),
+                params: Vec::new(),
+            }],
+            link,
+            meta: None,
+            deps: Vec::new(),
+            exports: Vec::new(),
+            data_names: Vec::new(),
+            data: Vec::new(),
+            tail_missing: false,
+            pending: Vec::new(),
+        }
+    }
+
+    fn meta_value(&self) -> Value {
+        let mut pairs = match &self.meta {
+            Some(Value::Object(items)) => items.iter().cloned().collect(),
+            _ => Vec::new(),
+        };
+        super::value::put(
+            &mut pairs,
+            "deps".to_string(),
+            Value::array(self.deps.clone()),
+        );
+        super::value::put(
+            &mut pairs,
+            "defs".to_string(),
+            Value::array(
+                self.exports
+                    .iter()
+                    .map(|exp| Value::String(format!("{}/{}", exp.name, exp.arity)))
+                    .collect(),
+            ),
+        );
+        Value::object(pairs)
+    }
 }
 
 struct PScope {
@@ -1322,6 +1506,231 @@ struct Sig {
 }
 
 impl<'a> Parser<'a> {
+    /// Optional `module`, then `import` and `include`, then the program.
+    fn parse_program(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if self.at_keyword("module") {
+            self.parse_module_directive()?;
+        }
+        loop {
+            self.skip_ws();
+            if self.at_keyword("import") {
+                self.parse_import_directive()?;
+            } else if self.at_keyword("include") {
+                self.parse_include_directive()?;
+            } else {
+                break;
+            }
+        }
+        self.resolve_imports()?;
+        self.skip_ws();
+        let mut body = if self.eof() {
+            if self.meta.is_none() && self.deps.is_empty() {
+                return Err(ProgramError::Syntax);
+            }
+            self.tail_missing = true;
+            Filter::Empty
+        } else {
+            self.parse_pipe()?
+        };
+        for (name, value) in self.data.iter().rev() {
+            body = Filter::Bind {
+                expr: Box::new(Filter::Literal(value.clone())),
+                pattern: Pattern::Var(name.clone()),
+                body: Box::new(body),
+            };
+        }
+        Ok(body)
+    }
+
+    fn parse_module_directive(&mut self) -> Result<(), ProgramError> {
+        let at = self.index;
+        if !self.eat_keyword("module") {
+            return Err(ProgramError::Syntax);
+        }
+        self.skip_ws();
+        let expr = self.parse_pipe()?;
+        let value = match const_one(&expr) {
+            Some(value) if matches!(value, Value::Object(_)) => value,
+            Some(_) => return Err(report_at(self.src, at, "Module metadata must be an object")),
+            None => return Err(report_at(self.src, at, "Module metadata must be constant")),
+        };
+        if !self.eat(';') {
+            return Err(ProgramError::Syntax);
+        }
+        self.meta = Some(value);
+        Ok(())
+    }
+
+    fn parse_import_directive(&mut self) -> Result<(), ProgramError> {
+        let at = self.index;
+        if !self.eat_keyword("import") {
+            return Err(ProgramError::Syntax);
+        }
+        let (path, _path_at) = self.parse_module_path()?;
+        if !self.eat_keyword("as") {
+            return Err(ProgramError::Syntax);
+        }
+        self.skip_ws();
+        let (alias, data) = if self.eat('$') {
+            (self.ident()?, true)
+        } else if self.starts_ident() {
+            let name = self.ident()?;
+            if reserved(&name) {
+                return Err(ProgramError::Syntax);
+            }
+            (name, false)
+        } else {
+            return Err(ProgramError::Syntax);
+        };
+        let meta = self.parse_meta(at)?;
+        if !self.eat(';') {
+            return Err(ProgramError::Syntax);
+        }
+        self.deps
+            .push(dep_record(meta.clone(), Some(&alias), data, &path));
+        if !self.link && data {
+            self.data_names.push(alias.clone());
+        }
+        self.pending.push(PendingImport {
+            path,
+            alias: Some(alias),
+            data,
+        });
+        Ok(())
+    }
+
+    fn parse_include_directive(&mut self) -> Result<(), ProgramError> {
+        let at = self.index;
+        if !self.eat_keyword("include") {
+            return Err(ProgramError::Syntax);
+        }
+        let (path, _path_at) = self.parse_module_path()?;
+        let meta = self.parse_meta(at)?;
+        if !self.eat(';') {
+            return Err(ProgramError::Syntax);
+        }
+        self.deps.push(dep_record(meta, None, false, &path));
+        self.pending.push(PendingImport {
+            path,
+            alias: None,
+            data: false,
+        });
+        Ok(())
+    }
+
+    /// Later imports are loaded first. The last error is the one jq reports.
+    /// Successful imports are installed in source order.
+    fn resolve_imports(&mut self) -> Result<(), ProgramError> {
+        if !self.link {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut last = None;
+        let mut ready = Vec::new();
+        for item in &pending {
+            let loaded = if item.data {
+                super::modules::load_data(&item.path).map(Ready::Data)
+            } else {
+                super::modules::load_code(&item.path).map(Ready::Code)
+            };
+            match loaded {
+                Ok(value) => ready.push(value),
+                Err(err) => last = Some(err),
+            }
+        }
+        if let Some(err) = last {
+            return Err(err);
+        }
+        for (item, value) in pending.into_iter().zip(ready) {
+            match value {
+                Ready::Data(value) => {
+                    let name = item.alias.unwrap_or_default();
+                    self.data_names.push(name.clone());
+                    self.data.push((name, value));
+                }
+                Ready::Code(exports) => self.install(item.alias.as_deref(), &exports),
+            }
+        }
+        Ok(())
+    }
+
+    /// A string literal. Interpolation is rejected. The index is the quote.
+    fn parse_module_path(&mut self) -> Result<(String, usize), ProgramError> {
+        self.skip_ws();
+        let at = self.index;
+        if self.peek() != Some('"') {
+            return Err(ProgramError::Syntax);
+        }
+        match self.parse_string_expr()? {
+            Filter::Literal(Value::String(ref text)) => Ok((text.clone(), at)),
+            _ => Err(report_at(self.src, at, "Import path must be constant")),
+        }
+    }
+
+    /// Nothing when the next token is `;`. Otherwise one constant object.
+    fn parse_meta(&mut self, at: usize) -> Result<Option<Value>, ProgramError> {
+        self.skip_ws();
+        if self.peek() == Some(';') || self.eof() {
+            return Ok(None);
+        }
+        let expr = self.parse_pipe()?;
+        match const_one(&expr) {
+            Some(value) if matches!(value, Value::Object(_)) => Ok(Some(value)),
+            Some(_) => Err(report_at(self.src, at, "Module metadata must be an object")),
+            None => Err(report_at(self.src, at, "Module metadata must be constant")),
+        }
+    }
+
+    fn install(&mut self, alias: Option<&str>, exports: &[super::modules::Export]) {
+        let scope = &mut self.scopes[0].funcs;
+        for exp in exports {
+            let name = match alias {
+                Some(alias) => format!("{alias}::{}", exp.name),
+                None => exp.name.clone(),
+            };
+            scope.push(Sig {
+                name,
+                arity: exp.arity,
+                func: Rc::clone(&exp.func),
+            });
+        }
+    }
+
+    fn at_keyword(&self, word: &str) -> bool {
+        let rest = &self.src[self.index..];
+        if rest.len() < word.len() || !rest.starts_with(word) {
+            return false;
+        }
+        match rest[word.len()..].chars().next() {
+            None => true,
+            Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => false,
+            Some(_) => true,
+        }
+    }
+
+    /// `foo::bar` with no space around `::`.
+    fn qualify(&mut self, mut name: String) -> Result<String, ProgramError> {
+        while self.followed_by_colon_name() {
+            self.index += 2;
+            let next = self.ident()?;
+            name.push_str("::");
+            name.push_str(&next);
+        }
+        Ok(name)
+    }
+
+    fn followed_by_colon_name(&self) -> bool {
+        let rest = &self.src[self.index..];
+        if !rest.starts_with("::") {
+            return false;
+        }
+        rest[2..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+    }
+
     fn parse_pipe(&mut self) -> Result<Filter, ProgramError> {
         let mut filter = self.parse_comma()?;
         while self.eat('|') {
@@ -1559,6 +1968,18 @@ impl<'a> Parser<'a> {
             let at = self.index;
             self.bump();
             let name = self.ident()?;
+            if self.followed_by_colon_name() {
+                self.index += 2;
+                let rest = self.ident()?;
+                if rest == name && self.data_names.iter().any(|have| have == &name) {
+                    return Ok(Filter::Var(name));
+                }
+                return Err(report_at(
+                    self.src,
+                    at,
+                    &format!("${name}::{rest} is not defined"),
+                ));
+            }
             // `$__loc__` is the source of that `$`, not a binding. `-f` keeps
             // the file name `<top-level>`.
             if name == "__loc__" {
@@ -1603,20 +2024,24 @@ impl<'a> Parser<'a> {
     /// The first `(` is the call. A second `(` is juxtaposition, and
     /// `forbids_call` rejects it.
     fn parse_name(&mut self, at: usize, name: String) -> Result<Filter, ProgramError> {
-        match name.as_str() {
-            "def" if !self.reject_block => return self.parse_def(),
-            "if" if !self.reject_block => return self.parse_if(),
-            "reduce" if !self.reject_block => return self.parse_fold(false),
-            "foreach" if !self.reject_block => return self.parse_fold(true),
-            "try" if !self.reject_block && !self.reject_try => return self.parse_try(),
-            "true" => return Ok(Filter::Literal(Value::Bool(true))),
-            "false" => return Ok(Filter::Literal(Value::Bool(false))),
-            "null" => return Ok(Filter::Literal(Value::Null)),
-            _ => {}
+        let qualified = self.followed_by_colon_name();
+        if !qualified {
+            match name.as_str() {
+                "def" if !self.reject_block => return self.parse_def(),
+                "if" if !self.reject_block => return self.parse_if(),
+                "reduce" if !self.reject_block => return self.parse_fold(false),
+                "foreach" if !self.reject_block => return self.parse_fold(true),
+                "try" if !self.reject_block && !self.reject_try => return self.parse_try(),
+                "true" => return Ok(Filter::Literal(Value::Bool(true))),
+                "false" => return Ok(Filter::Literal(Value::Bool(false))),
+                "null" => return Ok(Filter::Literal(Value::Null)),
+                _ => {}
+            }
+            if reserved(&name) {
+                return Err(ProgramError::Syntax);
+            }
         }
-        if reserved(&name) {
-            return Err(ProgramError::Syntax);
-        }
+        let name = self.qualify(name)?;
         self.skip_ws();
         let args = if self.peek() == Some('(') {
             self.parse_call_args()?
@@ -1659,8 +2084,9 @@ impl<'a> Parser<'a> {
     /// It is not visible in the argument expressions of that call.
     fn parse_def(&mut self) -> Result<Filter, ProgramError> {
         self.skip_ws();
-        let name = self.ident()?;
-        if reserved(&name) {
+        let ident = self.ident()?;
+        let name = self.qualify(ident)?;
+        if !name.contains("::") && reserved(&name) {
             return Err(ProgramError::Syntax);
         }
         self.skip_ws();
@@ -1676,6 +2102,13 @@ impl<'a> Parser<'a> {
             params: params.clone(),
             body: RefCell::new(Rc::new(Filter::Empty)),
         });
+        if self.scopes.len() == 1 {
+            self.exports.push(super::modules::Export {
+                name: name.clone(),
+                arity: params.len(),
+                func: Rc::clone(&func),
+            });
+        }
         // The name is visible in the body and the rest, then it drops out so
         // a `def` inside parentheses does not shadow the code after them.
         let slot = self.define(&name, Rc::clone(&func));
@@ -1696,7 +2129,18 @@ impl<'a> Parser<'a> {
             return Err(ProgramError::Syntax);
         }
         *func.body.borrow_mut() = Rc::new(body);
-        let rest = self.parse_pipe();
+        self.skip_ws();
+        let rest = if self.eof() {
+            // A top-level definition with nothing after it is not a program.
+            // The same file is a valid library. A nested definition that runs
+            // out of input is a syntax error when its outer `def` is closed.
+            if self.scopes.len() == 1 {
+                self.tail_missing = true;
+            }
+            Ok(Filter::Empty)
+        } else {
+            self.parse_pipe()
+        };
         self.scopes[slot.0].funcs.remove(slot.1);
         let rest = rest?;
         Ok(Filter::Define {
@@ -2873,7 +3317,10 @@ pub(super) fn decode_string_token(text: &str) -> Result<String, String> {
 
 pub(super) fn report_at(source: &str, pos: usize, message: &str) -> ProgramError {
     let (line_no, line, column) = line_at(source, pos);
-    let mut text = format!("jq: error: {message} at <top-level>, line {line_no}:\n{line}");
+    let mut text = format!(
+        "jq: error: {message} at {}, line {line_no}:\n{line}",
+        place_label()
+    );
     text.push_str(&" ".repeat(column));
     text.push_str("\njq: 1 compile error\n");
     ProgramError::Report(text)

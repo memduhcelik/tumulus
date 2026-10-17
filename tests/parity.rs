@@ -9870,3 +9870,206 @@ fn search_formats_match_jq() {
         compare_exact(name, args, input);
     }
 }
+
+/// `import`, `include`, `-L`, `~/.jq`, `modulemeta`, and `get_search_list`.
+#[test]
+fn modules_match_jq() {
+    require_jq();
+    let plain = [
+        ("search", &["-nc", "get_search_list"][..], b""),
+        ("search one", &["-nc", "1|get_search_list"], b""),
+        ("search none", &["-nc", "empty|get_search_list"], b""),
+        ("search arity", &["-n", "get_search_list(1)"], b""),
+        ("meta arity", &["-n", "modulemeta(1)"], b""),
+        ("meta null", &["-nc", "null|modulemeta"], b""),
+        ("L bare", &["-n", "-L"], b""),
+        ("no program", &["-n", "def f: 1;"], b""),
+        ("mod only", &["-n", "module {\"a\":1};"], b""),
+        ("mod null", &["-n", "module null; 0"], b""),
+        ("mod text", &["-n", "module \"x\"; 0"], b""),
+        ("mod dot", &["-n", "module {\"a\":.}; 0"], b""),
+        ("mod plus", &["-n", "module (.+1); 0"], b""),
+        ("mod array", &["-n", "module []; 0"], b""),
+        ("inc plus", &["-n", "include \"a\" (.+1); 0"], b""),
+        ("inc array", &["-n", "include \"a\" []; 0"], b""),
+        ("inc escape", &["-n", "include \"\\ \"; 0"], b""),
+        ("inc interp", &["-n", "include \"\\(a)\"; 0"], b""),
+        ("inc letter", &["-n", "include \"\\u0041\"; 0"], b""),
+        ("parent", &["-n", "import \"a/../b\" as b; 1"], b""),
+        ("not defined as", &["-nc", "1 as $n | $n::n"], b""),
+    ];
+    for (name, args, input) in plain {
+        compare_exact(name, args, input);
+    }
+
+    let (dir, _guard) = scratch("modules");
+    let lib = dir.join("lib");
+    let home = dir.join("home");
+    let work = dir.join("work");
+    fs::create_dir_all(lib.join("pkg")).unwrap();
+    fs::create_dir_all(home.join(".jq")).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    fs::write(lib.join("foo.jq"), "def f: 1; def g($x): $x+1;\n").unwrap();
+    fs::write(lib.join("bar.jq"), "def f: 2;\n").unwrap();
+    fs::write(lib.join("foo.json"), "{\"from\":\"json\"}\n").unwrap();
+    fs::write(lib.join("num.json"), "1\n2\n").unwrap();
+    fs::write(lib.join("bad.json"), "{not json\n").unwrap();
+    fs::write(lib.join("pkg").join("pkg.jq"), "def p: 4;\n").unwrap();
+    fs::write(lib.join("sh.jq"), "def f: 1; def g: f;\n").unwrap();
+    fs::write(
+        lib.join("meta.jq"),
+        "module {\"name\":\"meta\",\"version\":\"1.2\"}; def a: 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        lib.join("importer.jq"),
+        "import \"foo\" as foo {\"extra\":true}; import \"num\" as $n; def use: foo::f; def see: $n;\n",
+    )
+    .unwrap();
+    fs::write(
+        lib.join("dot.jq"),
+        "import \"./foo\" as foo; def k: foo::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        lib.join("datause.jq"),
+        "import \"num\" as $n; def f: $n; def g: $n::n;\n",
+    )
+    .unwrap();
+    fs::write(lib.join("miss.jq"), "import \"nope\" as n; def a: 1;\n").unwrap();
+    fs::write(
+        lib.join("over.jq"),
+        "module {\"name\":\"o\",\"deps\":[9],\"extra\":1}; def a: 1;\n",
+    )
+    .unwrap();
+    fs::write(home.join(".jq").join("homeonly.jq"), "def h: \"home\";\n").unwrap();
+    fs::write(work.join("sib.jq"), "def v: 7;\n").unwrap();
+    let lib_path = lib.to_str().unwrap();
+    let cases = [
+        ("import", format!("import \"foo\" as foo; foo::f")),
+        ("call", format!("import \"foo\" as foo; foo::g(3)")),
+        ("hidden", format!("import \"foo\" as foo; f")),
+        ("include", format!("include \"foo\"; g(4)")),
+        ("shadow", format!("include \"sh\"; def f: 9; [f,g]")),
+        (
+            "replace",
+            format!("import \"foo\" as f; import \"bar\" as f; f::f"),
+        ),
+        (
+            "redef",
+            format!("import \"foo\" as foo; def foo::f: 9; foo::f"),
+        ),
+        ("data", format!("import \"num\" as $n; $n")),
+        ("colon", format!("import \"num\" as $n; $n::n")),
+        ("colon bad", format!("import \"num\" as $n; $n::x")),
+        ("json", format!("import \"foo\" as $f; $f")),
+        ("in def", format!("import \"num\" as $n; def f: $n; f")),
+        ("mod data", format!("import \"datause\" as d; [d::f, d::g]")),
+        ("pkg", format!("import \"pkg\" as p; p::p")),
+        ("dot", format!("import \"dot\" as d; d::k")),
+        ("bad", format!("import \"bad\" as $d; $d")),
+        ("missing", format!("import \"no-such\" as m; 1")),
+        ("meta", format!("\"meta\"|modulemeta")),
+        ("deps", format!("\"importer\"|modulemeta")),
+        ("miss meta", format!("\"miss\"|modulemeta")),
+        ("over", format!("\"over\"|modulemeta")),
+        ("nope", format!("\"nope\"|modulemeta")),
+        ("try nope", format!("try (\"nope\"|modulemeta) catch .")),
+        ("two", format!("(\"foo\",\"bar\")|modulemeta")),
+    ];
+    for (name, program) in cases {
+        compare_module(name, &dir, &home, &["-nc", "-L", lib_path, &program], b"");
+    }
+    compare_module(
+        "home",
+        &dir,
+        &home,
+        &["-n", "import \"homeonly\" as h; h::h"],
+        b"",
+    );
+    compare_module(
+        "hidden home",
+        &dir,
+        &home,
+        &["-n", "-L", lib_path, "import \"homeonly\" as h; h::h"],
+        b"",
+    );
+    compare_module(
+        "cwd",
+        &work,
+        &home,
+        &["-n", "-L", lib_path, "import \"sib\" as s; s::v"],
+        b"",
+    );
+    compare_module(
+        "rel search",
+        &dir,
+        &home,
+        &["-nc", "-L", "lib", "get_search_list"],
+        b"",
+    );
+    compare_module(
+        "missing dir",
+        &dir,
+        &home,
+        &["-nc", "-L", "no/such", "get_search_list"],
+        b"",
+    );
+    compare_module(
+        "no home",
+        &dir,
+        &home,
+        &["-n", "import \"homeonly\" as h; h::h"],
+        b"",
+    );
+}
+
+fn compare_module(name: &str, cwd: &Path, home: &Path, args: &[&str], input: &[u8]) {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let owned: Vec<String> = args.iter().copied().map(str::to_string).collect();
+    let go = |program: &str, drop_home: bool| {
+        let mut cmd = Command::new(program);
+        cmd.args(&owned)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if drop_home {
+            cmd.env_remove("HOME");
+        } else {
+            cmd.env("HOME", home);
+        }
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|err| panic!("{name}: start {program}: {err}"));
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input);
+        }
+        child
+            .wait_with_output()
+            .unwrap_or_else(|err| panic!("{name}: wait {program}: {err}"))
+    };
+    let drop_home = name == "no home";
+    let got = go(bin, drop_home);
+    let expected = go("jq", drop_home);
+    assert_eq!(
+        got.stdout,
+        expected.stdout,
+        "{name}: stdout\nours {}\njq {}",
+        String::from_utf8_lossy(&got.stdout),
+        String::from_utf8_lossy(&expected.stdout)
+    );
+    assert_eq!(
+        got.stderr,
+        expected.stderr,
+        "{name}: stderr\nours {}\njq {}",
+        String::from_utf8_lossy(&got.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert_eq!(
+        got.status.code(),
+        expected.status.code(),
+        "{name}: status\n{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+}
