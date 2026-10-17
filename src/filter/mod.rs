@@ -24,6 +24,7 @@ pub(crate) fn reset_for_run() {
     modules::set_import_origin(None);
     func::reset_scope();
     parse::reset_compile_state();
+    eval::reset_labels();
 }
 
 use eval::*;

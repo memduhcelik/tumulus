@@ -1,5 +1,7 @@
 //! Running a filter: indexes, pipes, bindings, objects, and strings.
 
+use std::cell::{Cell, RefCell};
+
 use crate::date;
 use crate::math;
 use crate::number::{array_index, slice_bound};
@@ -112,23 +114,27 @@ pub(super) fn produce(
         Filter::Bind {
             expr,
             pattern,
+            alts,
             body,
-        } => eval_bind(expr, pattern, body, input, env),
+        } => eval_bind(expr, pattern, alts, body, input, env),
         Filter::Reduce {
             stream,
             pattern,
+            alts,
             init,
             update,
-        } => eval_fold(stream, pattern, init, update, None, false, input, env),
+        } => eval_fold(stream, pattern, alts, init, update, None, false, input, env),
         Filter::Foreach {
             stream,
             pattern,
+            alts,
             init,
             update,
             extract,
         } => eval_fold(
             stream,
             pattern,
+            alts,
             init,
             update,
             extract.as_deref(),
@@ -136,6 +142,8 @@ pub(super) fn produce(
             input,
             env,
         ),
+        Filter::Label { slot, body } => eval_label(*slot, body, input, env),
+        Filter::Break { slot, .. } => Err(break_failure(*slot)),
         Filter::Empty => Ok(Vec::new()),
         Filter::Length => eval_length(input),
         Filter::Keys => eval_keys(input),
@@ -632,31 +640,211 @@ pub(super) fn child_scope(
 pub(super) fn eval_bind(
     expr: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     body: &Filter,
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
+    let names = bind_name_list(pattern, alts);
     let (values, err) = parts(eval_in(expr, input, env));
     let mut out = Vec::new();
     for value in values {
-        let matched = match_pat(pattern, &value, env, &[], &mut |frame| {
-            let child = child_scope(frame, env);
-            match eval_in(body, input, &child) {
-                Ok(more) => {
-                    out.extend(more);
-                    Ok(())
-                }
-                Err(mut failure) => {
-                    out.extend(std::mem::take(&mut failure.partial));
-                    Err(failure)
-                }
-            }
-        });
-        if let Err(failure) = matched {
+        if let Err(failure) = bind_value(pattern, alts, &names, &value, body, input, env, &mut out)
+        {
             return Err(with_partial(out, failure));
         }
     }
     finish(out, err)
+}
+
+/// One value against each `?//` pattern. A pattern with no match is success
+/// and does not try the next pattern. A failure tries the next one. `halt`
+/// does not. Outputs from a failed attempt stay.
+fn bind_value(
+    pattern: &Pattern,
+    alts: &[Pattern],
+    names: &[String],
+    value: &Value,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    out: &mut Vec<Value>,
+) -> Result<(), Failure> {
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
+    for (index, pat) in pats.iter().enumerate() {
+        let last = index + 1 == pats.len();
+        match bind_pattern(pat, names, value, body, input, env, out) {
+            Ok(()) => return Ok(()),
+            Err(failure) if failure.stop.is_some() || last => return Err(failure),
+            Err(failure) => out.extend(failure.partial),
+        }
+    }
+    Ok(())
+}
+
+fn bind_pattern(
+    pattern: &Pattern,
+    names: &[String],
+    value: &Value,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    out: &mut Vec<Value>,
+) -> Result<(), Failure> {
+    match_pat(pattern, value, env, &[], &mut |frame| {
+        let frame = with_nulls(frame, names);
+        let child = child_scope(&frame, env);
+        match eval_in(body, input, &child) {
+            Ok(more) => {
+                out.extend(more);
+                Ok(())
+            }
+            Err(mut failure) => {
+                out.extend(std::mem::take(&mut failure.partial));
+                Err(failure)
+            }
+        }
+    })
+}
+
+fn bind_name_list(pattern: &Pattern, alts: &[Pattern]) -> Vec<String> {
+    let mut names = Vec::new();
+    super::parse::bind_names(pattern, alts, &mut names);
+    names
+}
+
+/// Names the successful pattern did not bind are null, and they hide an outer
+/// binding of the same name.
+fn with_nulls(frame: &[(String, Value)], names: &[String]) -> Vec<(String, Value)> {
+    let mut out = frame.to_vec();
+    for name in names {
+        if !out.iter().any(|(bound, _)| bound == name) {
+            out.push((name.clone(), Value::Null));
+        }
+    }
+    out
+}
+
+struct LabelMark {
+    slot: u32,
+    runtime: u32,
+}
+
+thread_local! {
+    static LABEL_STACK: RefCell<Vec<LabelMark>> = const { RefCell::new(Vec::new()) };
+    static LABEL_SEQ: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A new run starts at 0. Inputs in that run keep counting.
+pub(crate) fn reset_labels() {
+    LABEL_SEQ.with(|seq| seq.set(0));
+    LABEL_STACK.with(|stack| stack.borrow_mut().clear());
+}
+
+/// Pops this label when dropped, including when a caller stops the stack early.
+pub(super) struct LabelGuard {
+    runtime: u32,
+}
+
+impl LabelGuard {
+    pub(super) fn enter(slot: u32) -> (u32, Self) {
+        let runtime = LABEL_SEQ.with(|seq| {
+            let id = seq.get();
+            seq.set(id.wrapping_add(1));
+            id
+        });
+        LABEL_STACK.with(|stack| {
+            stack.borrow_mut().push(LabelMark { slot, runtime });
+        });
+        (runtime, LabelGuard { runtime })
+    }
+}
+
+impl Drop for LabelGuard {
+    fn drop(&mut self) {
+        LABEL_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(index) = stack.iter().rposition(|mark| mark.runtime == self.runtime) {
+                stack.remove(index);
+            }
+        });
+    }
+}
+
+pub(super) fn lookup_label(slot: u32) -> Option<u32> {
+    LABEL_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|mark| mark.slot == slot)
+            .map(|mark| mark.runtime)
+    })
+}
+
+pub(super) fn label_object(runtime: u32) -> Value {
+    Value::object(vec![(
+        "__jq".to_string(),
+        Value::Number(runtime.to_string()),
+    )])
+}
+
+/// A break, or `error({"__jq": n})` for this label's number.
+pub(super) fn is_label_hit(failure: &Failure, runtime: u32) -> bool {
+    if failure.stop.is_some() {
+        return false;
+    }
+    match &failure.caught {
+        Some(value) => label_runtime(value) == Some(runtime),
+        None => false,
+    }
+}
+
+fn label_runtime(value: &Value) -> Option<u32> {
+    let Value::Object(items) = value else {
+        return None;
+    };
+    if items.len() != 1 {
+        return None;
+    }
+    let (key, inner) = &items[0];
+    if key != "__jq" {
+        return None;
+    }
+    let Value::Number(text) = inner else {
+        return None;
+    };
+    let number = crate::number::f64_of(text);
+    if number.is_finite() && number >= 0.0 && number.fract() == 0.0 && number <= u32::MAX as f64 {
+        Some(number as u32)
+    } else {
+        None
+    }
+}
+
+pub(super) fn break_failure(slot: Option<u32>) -> Failure {
+    let Some(runtime) = slot.and_then(lookup_label) else {
+        return fail("break".to_string());
+    };
+    super::builtin::raise(label_object(runtime))
+}
+
+fn eval_label(
+    slot: u32,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let (runtime, guard) = LabelGuard::enter(slot);
+    let result = eval_in(body, input, env);
+    drop(guard);
+    match result {
+        Ok(values) => Ok(values),
+        Err(failure) if is_label_hit(&failure, runtime) => Ok(failure.partial),
+        Err(failure) => Err(failure),
+    }
 }
 
 /// `reduce` keeps only a finished accumulator. `foreach` emits each step.
@@ -664,6 +852,7 @@ pub(super) fn eval_bind(
 pub(super) fn eval_fold(
     stream: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     init: &Filter,
     update: &Filter,
     extract: Option<&Filter>,
@@ -677,7 +866,7 @@ pub(super) fn eval_fold(
         false
     };
     match fold_into(
-        stream, pattern, init, update, extract, emit, input, env, &mut sink,
+        stream, pattern, alts, init, update, extract, emit, input, env, &mut sink,
     ) {
         Ok(_) => Ok(out),
         Err(failure) => Err(with_partial(out, failure)),
@@ -688,6 +877,36 @@ pub(super) fn eval_fold(
 fn fold_one(
     item: &Value,
     pattern: &Pattern,
+    alts: &[Pattern],
+    update: &Filter,
+    extract: Option<&Filter>,
+    emit: bool,
+    env: &[(String, Value)],
+    acc: &mut Value,
+    lookup: &mut Option<super::update::ObjIndex>,
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    let names = bind_name_list(pattern, alts);
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
+    for (index, pat) in pats.iter().enumerate() {
+        let last = index + 1 == pats.len();
+        match fold_pattern(
+            item, pat, &names, update, extract, emit, env, acc, lookup, sink,
+        ) {
+            Ok(stop) => return Ok(stop),
+            Err(failure) if failure.stop.is_some() || last => return Err(failure),
+            Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+fn fold_pattern(
+    item: &Value,
+    pattern: &Pattern,
+    names: &[String],
     update: &Filter,
     extract: Option<&Filter>,
     emit: bool,
@@ -698,6 +917,8 @@ fn fold_one(
 ) -> Result<bool, Failure> {
     let mut stop = false;
     let stepped = match_pat(pattern, item, env, &[], &mut |frame| {
+        let frame = with_nulls(frame, names);
+        let frame = frame.as_slice();
         if stop {
             return Ok(());
         }
@@ -778,6 +999,7 @@ fn fold_one(
 pub(super) fn fold_into(
     stream: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     init: &Filter,
     update: &Filter,
     extract: Option<&Filter>,
@@ -811,6 +1033,7 @@ pub(super) fn fold_into(
                         if fold_one(
                             &item,
                             pattern,
+                            alts,
                             update,
                             extract,
                             emit,
@@ -836,6 +1059,7 @@ pub(super) fn fold_into(
                 if fold_one(
                     item,
                     pattern,
+                    alts,
                     update,
                     extract,
                     emit,

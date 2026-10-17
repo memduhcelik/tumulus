@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+`label $name | expr` and `break $name` leave the labeled expression. Values already produced stay. `break` raises `{"__jq": n}`, counted from 0 as labels are entered, including across inputs. `try` and `?` can catch it. A label catches its own number when nothing else does. A `break` with no visible label fails to compile with `$*label-name is not defined`, and the exit status is 3. A function that is never called is not checked. `break` keeps the label that is visible where it is written.
+
+`as`, `reduce`, and `foreach` accept `?//` patterns. The next pattern runs when the current one cannot match, or when the rest of the expression fails. A name that pattern did not bind is null. `halt` is not tried again. The last failure is kept, and the exit status is 5.
+
+Of the 447 programs in jq 1.7.1's test file, 440 come out the same. The 22 new ones are lines 283, 287, 292, 299, 787, 794, 798, 802, 806, 810, 817, 824, 831, 838, 845, 852, 859, 866, 873, 880, 887, and 1903. No previously matching program was lost.
+
 `-C` forces colored JSON. `-M` turns color off, and `-M` wins when both are given. With neither, color is used when stdout is a terminal, unless `NO_COLOR` is set to a non-empty value. `JQ_COLORS` replaces the eight color slots, in order: null, false, true, numbers, strings, arrays, objects, and keys. A trailing colon does not add a slot. A bad value prints `Failed to set $JQ_COLORS` and the default colors are kept. `debug` uses those colors. `stderr` does not.
 
 `--seq` reads and writes application/json-seq. Each JSON text is preceded by an ASCII record separator. A raw string is not. Bytes before the first separator are skipped. A bad record prints `jq: ignoring parse error` and reading continues. `--raw-output0` implies `-r` and ends each output with a NUL instead of a newline. A string containing a NUL is rejected. `--unbuffered` flushes stdout after each output. `-V` and `--version` print the version and exit 0 before the filter runs.

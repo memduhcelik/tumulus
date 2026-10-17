@@ -173,6 +173,9 @@ struct Nest {
     key_err: Option<Failure>,
     take: Take,
     seen: usize,
+    /// Set while a `label` frame is on the stack. Dropped with the frame.
+    label_guard: Option<eval::LabelGuard>,
+    label_runtime: Option<u32>,
 }
 
 enum Kind {
@@ -194,6 +197,11 @@ enum Kind {
     Bind {
         expr: Rc<Filter>,
         pattern: Pattern,
+        body: Rc<Filter>,
+    },
+    /// `label $name | body`. `runtime` is this entry's `__jq` number.
+    Label {
+        slot: u32,
         body: Rc<Filter>,
     },
     Reduce {
@@ -621,10 +629,28 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             env,
             scope,
         ),
+        Filter::Bind { alts, .. } if !alts.is_empty() => {
+            fallback(machine, index, &filter, &input, &env)
+        }
+        Filter::Reduce { alts, .. } if !alts.is_empty() => {
+            fallback(machine, index, &filter, &input, &env)
+        }
+        Filter::Label { slot, body } => replace_nest(
+            machine,
+            index,
+            Kind::Label {
+                slot: *slot,
+                body: Rc::new((**body).clone()),
+            },
+            input,
+            env,
+            scope,
+        ),
         Filter::Bind {
             expr,
             pattern,
             body,
+            ..
         } => replace_nest(
             machine,
             index,
@@ -642,6 +668,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             pattern,
             init,
             update,
+            ..
         } => replace_nest(
             machine,
             index,
@@ -1497,12 +1524,18 @@ fn failed(
                     parent = next;
                 }
                 NestErr::Done => {
+                    // The nest turned the failure into success. Keep going
+                    // the way a finished child does, so a comma after a
+                    // caught break still runs.
                     let next = machine.stack[index].parent;
                     machine.stack.truncate(index);
                     if next == ROOT {
                         return Ok(Some(false));
                     }
-                    return Ok(Some(finished(machine, next, emit)?));
+                    if finished(machine, next, emit)? {
+                        return Ok(Some(true));
+                    }
+                    return Ok(None);
                 }
             },
             Halt::Drop => {
@@ -1554,6 +1587,8 @@ fn replace_nest(
         key_err: None,
         take: Take::Off,
         seen: 0,
+        label_guard: None,
+        label_runtime: None,
     }));
     Ok(Act::Cont)
 }
@@ -1639,6 +1674,13 @@ fn nest_accept(machine: &mut Machine, index: usize, value: Value) -> Result<Take
             nest.stopped_child = true;
         }
         return Ok(Taken::Cut(value));
+    }
+    let label = match &*machine.stack[index].body {
+        Body::Nest(nest) => matches!(nest.kind, Kind::Label { .. }),
+        _ => false,
+    };
+    if label {
+        return Ok(Taken::Send(value));
     }
     if bind_body {
         return Ok(Taken::Send(value));
@@ -1839,6 +1881,21 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             };
             nest_arm(machine, index, count, input);
         }
+        11 => {
+            let (slot, body) = match &*machine.stack[index].body {
+                Body::Nest(Nest {
+                    kind: Kind::Label { slot, body },
+                    ..
+                }) => (*slot, Rc::clone(body)),
+                _ => unreachable!("label"),
+            };
+            let (runtime, guard) = eval::LabelGuard::enter(slot);
+            if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                nest.label_runtime = Some(runtime);
+                nest.label_guard = Some(guard);
+            }
+            nest_arm(machine, index, body, input);
+        }
         _ => {
             let empty = match &*machine.stack[index].body {
                 Body::Nest(Nest {
@@ -1869,6 +1926,7 @@ fn kind_tag(kind: &Kind) -> u8 {
         Kind::First(_) => 8,
         Kind::Limit { .. } => 9,
         Kind::Object(_) => 10,
+        Kind::Label { .. } => 11,
     }
 }
 
@@ -1927,8 +1985,20 @@ fn nest_child_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         (9, 0) => finish_limit_count(machine, index),
         (9, _) => finish_limit_expr(machine, index),
         (10, 0) => finish_object_key(machine, index),
+        (11, _) => finish_label(machine, index),
         _ => finish_object_value(machine, index),
     }
+}
+
+fn finish_label(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let err = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.err.take(),
+        _ => None,
+    };
+    Ok(match err {
+        Some(failure) => DoneAct::Fail(failure),
+        None => DoneAct::Finish,
+    })
 }
 
 fn nest_after_stop(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
@@ -2773,6 +2843,16 @@ fn nest_on_error(
     index: usize,
     failure: &mut Failure,
 ) -> Result<NestErr, Failure> {
+    let caught_here = match &*machine.stack[index].body {
+        Body::Nest(nest) => match (&nest.kind, nest.label_runtime) {
+            (Kind::Label { .. }, Some(runtime)) => eval::is_label_hit(failure, runtime),
+            _ => false,
+        },
+        _ => false,
+    };
+    if caught_here {
+        return Ok(NestErr::Done);
+    }
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         if nest.err.is_none() {
             nest.err = Some(note(failure));

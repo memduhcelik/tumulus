@@ -124,24 +124,43 @@ pub enum Filter {
         by: Option<Box<Filter>>,
     },
     /// `expr as pattern | body`. `.` in the body is the input of this expression.
+    /// `alts` are the `?//` patterns after the first. A pattern that cannot
+    /// match, or a body that fails, tries the next one. Names that pattern
+    /// did not bind are null. Every name from every pattern is in scope.
     Bind {
         expr: Box<Filter>,
         pattern: Pattern,
+        alts: Vec<Pattern>,
         body: Box<Filter>,
     },
     Reduce {
         stream: Box<Filter>,
         pattern: Pattern,
+        alts: Vec<Pattern>,
         init: Box<Filter>,
         update: Box<Filter>,
     },
     Foreach {
         stream: Box<Filter>,
         pattern: Pattern,
+        alts: Vec<Pattern>,
         init: Box<Filter>,
         update: Box<Filter>,
         /// `None` emits each update. `Some` emits the extract instead.
         extract: Option<Box<Filter>>,
+    },
+    /// `label $name | body`. `slot` is this label. `break $name` targets the
+    /// nearest visible label of that name. `$name` is not a value binding.
+    Label {
+        slot: u32,
+        body: Box<Filter>,
+    },
+    /// `break $name`. `slot` is missing when that label is not visible.
+    /// A break that can run with no slot is a compile error.
+    Break {
+        slot: Option<u32>,
+        at: usize,
+        name: String,
     },
     /// `empty`. No outputs.
     Empty,

@@ -1035,6 +1035,8 @@ struct Tail<'a> {
     body: &'a Filter,
     orig_input: &'a Value,
     orig_input_gen: u64,
+    /// Every name bound by the pattern or a `?//` alternative.
+    names: &'a [String],
 }
 
 #[derive(Clone)]
@@ -1153,8 +1155,11 @@ fn run(
         Filter::Bind {
             expr,
             pattern,
+            alts,
             body,
-        } => run_bind(expr, pattern, body, input, path, line, input_gen, ctx),
+        } => run_bind(expr, pattern, alts, body, input, path, line, input_gen, ctx),
+        Filter::Label { slot, body } => run_label(*slot, body, input, path, line, input_gen, ctx),
+        Filter::Break { slot, .. } => Err(path_break(*slot)),
         Filter::At {
             base,
             key,
@@ -1236,6 +1241,7 @@ fn run(
             init,
             update,
             extract,
+            ..
         } => run_foreach(
             stream,
             pattern,
@@ -2358,6 +2364,7 @@ fn run_select(
 fn run_bind(
     expr: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     body: &Filter,
     input: &Value,
     path: &[Step],
@@ -2365,25 +2372,20 @@ fn run_bind(
     input_gen: u64,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
+    let mut names = Vec::new();
+    super::parse::bind_names(pattern, alts, &mut names);
     let tail = Tail {
         body,
         orig_input: input,
         orig_input_gen: input_gen,
+        names: &names,
     };
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
     if matches!(expr, Filter::Identity) {
         let carrier = carrier_now(line, input_gen);
-        return exec_pattern(
-            pattern,
-            input,
-            path,
-            line,
-            carrier,
-            input_gen,
-            &[],
-            Vec::new(),
-            &tail,
-            ctx,
-        );
+        return bind_patterns(&pats, input, path, line, carrier, input_gen, &tail, ctx);
     }
     let saved = line.get();
     let saved_path = path.to_vec();
@@ -2392,23 +2394,99 @@ fn run_bind(
     let mut out = Vec::new();
     for value in values {
         line.set(saved);
-        match exec_pattern(
-            pattern,
-            &value,
-            &saved_path,
-            line,
-            false,
-            0,
-            &[],
-            Vec::new(),
-            &tail,
-            ctx,
-        ) {
+        match bind_patterns(&pats, &value, &saved_path, line, false, 0, &tail, ctx) {
             Ok(more) => out.extend(more),
             Err(err) => return Err(attach(out, err)),
         }
     }
     finish_outs(out, err)
+}
+
+/// Each pattern in order. A failure that is not `halt` tries the next pattern.
+fn bind_patterns(
+    pats: &[&Pattern],
+    value: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    carrier: bool,
+    input_gen: u64,
+    tail: &Tail,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let mut out = Vec::new();
+    for (index, pat) in pats.iter().enumerate() {
+        let last = index + 1 == pats.len();
+        match exec_pattern(
+            pat,
+            value,
+            path,
+            line,
+            carrier,
+            input_gen,
+            &[],
+            Vec::new(),
+            tail,
+            ctx,
+        ) {
+            Ok(more) => {
+                out.extend(more);
+                return Ok(out);
+            }
+            Err(err) if err.stop.is_some() || last => return Err(attach(out, err)),
+            Err(err) => out.extend(err.partial),
+        }
+    }
+    Ok(out)
+}
+
+fn run_label(
+    slot: u32,
+    body: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let (runtime, guard) = super::eval::LabelGuard::enter(slot);
+    let result = run(body, input, path, line, input_gen, ctx);
+    drop(guard);
+    match result {
+        Ok(outs) => Ok(outs),
+        Err(err) if path_label_hit(&err, runtime) => Ok(err.partial),
+        Err(err) => Err(err),
+    }
+}
+
+fn path_break(slot: Option<u32>) -> PathErr {
+    let Some(runtime) = slot.and_then(super::eval::lookup_label) else {
+        return bare("break".to_string());
+    };
+    let value = super::eval::label_object(runtime);
+    PathErr {
+        partial: Vec::new(),
+        message: super::eval::jq_text(&value),
+        caught: Some(value),
+        stop: None,
+    }
+}
+
+fn path_label_hit(err: &PathErr, runtime: u32) -> bool {
+    if err.stop.is_some() {
+        return false;
+    }
+    match &err.caught {
+        Some(value) => super::eval::is_label_hit(
+            &Failure {
+                partial: Vec::new(),
+                message: String::new(),
+                caught: Some(value.clone()),
+                stop: None,
+            },
+            runtime,
+        ),
+        None => false,
+    }
 }
 
 fn run_at(
@@ -2914,10 +2992,15 @@ fn run_body(
     tail: &Tail,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
-    let frame: Vec<(String, Value)> = binds
+    let mut frame: Vec<(String, Value)> = binds
         .iter()
         .map(|bind| (bind.name.clone(), bind.value.clone()))
         .collect();
+    for name in tail.names {
+        if !frame.iter().any(|(bound, _)| bound == name) {
+            frame.push((name.clone(), Value::Null));
+        }
+    }
     let child_env = child_scope(&frame, ctx.env);
     let mut merged = binds.to_vec();
     merged.extend_from_slice(ctx.pbinds);

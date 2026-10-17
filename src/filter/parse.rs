@@ -196,6 +196,8 @@ pub fn reads_input(filter: &Filter) -> bool {
                     || step.as_deref().is_some_and(|step| walk(step, seen))
             }
             Filter::If { cond, yes, no } => walk(cond, seen) || walk(yes, seen) || walk(no, seen),
+            Filter::Label { body, .. } => walk(body, seen),
+            Filter::Break { .. } => false,
             Filter::Bind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
             Filter::Reduce {
                 stream,
@@ -568,30 +570,39 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         Filter::Bind {
             expr,
             pattern,
+            alts,
             body,
         } => {
             check_vars(expr, scope)?;
             check_pattern(pattern, scope)?;
+            for alt in alts {
+                check_pattern(alt, scope)?;
+            }
             let mut inner = scope.to_vec();
-            pattern_names(pattern, &mut inner);
+            bind_names(pattern, alts, &mut inner);
             check_vars(body, &inner)
         }
         Filter::Reduce {
             stream,
             pattern,
+            alts,
             init,
             update,
         } => {
             check_vars(stream, scope)?;
             check_vars(init, scope)?;
             check_pattern(pattern, scope)?;
+            for alt in alts {
+                check_pattern(alt, scope)?;
+            }
             let mut inner = scope.to_vec();
-            pattern_names(pattern, &mut inner);
+            bind_names(pattern, alts, &mut inner);
             check_vars(update, &inner)
         }
         Filter::Foreach {
             stream,
             pattern,
+            alts,
             init,
             update,
             extract,
@@ -599,14 +610,19 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             check_vars(stream, scope)?;
             check_vars(init, scope)?;
             check_pattern(pattern, scope)?;
+            for alt in alts {
+                check_pattern(alt, scope)?;
+            }
             let mut inner = scope.to_vec();
-            pattern_names(pattern, &mut inner);
+            bind_names(pattern, alts, &mut inner);
             check_vars(update, &inner)?;
             if let Some(extract) = extract {
                 check_vars(extract, &inner)?;
             }
             Ok(())
         }
+        Filter::Label { body, .. } => check_vars(body, scope),
+        Filter::Break { .. } => Ok(()),
     }
 }
 
@@ -915,6 +931,13 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         Filter::Unresolved {
             at, name, arity, ..
         } => errors.push((*at, format!("{name}/{arity} is not defined"))),
+        Filter::Label { body, .. } => walk_defs(body, seen, errors),
+        Filter::Break {
+            slot: None,
+            at,
+            name,
+        } => errors.push((*at, format!("$*label-{name} is not defined"))),
+        Filter::Break { slot: Some(_), .. } => {}
     }
 }
 
@@ -1398,6 +1421,13 @@ fn with_stream_arg(source: &str, arg: Box<Filter>) -> Filter {
     filter
 }
 
+pub(super) fn bind_names(pattern: &Pattern, alts: &[Pattern], out: &mut Vec<String>) {
+    pattern_names(pattern, out);
+    for alt in alts {
+        pattern_names(alt, out);
+    }
+}
+
 pub(super) fn pattern_names(pattern: &Pattern, out: &mut Vec<String>) {
     match pattern {
         Pattern::Var(name) => out.push(name.clone()),
@@ -1445,6 +1475,9 @@ pub(super) struct Parser<'a> {
     tail_missing: bool,
     /// Imports and includes, loaded after the whole preamble is read.
     pending: Vec<PendingImport>,
+    /// Visible `label` names, inner ones at the back. The number is the slot.
+    labels: Vec<(String, u32)>,
+    next_slot: u32,
 }
 
 struct PendingImport {
@@ -1481,6 +1514,8 @@ impl<'a> Parser<'a> {
             data: Vec::new(),
             tail_missing: false,
             pending: Vec::new(),
+            labels: Vec::new(),
+            next_slot: 0,
         }
     }
 
@@ -1556,6 +1591,7 @@ impl<'a> Parser<'a> {
             body = Filter::Bind {
                 expr: Box::new(Filter::Literal(value.clone())),
                 pattern: Pattern::Var(name.clone()),
+                alts: Vec::new(),
                 body: Box::new(body),
             };
         }
@@ -1894,7 +1930,7 @@ impl<'a> Parser<'a> {
         if !self.eat_keyword("as") {
             return Ok(left);
         }
-        let pattern = self.parse_pattern()?;
+        let (pattern, alts) = self.parse_pattern_alts()?;
         if !self.eat('|') {
             return Err(ProgramError::Syntax);
         }
@@ -1902,6 +1938,7 @@ impl<'a> Parser<'a> {
         Ok(Filter::Bind {
             expr: Box::new(left),
             pattern,
+            alts,
             body: Box::new(body),
         })
     }
@@ -2055,6 +2092,8 @@ impl<'a> Parser<'a> {
                 "reduce" if !self.reject_block => return self.parse_fold(false),
                 "foreach" if !self.reject_block => return self.parse_fold(true),
                 "try" if !self.reject_block && !self.reject_try => return self.parse_try(),
+                "label" if !self.reject_block && !self.reject_try => return self.parse_label(),
+                "break" => return self.parse_break(at),
                 "true" => return Ok(Filter::Literal(Value::Bool(true))),
                 "false" => return Ok(Filter::Literal(Value::Bool(false))),
                 "null" => return Ok(Filter::Literal(Value::Null)),
@@ -2289,7 +2328,7 @@ impl<'a> Parser<'a> {
         if !self.eat_keyword("as") {
             return Err(ProgramError::Syntax);
         }
-        let pattern = self.parse_pattern()?;
+        let (pattern, alts) = self.parse_pattern_alts()?;
         if !self.eat('(') {
             return Err(ProgramError::Syntax);
         }
@@ -2315,6 +2354,7 @@ impl<'a> Parser<'a> {
             Ok(Filter::Foreach {
                 stream,
                 pattern,
+                alts,
                 init,
                 update,
                 extract,
@@ -2323,10 +2363,76 @@ impl<'a> Parser<'a> {
             Ok(Filter::Reduce {
                 stream,
                 pattern,
+                alts,
                 init,
                 update,
             })
         }
+    }
+
+    /// The first pattern, then each `?//` pattern.
+    fn parse_pattern_alts(&mut self) -> Result<(Pattern, Vec<Pattern>), ProgramError> {
+        let pattern = self.parse_pattern()?;
+        let mut alts = Vec::new();
+        while self.eat_question_alt() {
+            alts.push(self.parse_pattern()?);
+        }
+        Ok((pattern, alts))
+    }
+
+    /// `?//` between patterns. A lone `?` or `//` stays what it was.
+    fn eat_question_alt(&mut self) -> bool {
+        self.skip_ws();
+        let rest = &self.src[self.index..];
+        if rest.starts_with("?//") {
+            self.index += 3;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `label $name | body`. The name is visible in the body and nowhere after it.
+    fn parse_label(&mut self) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if !self.eat('$') {
+            return Err(ProgramError::Syntax);
+        }
+        let name = self.ident()?;
+        if name == "__loc__" {
+            return Err(ProgramError::Syntax);
+        }
+        if !self.eat('|') {
+            return Err(ProgramError::Syntax);
+        }
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.labels.push((name, slot));
+        let body = self.parse_pipe();
+        self.labels.pop();
+        Ok(Filter::Label {
+            slot,
+            body: Box::new(body?),
+        })
+    }
+
+    /// `break $name`. The slot is filled when a label of that name is visible.
+    fn parse_break(&mut self, at: usize) -> Result<Filter, ProgramError> {
+        self.skip_ws();
+        if !self.eat('$') {
+            return Err(ProgramError::Syntax);
+        }
+        let name = self.ident()?;
+        if name == "__loc__" {
+            return Err(ProgramError::Syntax);
+        }
+        let slot = self
+            .labels
+            .iter()
+            .rev()
+            .find(|(bound, _)| bound == &name)
+            .map(|(_, slot)| *slot);
+        Ok(Filter::Break { slot, at, name })
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ProgramError> {
@@ -2506,7 +2612,7 @@ impl<'a> Parser<'a> {
         if !self.eat_keyword("as") {
             return Ok(filter);
         }
-        let pattern = self.parse_pattern()?;
+        let (pattern, alts) = self.parse_pattern_alts()?;
         if !self.eat('|') {
             return Err(ProgramError::Syntax);
         }
@@ -2514,6 +2620,7 @@ impl<'a> Parser<'a> {
         Ok(Filter::Bind {
             expr: Box::new(filter),
             pattern,
+            alts,
             body: Box::new(body),
         })
     }

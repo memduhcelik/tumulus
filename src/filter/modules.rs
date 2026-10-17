@@ -270,6 +270,7 @@ pub(super) fn wrap_data(mut body: Filter, binds: &[(String, Value)]) -> Filter {
         body = Filter::Bind {
             expr: Box::new(Filter::Literal(value.clone())),
             pattern: Pattern::Var(name.clone()),
+            alts: Vec::new(),
             body: Box::new(body),
         };
     }

@@ -240,12 +240,14 @@ fn drive(
         Filter::Foreach {
             stream,
             pattern,
+            alts,
             init,
             update,
             extract,
         } => eval::fold_into(
             stream,
             pattern,
+            alts,
             init,
             update,
             extract.as_deref(),
@@ -254,6 +256,8 @@ fn drive(
             env,
             &mut |value| emit.call(value),
         ),
+        Filter::Label { slot, body } => drive_label(*slot, body, input, env, emit),
+        Filter::Break { slot, .. } => Err(eval::break_failure(*slot)),
         Filter::Call { .. } | Filter::Param(_) => {
             let mut forward = |value| emit.call(&value);
             super::machine::run(filter, input, env, &mut forward)
@@ -388,6 +392,30 @@ fn for_each(
         return Err(err);
     }
     result
+}
+
+fn drive_label(
+    slot: u32,
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    let (runtime, guard) = eval::LabelGuard::enter(slot);
+    let result = drive(body, input, env, emit);
+    drop(guard);
+    match result {
+        Ok(stopped) => Ok(stopped),
+        Err(failure) if eval::is_label_hit(&failure, runtime) => {
+            for value in &failure.partial {
+                if emit.call(value) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(failure) => Err(failure),
+    }
 }
 
 fn relay(result: Result<Vec<Value>, Failure>, emit: &Emit) -> Result<bool, Failure> {
