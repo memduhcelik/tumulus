@@ -5,9 +5,9 @@ use std::process;
 
 use tumulus::{
     bind_source, compile_with, environ_now, eval_stream, location, next_main, open_failed,
-    parse_stream, program_stream, program_stream_with, reads_input, render, set_environ,
-    set_unknown, Error, Failure, Filter, Indent, Layout, MainNext, ProgramError, Source, Style,
-    Value,
+    parse_stream, program_stream, program_stream_with, reads_input, render, set_dump_flags,
+    set_environ, set_input_line, set_prog_origin, set_unknown, Error, Failure, Filter, Indent,
+    Layout, MainNext, ProgramError, Source, Style, Value,
 };
 
 fn main() {
@@ -44,6 +44,25 @@ fn reset_sigpipe() {
     }
 }
 
+/// Directory of a `-f` program, or the current directory when the program is an argument.
+fn program_origin(program: &Program) -> String {
+    let fallback = || {
+        env::current_dir()
+            .ok()
+            .and_then(|path| fs::canonicalize(&path).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string())
+    };
+    match program {
+        Program::Text(_) => fallback(),
+        Program::File(path) => fs::canonicalize(path)
+            .ok()
+            .and_then(|full| full.parent().map(|dir| dir.to_string_lossy().into_owned()))
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(fallback),
+    }
+}
+
 fn run(out: &mut dyn Write) -> Result<i32, Error> {
     let options = options()?;
     let source = match &options.program {
@@ -70,6 +89,9 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
     };
     let environ = environ_now();
     set_environ(environ.clone());
+    set_dump_flags(options.style.ascii, options.style.sort_keys);
+    set_prog_origin(program_origin(&options.program));
+    set_input_line(0);
     let env = initial_env(&options.named, &options.positional, &environ);
     let mut run = Run::new();
     // `input` reads the same stream the main loop walks.
@@ -212,6 +234,7 @@ fn apply(
     let parsed = parse_stream(bytes)?;
     let mut failed = false;
     for item in &parsed.values {
+        set_input_line(item.line);
         match run_program(program, &item.value, env, style, run, out)? {
             Ok(()) => failed = false,
             Err(failure) => {
@@ -312,6 +335,7 @@ fn apply_null(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
+    set_input_line(0);
     match run_program(program, &Value::Null, env, style, run, out)? {
         Ok(()) => run.status = 0,
         Err(failure) => {
@@ -448,6 +472,7 @@ fn apply_slurp(
             if run.stopped {
                 break;
             }
+            set_input_line(item.line);
             let place = if item.unknown {
                 "<unknown>".to_string()
             } else {
@@ -470,6 +495,7 @@ fn apply_slurp(
         return Ok(());
     }
     let input = Value::array(parsed.values.into_iter().map(|item| item.value).collect());
+    set_input_line(at.line);
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
     run.status = stopped_status(run, missing, failed);
     Ok(())
@@ -513,6 +539,7 @@ fn apply_raw_slurp(
         }
     }
     let input = Value::String(decode_raw(&buf));
+    set_input_line(at.line);
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
     run.status = stopped_status(run, missing, failed);
     Ok(())
@@ -555,6 +582,7 @@ fn apply_raw(
                         line += 1;
                         let text = decode_raw(&pending);
                         pending.clear();
+                        set_input_line(line);
                         last_failed = emit(
                             program,
                             &Value::String(text),
@@ -582,6 +610,7 @@ fn apply_raw(
         }
     }
     if !stop && !pending.is_empty() {
+        set_input_line(at.line);
         last_failed = emit(
             program,
             &Value::String(decode_raw(&pending)),

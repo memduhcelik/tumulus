@@ -19,6 +19,10 @@ use crate::Error;
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
     static ENVIRON: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static INPUT_LINE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DUMP_ASCII: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DUMP_SORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROG_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// What `input` got from the stream.
@@ -72,6 +76,44 @@ pub fn here(line: usize) -> Value {
         ("file".to_string(), Value::String("<top-level>".to_string())),
         ("line".to_string(), Value::Number(line.to_string())),
     ])
+}
+
+pub fn set_input_line(line: usize) {
+    INPUT_LINE.with(|slot| slot.set(line));
+}
+
+pub fn input_line_value() -> Value {
+    Value::Number(INPUT_LINE.with(|slot| slot.get()).to_string())
+}
+
+pub fn set_dump_flags(ascii: bool, sort_keys: bool) {
+    DUMP_ASCII.with(|slot| slot.set(ascii));
+    DUMP_SORT.with(|slot| slot.set(sort_keys));
+}
+
+pub fn dump_flags() -> (bool, bool) {
+    (
+        DUMP_ASCII.with(|slot| slot.get()),
+        DUMP_SORT.with(|slot| slot.get()),
+    )
+}
+
+pub fn set_prog_origin(origin: String) {
+    PROG_ORIGIN.with(|slot| *slot.borrow_mut() = origin);
+}
+
+pub fn prog_origin() -> String {
+    PROG_ORIGIN.with(|slot| slot.borrow().clone())
+}
+
+/// Directory of `argv[0]`. A name with no slash is `.`, and symlinks stay unresolved.
+pub fn jq_origin() -> String {
+    let arg0 = std::env::args().next().unwrap_or_default();
+    let path = std::path::Path::new(&arg0);
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_string_lossy().into_owned(),
+        _ => ".".to_string(),
+    }
 }
 
 pub fn input_filename() -> Value {
@@ -897,6 +939,7 @@ impl Session {
     fn note(&mut self, name: &str, line: usize) {
         self.yielded = Some(name.to_string());
         self.at = format!("{name}:{line}");
+        set_input_line(line);
     }
 
     fn mark_break(&mut self) {

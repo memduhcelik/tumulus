@@ -5,6 +5,7 @@ mod builtin;
 mod eval;
 mod func;
 mod machine;
+mod names;
 mod parse;
 mod sort;
 mod stream;

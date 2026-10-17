@@ -12,8 +12,9 @@ mod value;
 
 pub use error::Error;
 pub use feed::{
-    bind_source, environ_now, location, next_main, open_failed, set_environ, set_unknown,
-    streaming, MainNext, Source, SourceGuard,
+    bind_source, environ_now, jq_origin, location, next_main, open_failed, set_dump_flags,
+    set_environ, set_input_line, set_prog_origin, set_unknown, streaming, MainNext, Source,
+    SourceGuard,
 };
 pub use filter::{
     compile, compile_with, eval, eval_stream, eval_with, reads_input, Failure, Filter, ProgramError,

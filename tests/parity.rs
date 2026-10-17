@@ -9372,3 +9372,199 @@ fn eight_match_jq() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `debug`, `stderr`, `input_line_number`, `builtins`, `finites`, `normals`,
+/// `get_jq_origin`, and `get_prog_origin`.
+#[test]
+fn report_match_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("debug null", &["-nc", "debug"], b""),
+        ("debug number", &["-c", "debug"], b"1\n"),
+        ("debug pretty", &["debug"], b"{\"b\":1,\"a\":2}\n"),
+        ("debug compact", &["-c", "debug"], b"{\"b\":1,\"a\":2}\n"),
+        ("debug string", &["-c", "debug"], b"\"hi\"\n"),
+        ("debug sorted", &["-S", "debug"], b"{\"b\":1,\"a\":2}\n"),
+        ("debug raw", &["-r", "debug"], b"\"hi\"\n"),
+        ("debug join", &["-j", "debug"], b"\"hi\"\n"),
+        ("debug tab", &["--tab", "debug"], b"{\"a\":1}\n"),
+        ("debug both", &["-cS", "debug"], b"{\"b\":1,\"a\":2}\n"),
+        ("debug ascii", &["-anc", "\"é\"|debug"], b""),
+        ("stderr ascii", &["-anc", "{\"b\":\"é\"}|stderr"], b""),
+        ("debug message", &["-nc", "1|debug(\"x\")"], b""),
+        ("debug messages", &["-nc", "1|debug(1,2)"], b""),
+        ("debug empty msg", &["-nc", "1|debug(empty)"], b""),
+        ("debug pipe", &["-nc", "1|debug|.+1"], b""),
+        ("debug array", &["-nc", "[1|debug]"], b""),
+        ("debug two", &["-nc", "(1,2)|debug"], b""),
+        ("debug try", &["-nc", "try debug catch \"c\""], b""),
+        ("debug error", &["-nc", "debug(error(\"z\"))"], b""),
+        ("debug arity", &["-nc", "debug(\"A\";\"B\")"], b""),
+        ("debug false", &["-nc", "false|debug"], b""),
+        ("debug blank", &["-nc", "\"\"|debug"], b""),
+        ("debug newline", &["-nc", "\"a\\nb\"|debug"], b""),
+        ("debug nul", &["-nc", "\"a\\u0000b\"|debug"], b""),
+        ("debug nan", &["-nc", "nan|debug"], b""),
+        ("stderr number", &["-nc", "1|stderr"], b""),
+        ("stderr string", &["-c", "stderr"], b"\"hi\"\n"),
+        ("stderr pretty", &["stderr"], b"{\"b\":1,\"a\":2}\n"),
+        ("stderr compact", &["-c", "stderr"], b"{\"b\":1,\"a\":2}\n"),
+        ("stderr sorted", &["-S", "stderr"], b"{\"b\":1,\"a\":2}\n"),
+        ("stderr raw", &["-r", "stderr"], b"\"hi\"\n"),
+        ("stderr newline", &["-nc", "\"a\\nb\"|stderr"], b""),
+        ("stderr quote", &["-nc", "\"say \\\"hi\\\"\"|stderr"], b""),
+        ("stderr blank", &["-nc", "\"\"|stderr"], b""),
+        ("stderr true", &["-nc", "true|stderr"], b""),
+        ("stderr pipe", &["-nc", "1|stderr|.+1"], b""),
+        ("stderr two", &["-nc", "(1,\"a\")|stderr"], b""),
+        ("stderr nan", &["-nc", "nan|stderr"], b""),
+        ("stderr inf", &["-nc", "infinite|stderr"], b""),
+        ("stderr nul", &["-nc", "\"a\\u0000b\"|stderr"], b""),
+        ("stderr empty", &["-nc", "empty|stderr"], b""),
+        ("line none", &["-n", "input_line_number"], b""),
+        ("line one", &["-c", "input_line_number"], b"1\n"),
+        ("line two", &["-c", "input_line_number"], b"1\n2\n"),
+        ("line no nl", &["-c", "input_line_number"], b"1"),
+        ("line blank", &["-c", "input_line_number"], b"1\n\n2\n"),
+        ("line cut", &["-c", "input_line_number"], b"1\n2"),
+        (
+            "line object",
+            &["-c", ".|input_line_number"],
+            b"{\"a\":1,\n\"b\":2}\n3\n",
+        ),
+        ("line raw", &["-Rc", "input_line_number"], b"a\nb\n"),
+        ("line raw cut", &["-Rc", "input_line_number"], b"a\nb"),
+        ("line slurp", &["-sc", "input_line_number"], b"1\n2\n"),
+        ("line slurp cut", &["-sc", "input_line_number"], b"1\n2"),
+        ("line slurp empty", &["-sc", "input_line_number"], b""),
+        (
+            "line inputs",
+            &["-nc", "inputs|input_line_number"],
+            b"1\n2\n3\n",
+        ),
+        (
+            "line input",
+            &["-c", "input_line_number, input|input_line_number"],
+            b"1\n2\n",
+        ),
+        (
+            "line twice",
+            &["-c", "input_line_number, input_line_number"],
+            b"1\n2\n",
+        ),
+        (
+            "line after inputs",
+            &["-nc", "[inputs]|length, input_line_number"],
+            b"1\n2\n",
+        ),
+        (
+            "line stream",
+            &["-c", "--stream", "input_line_number"],
+            b"[1,2]\n",
+        ),
+        ("line raw slurp", &["-Rsc", "input_line_number"], b"a\nb\n"),
+        ("builtins", &["-nc", "builtins"], b""),
+        ("builtins length", &["-c", "builtins|length"], b"5\n"),
+        ("builtins long", &["-nc", "builtins|length > 10"], b""),
+        (
+            "builtins arity",
+            &["-nc", "\"-1\"|IN(builtins[]/\"/\"|.[1])"],
+            b"",
+        ),
+        (
+            "builtins nums",
+            &["-nc", "all(builtins[]/\"/\"; .[1]|tonumber >= 0)"],
+            b"",
+        ),
+        (
+            "builtins under",
+            &["-nc", "builtins|any(.[:1]==\"_\")"],
+            b"",
+        ),
+        (
+            "finites",
+            &["-nc", "(1,nan,infinite,0,\"a\",null)|finites"],
+            b"",
+        ),
+        (
+            "normals",
+            &["-nc", "(1,-1,0,nan,infinite,1.5,1e-320)|normals"],
+            b"",
+        ),
+        (
+            "isfinite",
+            &["-nc", "[1,nan,infinite,0]|map(isfinite)"],
+            b"",
+        ),
+        ("isfinite text", &["-nc", "\"a\"|isfinite"], b""),
+        ("isfinite zero", &["-nc", "(-0)|isfinite"], b""),
+        ("normals array", &["-nc", "[1,0,nan]|normals"], b""),
+        ("prog origin", &["-n", "get_prog_origin"], b""),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("report-span-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let prog = dir.join("prog.jq");
+    let nested = dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(&prog, "get_prog_origin\n").unwrap();
+    fs::write(nested.join("prog.jq"), "get_prog_origin\n").unwrap();
+    let left = dir.join("left.json");
+    let right = dir.join("right.json");
+    let cut = dir.join("cut.json");
+    fs::write(&left, b"1\n2\n").unwrap();
+    fs::write(&right, b"3\n").unwrap();
+    fs::write(&cut, b"1\n2").unwrap();
+    compare_exact(
+        "prog origin file",
+        &["-n", "-f", prog.to_str().unwrap()],
+        b"",
+    );
+    compare_exact(
+        "line files",
+        &[
+            "-c",
+            "input_line_number",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+        b"",
+    );
+    compare_exact(
+        "line slurp files",
+        &[
+            "-sc",
+            "input_line_number",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+        b"",
+    );
+    compare_exact(
+        "line cut file",
+        &["-c", "input_line_number", cut.to_str().unwrap()],
+        b"",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let origin = Path::new(bin)
+        .parent()
+        .and_then(|dir| dir.to_str())
+        .expect("binary directory");
+    let got = run(bin, &["-n".to_string(), "get_jq_origin".to_string()], b"");
+    let quoted = format!("\"{origin}\"\n");
+    assert_eq!(
+        got.stdout,
+        quoted.as_bytes(),
+        "get_jq_origin should be the directory of the invoked binary"
+    );
+    assert!(got.stderr.is_empty());
+    assert_eq!(got.status.code(), Some(0));
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -26,6 +26,56 @@ pub(super) fn raise(value: Value) -> Failure {
     }
 }
 
+pub(super) fn eval_debug(input: &Value) -> Result<Vec<Value>, Failure> {
+    let wrapped = Value::array(vec![Value::String("DEBUG:".to_string()), input.clone()]);
+    let (ascii, sort_keys) = crate::feed::dump_flags();
+    let style = crate::print::Style {
+        layout: crate::print::Layout::Compact,
+        raw: false,
+        join: false,
+        ascii,
+        sort_keys,
+    };
+    let mut bytes = crate::print::render(&wrapped, style).into_bytes();
+    bytes.push(b'\n');
+    write_err(&bytes);
+    Ok(vec![input.clone()])
+}
+
+pub(super) fn eval_stderr(input: &Value) -> Result<Vec<Value>, Failure> {
+    let bytes = match input {
+        Value::String(text) => text.as_bytes().to_vec(),
+        other => {
+            let style = crate::print::Style {
+                layout: crate::print::Layout::Compact,
+                raw: false,
+                join: false,
+                ascii: false,
+                sort_keys: false,
+            };
+            crate::print::render(other, style).into_bytes()
+        }
+    };
+    write_err(&bytes);
+    Ok(vec![input.clone()])
+}
+
+fn write_err(bytes: &[u8]) {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = err.write_all(bytes);
+    let _ = err.flush();
+}
+
+pub(super) fn builtins_value() -> Value {
+    Value::array(
+        super::names::BUILTINS
+            .iter()
+            .map(|name| Value::String((*name).to_string()))
+            .collect(),
+    )
+}
+
 pub(super) fn eval_num_test(kind: NumTest, input: &Value) -> Result<Vec<Value>, Failure> {
     let flag = match input {
         Value::Number(text) => {
@@ -34,6 +84,8 @@ pub(super) fn eval_num_test(kind: NumTest, input: &Value) -> Result<Vec<Value>, 
                 NumTest::Nan => n.is_nan(),
                 NumTest::Infinite => n.is_infinite(),
                 NumTest::Normal => n.is_normal(),
+                // jq's `isfinite` is `type == "number" and (isinfinite | not)`.
+                NumTest::Finite => !n.is_infinite(),
             }
         }
         _ => false,

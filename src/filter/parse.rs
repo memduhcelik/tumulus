@@ -62,6 +62,12 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Pow10
             | Filter::NumTest(_)
             | Filter::Halt
+            | Filter::Debug
+            | Filter::Stderr
+            | Filter::InputLine
+            | Filter::Builtins
+            | Filter::JqOrigin
+            | Filter::ProgOrigin
             | Filter::Error
             | Filter::First(None)
             | Filter::Last(None)
@@ -271,6 +277,12 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::Pow10
         | Filter::NumTest(_)
         | Filter::Halt
+        | Filter::Debug
+        | Filter::Stderr
+        | Filter::InputLine
+        | Filter::Builtins
+        | Filter::JqOrigin
+        | Filter::ProgOrigin
         | Filter::Error
         | Filter::First(None)
         | Filter::Last(None)
@@ -603,6 +615,12 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Pow10
         | Filter::NumTest(_)
         | Filter::Halt
+        | Filter::Debug
+        | Filter::Stderr
+        | Filter::InputLine
+        | Filter::Builtins
+        | Filter::JqOrigin
+        | Filter::ProgOrigin
         | Filter::Error
         | Filter::First(None)
         | Filter::Last(None)
@@ -871,7 +889,10 @@ fn is_builtin(name: &str, arity: usize) -> bool {
             arity <= 1
         }
         "pick" => arity == 1,
-        "isnan" | "isinfinite" | "isnormal" | "halt" | "transpose" => arity == 0,
+        "isnan" | "isinfinite" | "isnormal" | "isfinite" | "halt" | "transpose" | "stderr"
+        | "input_line_number" | "builtins" | "finites" | "normals" | "get_jq_origin"
+        | "get_prog_origin" => arity == 0,
+        "debug" => arity <= 1,
         "any" | "all" => arity <= 2,
         "IN" | "INDEX" => arity == 1 || arity == 2,
         "recurse" => arity <= 2,
@@ -1103,7 +1124,19 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "isnan" => Filter::NumTest(NumTest::Nan),
         "isinfinite" => Filter::NumTest(NumTest::Infinite),
         "isnormal" => Filter::NumTest(NumTest::Normal),
+        "isfinite" => Filter::NumTest(NumTest::Finite),
         "halt" => Filter::Halt,
+        "debug" => match args.next() {
+            None => Filter::Debug,
+            Some(msgs) => with_stream_arg(DEBUG_MSGS, msgs),
+        },
+        "stderr" => Filter::Stderr,
+        "input_line_number" => Filter::InputLine,
+        "builtins" => Filter::Builtins,
+        "finites" => compile_stream(FINITES),
+        "normals" => compile_stream(NORMALS),
+        "get_jq_origin" => Filter::JqOrigin,
+        "get_prog_origin" => Filter::ProgOrigin,
         "halt_error" => match args.next() {
             None => compile_stream(HALT_ERROR),
             Some(code) => Filter::HaltError(code),
@@ -1129,6 +1162,15 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         },
     }
 }
+
+/// `debug(msgs)` prints each message and then yields the input.
+const DEBUG_MSGS: &str = "def debug(msgs): (msgs | debug | empty), .; debug(null)";
+
+/// `finites` keeps numbers that are not infinite. `nan` stays.
+const FINITES: &str = "def finites: select(isfinite); finites";
+
+/// `normals` keeps finite nonzero normal numbers.
+const NORMALS: &str = "def normals: select(isnormal); normals";
 
 /// `halt_error` with no argument is exit status 5.
 const HALT_ERROR: &str = "def halt_error: halt_error(5); halt_error";

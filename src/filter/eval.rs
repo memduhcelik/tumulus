@@ -215,6 +215,12 @@ pub(super) fn produce(
         Filter::NumTest(kind) => super::builtin::eval_num_test(*kind, input),
         Filter::Halt => Err(super::builtin::stop_quiet()),
         Filter::HaltError(code) => super::builtin::eval_halt_error(code, input, env),
+        Filter::Debug => super::builtin::eval_debug(input),
+        Filter::Stderr => super::builtin::eval_stderr(input),
+        Filter::InputLine => Ok(vec![crate::feed::input_line_value()]),
+        Filter::Builtins => Ok(vec![super::builtin::builtins_value()]),
+        Filter::JqOrigin => Ok(vec![Value::String(crate::feed::jq_origin())]),
+        Filter::ProgOrigin => Ok(vec![Value::String(crate::feed::prog_origin())]),
         Filter::Pow10 => Err(raise(Value::String(
             "Error: pow10/0 not found at build time".to_string(),
         ))),

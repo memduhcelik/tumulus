@@ -260,6 +260,18 @@ pub enum Filter {
     Halt,
     /// `halt_error(code)`. `code` runs on the input. The first number stops the program.
     HaltError(Box<Filter>),
+    /// `debug`. Writes `["DEBUG:", value]` to stderr and returns the value.
+    Debug,
+    /// `stderr`. Writes the value to stderr without a newline and returns it.
+    Stderr,
+    /// `input_line_number`. Newlines the reader has consumed for this value.
+    InputLine,
+    /// `builtins`. Every builtin name and arity, in jq's order.
+    Builtins,
+    /// `get_jq_origin`. Directory of the invoked executable.
+    JqOrigin,
+    /// `get_prog_origin`. Directory of the `-f` program, or the current directory.
+    ProgOrigin,
     /// `error` with no argument. Raises the current input.
     Error,
     /// `error(expr)`. A call written after it is a syntax error.
@@ -443,6 +455,8 @@ pub enum NumTest {
     Nan,
     Infinite,
     Normal,
+    /// A number that is not infinite. `nan` counts.
+    Finite,
 }
 
 /// `halt` or `halt_error`. `try` does not catch it.
