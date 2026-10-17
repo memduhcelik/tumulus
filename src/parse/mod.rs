@@ -59,12 +59,19 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
     Ok(())
 }
 
-/// A NUL with no newline after it ends the input there. Bytes past it are
-/// not parsed. A NUL earlier on a line is handled while scanning that token.
+/// macOS jq ends the input at a NUL that has no newline after it.
+/// Linux jq keeps the later bytes; the NUL only ends that token.
 pub(crate) fn nul_cut(bytes: &[u8]) -> usize {
-    match bytes.iter().rposition(|byte| *byte == 0) {
-        Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
-        _ => bytes.len(),
+    #[cfg(target_os = "macos")]
+    {
+        match bytes.iter().rposition(|byte| *byte == 0) {
+            Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
+            _ => bytes.len(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bytes.len()
     }
 }
 

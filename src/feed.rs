@@ -493,8 +493,11 @@ impl Session {
 
     fn release(&mut self) {
         let finished = self.input_eof && !self.blocked && self.drive.stack_empty();
+        // A parse error stops the input. A closer staged before that error
+        // has already happened, so it is not still waiting to see EOF.
+        let flush = finished || self.fault.is_some();
         while let Some(front) = self.staging.front() {
-            let hold = !finished && self.staging.len() == 1 && self.might_detach(&front.value);
+            let hold = !flush && self.staging.len() == 1 && self.might_detach(&front.value);
             if hold || !self.item_ready(front.end, front.atom) {
                 break;
             }
