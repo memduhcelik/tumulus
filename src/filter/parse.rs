@@ -120,6 +120,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::StrpTime(inner)
             | Filter::Raise(inner)
             | Filter::HaltError(inner)
+            | Filter::FormatBy(inner)
             | Filter::PathOf(inner)
             | Filter::GetPath(inner)
             | Filter::DelPaths(inner)
@@ -351,7 +352,8 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
         | Filter::StrfLocalTime(inner)
         | Filter::StrpTime(inner)
         | Filter::Raise(inner)
-        | Filter::HaltError(inner) => check_vars(inner, scope),
+        | Filter::HaltError(inner)
+        | Filter::FormatBy(inner) => check_vars(inner, scope),
         Filter::Flatten(inner) => match inner {
             Some(inner) => check_vars(inner, scope),
             None => Ok(()),
@@ -688,6 +690,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::StrpTime(inner)
         | Filter::Raise(inner)
         | Filter::HaltError(inner)
+        | Filter::FormatBy(inner)
         | Filter::PathOf(inner)
         | Filter::GetPath(inner)
         | Filter::DelPaths(inner)
@@ -891,8 +894,10 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         "pick" => arity == 1,
         "isnan" | "isinfinite" | "isnormal" | "isfinite" | "halt" | "transpose" | "stderr"
         | "input_line_number" | "builtins" | "finites" | "normals" | "get_jq_origin"
-        | "get_prog_origin" => arity == 0,
+        | "get_prog_origin" | "reverse" | "fromdateiso8601" | "todateiso8601" => arity == 0,
         "debug" => arity <= 1,
+        "in" | "bsearch" | "format" => arity == 1,
+        "JOIN" => (2..=4).contains(&arity),
         "any" | "all" => arity <= 2,
         "IN" | "INDEX" => arity == 1 || arity == 2,
         "recurse" => arity <= 2,
@@ -1137,6 +1142,13 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "normals" => compile_stream(NORMALS),
         "get_jq_origin" => Filter::JqOrigin,
         "get_prog_origin" => Filter::ProgOrigin,
+        "reverse" => compile_stream(REVERSE),
+        "in" => with_stream_arg(IN_VALUE, args.next().expect("in")),
+        "bsearch" => with_stream_arg(BSEARCH, args.next().expect("bsearch")),
+        "format" => Filter::FormatBy(args.next().expect("format")),
+        "fromdateiso8601" => compile_stream(FROM_ISO),
+        "todateiso8601" => compile_stream(TO_ISO),
+        "JOIN" => with_call_args(join_source(args.len()), unbox_keep(args)),
         "halt_error" => match args.next() {
             None => compile_stream(HALT_ERROR),
             Some(code) => Filter::HaltError(code),
@@ -1161,6 +1173,46 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
             ),
         },
     }
+}
+
+const REVERSE: &str = "def reverse: [.[length - 1 - range(0;length)]]; reverse";
+
+const IN_VALUE: &str = "def in(xs): . as $x | xs | has($x); in(null)";
+
+const BSEARCH: &str = "def bsearch($target): if length == 0 then -1 elif length == 1 then if $target == .[0] then 0 elif $target < .[0] then -1 else -2 end else . as $in | [0, length-1, null] | until(.[0] > .[1]; if .[2] != null then (.[1] = -1) else (((.[1] + .[0]) / 2) | floor) as $mid | $in[$mid] as $monkey | if $monkey == $target then (.[2] = $mid) elif .[0] == .[1] then (.[1] = -1) elif $monkey < $target then (.[0] = ($mid + 1)) else (.[1] = ($mid - 1)) end end) | if .[2] == null then if $in[.[0]] < $target then (-2 - .[0]) else (-1 - .[0]) end else .[2] end end; bsearch(null)";
+
+const JOIN2: &str = "def JOIN($idx; idx_expr): [.[] | [., $idx[idx_expr]]]; JOIN(null; null)";
+const JOIN3: &str =
+    "def JOIN($idx; stream; idx_expr): stream | [., $idx[idx_expr]]; JOIN(null; null; null)";
+const JOIN4: &str = "def JOIN($idx; stream; idx_expr; join_expr): stream | [., $idx[idx_expr]] | join_expr; JOIN(null; null; null; null)";
+
+const FROM_ISO: &str =
+    "def fromdateiso8601: strptime(\"%Y-%m-%dT%H:%M:%SZ\")|mktime; fromdateiso8601";
+const TO_ISO: &str = "def todateiso8601: strftime(\"%Y-%m-%dT%H:%M:%SZ\"); todateiso8601";
+
+fn join_source(arity: usize) -> &'static str {
+    match arity {
+        2 => JOIN2,
+        3 => JOIN3,
+        _ => JOIN4,
+    }
+}
+
+fn unbox_keep(args: std::vec::IntoIter<Box<Filter>>) -> Vec<Filter> {
+    args.map(|arg| *arg).collect()
+}
+
+fn with_call_args(source: &str, call_args: Vec<Filter>) -> Filter {
+    let mut filter = compile_stream(source);
+    let Filter::Define { rest, .. } = &mut filter else {
+        panic!("builtin is not a definition");
+    };
+    let Filter::Call { args, .. } = rest.as_mut() else {
+        panic!("builtin is not a call");
+    };
+    args.clear();
+    args.extend(call_args);
+    filter
 }
 
 /// `debug(msgs)` prints each message and then yields the input.

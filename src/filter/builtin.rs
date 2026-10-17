@@ -956,6 +956,60 @@ fn same(left: &Value, right: &Value) -> bool {
     cmp_value(left, right) == 0
 }
 
+pub(super) fn eval_format_by(
+    name: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    // Each name is formatted as it arrives. A bad name stops the rest of the
+    // argument, and names that already worked stay in the output.
+    let out = RefCell::new(Vec::new());
+    let bad: RefCell<Option<Failure>> = RefCell::new(None);
+    let streamed = super::stream::feed(
+        name,
+        input,
+        env,
+        &mut |value| match format_one(value, input) {
+            Ok(text) => {
+                out.borrow_mut().push(Value::String(text));
+                false
+            }
+            Err(err) => {
+                *bad.borrow_mut() = Some(err);
+                true
+            }
+        },
+    );
+    let mut produced = out.into_inner();
+    if let Some(err) = bad.into_inner() {
+        return Err(with_partial(produced, err));
+    }
+    match streamed {
+        Ok(_) => Ok(produced),
+        Err(mut failure) => {
+            let pending = std::mem::take(&mut failure.partial);
+            for value in pending {
+                match format_one(&value, input) {
+                    Ok(text) => produced.push(Value::String(text)),
+                    Err(err) => return Err(with_partial(produced, err)),
+                }
+            }
+            Err(with_partial(produced, failure))
+        }
+    }
+}
+
+fn format_one(value: &Value, input: &Value) -> Result<String, Failure> {
+    let Value::String(label) = value else {
+        return Err(fail(format!(
+            "{} ({}) is not a valid format",
+            value.type_name(),
+            shown(value)
+        )));
+    };
+    apply_format(label, input)
+}
+
 pub(super) fn eval_named_format(name: &str, input: &Value) -> Result<Vec<Value>, Failure> {
     Ok(vec![Value::String(apply_format(name, input)?)])
 }

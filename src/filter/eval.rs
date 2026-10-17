@@ -221,6 +221,7 @@ pub(super) fn produce(
         Filter::Builtins => Ok(vec![super::builtin::builtins_value()]),
         Filter::JqOrigin => Ok(vec![Value::String(crate::feed::jq_origin())]),
         Filter::ProgOrigin => Ok(vec![Value::String(crate::feed::prog_origin())]),
+        Filter::FormatBy(name) => super::builtin::eval_format_by(name, input, env),
         Filter::Pow10 => Err(raise(Value::String(
             "Error: pow10/0 not found at build time".to_string(),
         ))),

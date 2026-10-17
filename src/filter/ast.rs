@@ -272,6 +272,8 @@ pub enum Filter {
     JqOrigin,
     /// `get_prog_origin`. Directory of the `-f` program, or the current directory.
     ProgOrigin,
+    /// `format(name)`. `name` yields format names. Each one is applied to the input.
+    FormatBy(Box<Filter>),
     /// `error` with no argument. Raises the current input.
     Error,
     /// `error(expr)`. A call written after it is a syntax error.
