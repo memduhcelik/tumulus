@@ -11248,8 +11248,14 @@ fn help_and_build_match_jq() {
                     help = Some(got.stdout.clone());
                 }
             }
-        } else if jq.stdout == b"--with-oniguruma=builtin\n" {
-            assert_eq!(got.stdout, b"oniguruma=6.9.5\n", "{args:?}");
+        } else if jq_build_configuration(&jq.stdout) {
+            // tumulus names the Oniguruma it ships. jq names its own build.
+            assert_eq!(
+                got.stdout,
+                b"oniguruma=6.9.5\n",
+                "{args:?}\njq:\n{}",
+                String::from_utf8_lossy(&jq.stdout)
+            );
             assert!(jq.stderr.is_empty() && got.stderr.is_empty(), "{args:?}");
             assert_eq!(got.status.code(), Some(0), "{args:?}");
         } else if jq.stdout.starts_with(b"jq-") {
@@ -11277,6 +11283,38 @@ fn help_and_build_match_jq() {
         for flag in ["-h", "--help", "--build-configuration"] {
             exits_while_stdin_stays_open(program, flag);
         }
+    }
+}
+
+/// jq's `--build-configuration` text, checked live.
+///
+/// On macOS that text is `--with-oniguruma=builtin`. On Ubuntu it is one
+/// configure line from apt jq 1.7.1-3ubuntu0.24.04.2. The line starts with
+/// `--build=x86_64-linux-gnu`, includes `--prefix=/usr`, and does not name
+/// Oniguruma.
+fn jq_build_configuration(stdout: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        stdout == b"--with-oniguruma=builtin\n"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(text) = std::str::from_utf8(stdout) else {
+            return false;
+        };
+        let Some(line) = text.strip_suffix('\n') else {
+            return false;
+        };
+        !line.contains('\n')
+            && line.starts_with("--build=x86_64-linux-gnu ")
+            && line.contains(" --prefix=/usr ")
+            && line.contains("1.7.1-3ubuntu0.24.04.2")
+            && !line.contains("oniguruma")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stdout;
+        false
     }
 }
 
