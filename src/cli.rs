@@ -1401,7 +1401,7 @@ fn auto_color() -> bool {
     }
 }
 
-/// `tumulus-0.9.0`. jq prints its own build the same way.
+/// `tumulus-0.10.0`. jq prints its own build the same way.
 fn print_version() {
     crate::host::write_stdout_line(&format!("tumulus-{}", env!("CARGO_PKG_VERSION")));
 }

@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+Released on 2026-10-18.
 
 `scan`, `splits`, `sub`, and `gsub` follow jq, and so does `split` with two arguments. `scan` and `splits` search globally. `split` with one argument still splits on a string. `sub` replaces the first match. `gsub` replaces every match. The replacement is a filter and sees the named captures. A bad value, a bad flag, or a pattern that does not compile fails the way jq fails, and the exit status is 5. A path through an array or `reduce` reports a failure inside that array or stream.
 
-`test`, `match`, and `capture` follow jq. One argument takes a string or an array `[regex]` or `[regex, flags]`. Two arguments take the pattern and the flags. The flags are `g`, `i`, `m`, `n`, `p`, `s`, `l`, and `x`. `g` finds every non-overlapping match. `i` ignores case. `m` lets `.` match a newline. `s` does not. `p` turns on both, and `.` follows `m`. `n` drops empty matches. `l` keeps the longest match. `x` ignores whitespace and comments in the pattern. A bad value, a bad flag, or a pattern that does not compile fails the way jq fails, and the exit status is 5. Values already produced are kept. `first` and `limit` do not read a later pattern. `scan`, `splits`, `sub`, `gsub`, and `split` with two filters are still rejected. Of the 447 programs in jq 1.7.1's test file, 440 still come out the same.
+`test`, `match`, and `capture` follow jq. One argument takes a string or an array `[regex]` or `[regex, flags]`. Two arguments take the pattern and the flags. The flags are `g`, `i`, `m`, `n`, `p`, `s`, `l`, and `x`. `g` finds every non-overlapping match. `i` ignores case. `m` lets `.` match a newline. `s` does not. `p` turns on both, and `.` follows `m`. `n` drops empty matches. `l` keeps the longest match. `x` ignores whitespace and comments in the pattern. A bad value, a bad flag, or a pattern that does not compile fails the way jq fails, and the exit status is 5. Values already produced are kept. `first` and `limit` do not read a later pattern. Of the 447 programs in jq 1.7.1's test file, 440 still come out the same.
 
 A failure while a function accepts a value is caught by `try` in that function. `def f: try (1 + "a") catch .; f` yields the message instead of exiting 5.
 

@@ -1,18 +1,18 @@
 # tumulus
 
-tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.9.0.
+tumulus reads JSON and prints it the way jq does. The filter language is still small. This is version 0.10.0.
 
 macOS on Apple silicon:
 
 ```sh
-curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.9.0/tumulus-macos-arm64
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.10.0/tumulus-macos-arm64
 chmod +x tumulus
 ```
 
 Linux on x86_64:
 
 ```sh
-curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.9.0/tumulus-linux-x86_64
+curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.10.0/tumulus-linux-x86_64
 chmod +x tumulus
 ```
 
