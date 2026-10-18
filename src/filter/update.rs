@@ -2919,12 +2919,7 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
 fn slice_from_object(
     fields: &[(String, Value)],
 ) -> Result<(Option<String>, Option<String>), String> {
-    let start = fields.iter().rev().find(|(key, _)| key == "start");
-    let end = fields.iter().rev().find(|(key, _)| key == "end");
-    let (Some((_, start)), Some((_, end))) = (start, end) else {
-        return Err("Array/string slice indices must be integers".to_string());
-    };
-    Ok((bound_text(start)?, bound_text(end)?))
+    super::object_slice_bounds(fields).map_err(|failure| failure.message)
 }
 
 fn bound_text(value: &Value) -> Result<Option<String>, String> {

@@ -261,9 +261,25 @@ fn apply_values(
         run.status = outcome.status;
         return Ok(());
     }
+    let mut dirs = DirNote::default();
+    let mut saw_dir = false;
+    let mut saw_file = false;
     for path in files {
+        if path_is_dir(path) {
+            // The message waits until another file is opened. The last
+            // directory of the run stays quiet, and the status is still 2.
+            dirs.directory();
+            saw_dir = true;
+            run.missing = true;
+            if run.status == 0 {
+                run.status = 2;
+            }
+            continue;
+        }
+        dirs.other();
         match read_input(path) {
             Ok(bytes) => {
+                saw_file = true;
                 let source = if path == "-" { "<stdin>" } else { path };
                 let outcome = apply(&bytes, style, seq, program, source, env, run, out)?;
                 if outcome.jq_halt {
@@ -291,6 +307,17 @@ fn apply_values(
             }
             Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
         }
+    }
+    // `--seq` still parses an empty input when every file was a directory.
+    if seq && saw_dir && !saw_file && !run.stopped {
+        let outcome = apply(b"", style, true, program, "<stdin>", env, run, out)?;
+        if outcome.jq_halt {
+            run.stopped = true;
+            run.status = outcome.status;
+        }
+    }
+    if saw_dir && !run.stopped {
+        run.status = 2;
     }
     Ok(())
 }
@@ -596,6 +623,34 @@ fn committed_parse_error(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// A directory is not announced until a later file is opened.
+#[derive(Default)]
+struct DirNote {
+    pending: bool,
+}
+
+impl DirNote {
+    fn directory(&mut self) {
+        self.announce();
+        self.pending = true;
+    }
+
+    fn other(&mut self) {
+        self.announce();
+    }
+
+    fn announce(&mut self) {
+        if self.pending {
+            eprintln!("jq: error: Is a directory");
+            self.pending = false;
+        }
+    }
+}
+
+fn path_is_dir(path: &str) -> bool {
+    path != "-" && fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
 fn finish_input(missing: bool, failed: bool) -> i32 {
     // A missing file wins over a later filter or parse failure.
     if missing {
@@ -628,9 +683,16 @@ fn apply_slurp(
     };
     let mut missing = false;
     let mut early = None;
+    let mut dirs = DirNote::default();
     for path in input_paths(files) {
         at.source = source_name(path).to_string();
         at.line = 0;
+        if path_is_dir(path) {
+            dirs.directory();
+            missing = true;
+            continue;
+        }
+        dirs.other();
         match open_input(path)? {
             Opened::Missing => missing = true,
             Opened::Bytes(bytes) => {
@@ -757,9 +819,16 @@ fn apply_raw_slurp(
         line: 0,
     };
     let mut missing = false;
+    let mut dirs = DirNote::default();
     for path in input_paths(files) {
         at.source = source_name(path).to_string();
         at.line = 0;
+        if path_is_dir(path) {
+            dirs.directory();
+            missing = true;
+            continue;
+        }
+        dirs.other();
         match open_input(path)? {
             Opened::Missing => missing = true,
             Opened::Bytes(bytes) => {
@@ -794,12 +863,19 @@ fn apply_raw(
     let mut one_left = false;
     let mut stop = false;
     let mut last_failed = false;
+    let mut dirs = DirNote::default();
     for path in input_paths(files) {
         if stop {
             break;
         }
         at.source = source_name(path).to_string();
         at.line = 0;
+        if path_is_dir(path) {
+            dirs.directory();
+            missing = true;
+            continue;
+        }
+        dirs.other();
         match open_input(path)? {
             Opened::Missing => {
                 missing = true;
@@ -1261,7 +1337,7 @@ fn options() -> Result<Options, Error> {
             "-f" | "--from-file" => flags.from_file = true,
             "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
             other if other.starts_with("--") => {
-                return Err(Error::new(format!("unknown option: {other}")));
+                jq_usage(&format!("jq: Unknown option {other}"));
             }
             // `-nc` is options. `-1` and `-.a` are programs, because the
             // character after the dash is not a letter.

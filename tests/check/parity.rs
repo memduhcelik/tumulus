@@ -5431,17 +5431,19 @@ fn input_and_arguments_match_jq() {
 #[test]
 fn rejected_options_stay_ours() {
     require_jq();
-    let unknown = [
+    for option in [
         "--arg=a",
         "--argjson=a",
         "--from-file=prog.jq",
         "--indent=4",
-        "-fprog.jq",
         "--slurpfile=a",
         "--args=foo",
-        "-eQ",
-    ];
-    for option in unknown {
+        "--bogus",
+        "--Help",
+    ] {
+        compare_exact(option, &[option], b"");
+    }
+    for option in ["-fprog.jq", "-eQ"] {
         let stderr = format!("tumulus: unknown option: {option}\n");
         assert_rejects(option, &[option], b"", stderr.as_bytes(), 1);
     }
@@ -5457,6 +5459,55 @@ fn rejected_options_stay_ours() {
     compare_exact("unbound", &["--arg", "a", "1", "-n", "-e", "$b"], b"");
     compare_exact("dash f", &["-n", "--", "-f"], b"");
     compare_exact("dash arg", &["-n", "--", "--arg"], b"");
+}
+
+#[test]
+fn directory_files_match_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("dirfile");
+    let folder = dir.join("folder");
+    fs::create_dir(&folder).unwrap();
+    let folder = folder.to_str().expect("utf-8").to_string();
+    let one = write_bytes(&dir, "one.json", b"9\n");
+    let missing = dir.join("missing.json");
+    let missing = missing.to_str().expect("utf-8");
+    compare_exact("only", &["-c", ".", &folder], b"");
+    compare_exact("then file", &["-c", ".", &folder, &one], b"");
+    compare_exact("file then", &["-c", ".", &one, &folder], b"");
+    compare_exact("two", &["-c", ".", &folder, &folder], b"");
+    compare_exact("three", &["-c", ".", &folder, &folder, &folder], b"");
+    compare_exact("then missing", &["-c", ".", &folder, missing], b"");
+    compare_exact("missing then", &["-c", ".", missing, &folder], b"");
+    compare_exact("slurp only", &["-s", "-c", ".", &folder], b"");
+    compare_exact("slurp then", &["-s", "-c", ".", &folder, &one], b"");
+    compare_exact("slurp after", &["-s", "-c", ".", &one, &folder], b"");
+    compare_exact("raw only", &["-R", "-c", ".", &folder], b"");
+    compare_exact("raw then", &["-R", "-c", ".", &folder, &one], b"");
+    compare_exact("raw after", &["-R", "-c", ".", &one, &folder], b"");
+    compare_exact("raw slurp", &["-s", "-R", "-c", ".", &folder], b"");
+    compare_exact(
+        "raw slurp then",
+        &["-s", "-R", "-c", ".", &folder, &one],
+        b"",
+    );
+    compare_exact("stream only", &["--stream", "-c", ".", &folder], b"");
+    compare_exact("stream then", &["--stream", "-c", ".", &folder, &one], b"");
+    compare_exact(
+        "stream two",
+        &["--stream", "-c", ".", &folder, &folder],
+        b"",
+    );
+    compare_exact("seq only", &["--seq", "-c", ".", &folder], b"");
+    compare_exact("seq two", &["--seq", "-c", ".", &folder, &folder], b"");
+    compare_exact(
+        "seq then missing",
+        &["--seq", "-c", ".", &folder, missing],
+        b"",
+    );
+    compare_exact("null input", &["-n", "-c", ".", &folder], b"");
+    compare_exact("stdin after", &["-c", ".", &folder, "-"], b"1\n");
+    compare_exact("stdin before", &["-c", ".", "-", &folder], b"1\n");
+    compare_exact("exit status", &["-e", "-c", ".", &folder, &one], b"");
 }
 
 #[test]
@@ -7821,6 +7872,32 @@ fn expression_slices_match_jq() {
         "(infinite as $i | [1,2,3] | .[1:$i])",
         "[0,1,2,3,4] | (2 as $i | .[$i:] = 9)",
         "reduce range(3) as $i ([0,1,2,3,4]; .[$i:] = [$i])",
+        "[0,1,2,3,4] | .[{start:1, end:3}]",
+        "\"abcdef\" | .[{start:1, end:3}]",
+        "[0,1,2,3,4] | .[{end:3, start:1}]",
+        "[0,1,2,3,4] | .[{start:1}]",
+        "[0,1,2,3,4] | .[{end:3}]",
+        "[0,1,2,3,4] | .[{}]",
+        "[0,1,2,3,4] | .[{start:null, end:3}]",
+        "[0,1,2,3,4] | .[{start:1, end:null}]",
+        "[0,1,2,3,4] | .[{start:null, end:null}]",
+        "[0,1,2,3,4] | .[{start:1, end:3, x:9}]",
+        "[0,1,2,3,4] | .[{start:1, end:3, start:0}]",
+        "[0,1,2,3,4] | .[{end:3, start:1, end:4}]",
+        "[0,1,2,3,4] | .[{start:-2, end:null}]",
+        "[0,1,2,3,4] | .[{start:1.5, end:3.2}]",
+        "[0,1,2,3,4] | .[{start:1, end:3}, 0]",
+        "[0,1,2,3,4] | .[0, {start:1, end:3}]",
+        "(2 as $i | [0,1,2,3,4] | .[{start:$i, end:4}])",
+        "[0,1,2,3,4] | .[{start:(1,2), end:4}]",
+        "[0,1,2,3,4] | .[{start:empty, end:3}]",
+        "[0,1,2,3,4] | .[{start:1, end:error(\"z\")}]",
+        "[0,1,2,3,4] | .[{start:true, end:3}]",
+        "null | .[{foo:1}]",
+        "{} | .[{start:1, end:3}]",
+        "true | .[{start:1, end:3}]",
+        "[[0,1,2,3,4]] | .[0][{start:1, end:3}]",
+        "{\"a\":[0,1,2,3,4]} | .a[{start:1, end:3}]",
         "[0,1,2,3,4] | .[{start:1, end:3}] = [9]",
         "[0,1,2,3,4] | del(.[{start:1, end:3}])",
         "[0,1,2,3,4] | path(.[{start:1, end:3}])",

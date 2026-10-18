@@ -429,6 +429,31 @@ fn eval_slice(
     }
 }
 
+/// Both `start` and `end` have to be present. The later one of a repeated
+/// name wins. Null is an omitted bound. Anything else is not an index.
+pub(super) fn object_slice_bounds(
+    fields: &[(String, Value)],
+) -> Result<(Option<String>, Option<String>), Failure> {
+    let start = fields.iter().rev().find(|(key, _)| key == "start");
+    let end = fields.iter().rev().find(|(key, _)| key == "end");
+    let (Some((_, start)), Some((_, end))) = (start, end) else {
+        return Err(fail(
+            "Array/string slice indices must be integers".to_string(),
+        ));
+    };
+    Ok((slice_bound_text(start)?, slice_bound_text(end)?))
+}
+
+fn slice_bound_text(value: &Value) -> Result<Option<String>, Failure> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(text) => Ok(Some(text.strip_prefix('\u{1}').unwrap_or(text).to_string())),
+        _ => Err(fail(
+            "Array/string slice indices must be integers".to_string(),
+        )),
+    }
+}
+
 pub(super) fn require_slice_index(value: &Value) -> Result<(), Failure> {
     match value {
         Value::Null | Value::Number(_) => Ok(()),
@@ -1647,9 +1672,10 @@ pub(super) fn index_by(base: &Value, key: &Value) -> Result<Vec<Value>, Failure>
             index_number(base, &index)
         }
         Value::Object(_) if matches!(base, Value::Null) => Ok(vec![Value::Null]),
-        Value::Object(_) if matches!(base, Value::Array(_) | Value::String(_)) => Err(fail(
-            "Array/string slice indices must be integers".to_string(),
-        )),
+        Value::Object(fields) if matches!(base, Value::Array(_) | Value::String(_)) => {
+            let (start, end) = object_slice_bounds(fields)?;
+            slice(base, start.as_deref(), end.as_deref())
+        }
         Value::Array(_) if matches!(base, Value::Array(_)) => Ok(vec![Value::array(Vec::new())]),
         other => Err(fail(format!(
             "Cannot index {} with {}",
