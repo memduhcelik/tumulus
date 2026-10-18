@@ -5,7 +5,8 @@
 //! with the jq it ships. Apple's jq then replaces the weekday and yearday
 //! `strptime` stored. `strftime`, `strflocaltime`, and `strptime` accept
 //! `%Y` `%m` `%d` `%H` `%M` `%S` `%Z` `%j` `%a` `%A` `%b` `%B` `%e` `%y`
-//! `%z` `%I` `%p` `%u` `%w` `%s` `%D` `%F` `%T` `%R` `%c` and `%%`.
+//! `%z` `%I` `%p` `%u` `%w` `%s` `%D` `%F` `%T` `%R` `%c` `%C` `%g` `%G`
+//! `%h` `%k` `%l` `%n` `%r` `%t` `%U` `%V` `%W` `%x` `%X` `%P` and `%%`.
 
 use crate::number;
 use crate::value::Value;
@@ -328,7 +329,8 @@ fn check_letters(format: &str, filter: &str) -> Result<(), String> {
         match chars.next() {
             Some(
                 'Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z' | 'j' | 'a' | 'A' | 'b' | 'B' | 'e' | 'y'
-                | 'z' | 'I' | 'p' | 'u' | 'w' | 's' | 'D' | 'F' | 'T' | 'R' | 'c' | '%',
+                | 'z' | 'I' | 'p' | 'u' | 'w' | 's' | 'D' | 'F' | 'T' | 'R' | 'c' | 'C' | 'g' | 'G'
+                | 'h' | 'k' | 'l' | 'n' | 'r' | 't' | 'U' | 'V' | 'W' | 'x' | 'X' | 'P' | '%',
             ) => {}
             Some(other) => return Err(format!("{filter} does not support %{other}")),
             None => return Err(format!("{filter} does not support %")),

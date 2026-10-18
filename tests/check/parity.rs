@@ -4101,6 +4101,99 @@ fn date_letters_match_jq() {
     }
 }
 
+/// `%C` `%g` `%G` `%h` `%k` `%l` `%n` `%r` `%t` `%U` `%V` `%W` `%x` `%X`
+/// and `%P` are the host C library's letters. Each program is run against
+/// the jq on this machine, including a parse that fails.
+#[test]
+fn host_date_letters_match_jq() {
+    require_jq();
+    let letters = [
+        "C", "g", "G", "h", "k", "l", "n", "r", "t", "U", "V", "W", "x", "X", "P",
+    ];
+    let stamps = ["0", "46800", "1593561600", "1600000000", "1577836800"];
+    let samples = [
+        "",
+        "0",
+        "1",
+        "20",
+        "2020",
+        "Sep",
+        "AM",
+        "pm",
+        " 3",
+        "nope",
+        "P",
+        "am",
+        "00",
+        "12:00:00 AM",
+        "01/01/70",
+        "\n",
+        "\t",
+    ];
+    let mut programs = Vec::new();
+    for letter in letters {
+        let fmt = format!("%{letter}");
+        for stamp in stamps {
+            programs.push(format!(r#"{stamp} | strftime("{fmt}")"#));
+            programs.push(format!(r#"{stamp} | strflocaltime("{fmt}")"#));
+            programs.push(format!(
+                r#"{stamp} | strftime("{fmt}") | strptime("{fmt}")"#
+            ));
+            programs.push(format!(
+                r#"{stamp} | strflocaltime("{fmt}") | strptime("{fmt}")"#
+            ));
+        }
+        programs.push(format!(r#"[2020,8,13,15,4,0,0,256] | strftime("{fmt}")"#));
+        programs.push(format!(
+            r#"[2020,8,13,15,4,0,0,256] | strflocaltime("{fmt}")"#
+        ));
+        // A Rust format string turns `%%` into one `%`, so four of them
+        // are the jq program's `%%`.
+        programs.push(format!(r#"0 | strftime("%%%%{letter}")"#));
+        programs.push(format!(
+            r#"0 | strftime("{fmt}%%%%") | strptime("{fmt}%%%%")"#
+        ));
+        for sample in samples {
+            programs.push(format!(
+                "{} | strptime(\"{fmt}\")",
+                jq_string_literal(sample)
+            ));
+        }
+    }
+    let all = "%C %g %G %h %k %l %n %r %t %U %V %W %x %X %P";
+    for stamp in ["0", "1600000000"] {
+        programs.push(format!(r#"{stamp} | strftime("{all}")"#));
+        programs.push(format!(r#"{stamp} | strflocaltime("{all}")"#));
+        programs.push(format!(
+            r#"{stamp} | strftime("{all}") | strptime("{all}")"#
+        ));
+        programs.push(format!(
+            r#"{stamp} | strflocaltime("{all}") | strptime("{all}")"#
+        ));
+    }
+    programs.push(format!(r#"[2020,8,13,15,4,0,0,256] | strftime("{all}")"#));
+    for program in &programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
+
+fn jq_string_literal(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// jq aborts when `strftime` is given a number and a format that is not a
 /// string. The message here is the one jq prints for an array. Letters
 /// other than the ones these filters accept are not compared with jq.
@@ -4109,8 +4202,6 @@ fn strftime_letters_are_limited() {
     let cases = [
         (r#"0 | strftime("%")"#, "strftime does not support %"),
         (r#"0 | strftime("%Y%")"#, "strftime does not support %"),
-        (r#"0 | strftime("%n")"#, "strftime does not support %n"),
-        (r#"0 | strftime("%t")"#, "strftime does not support %t"),
         (r#"0 | strftime("%EY")"#, "strftime does not support %E"),
         (r#"0 | strftime("%-Y")"#, "strftime does not support %-"),
         (r#"0 | strftime("%10Y")"#, "strftime does not support %1"),
@@ -4155,14 +4246,6 @@ fn strflocaltime_letters_are_limited() {
         (
             r#"0 | strflocaltime("%Y%")"#,
             "strflocaltime does not support %",
-        ),
-        (
-            r#"0 | strflocaltime("%n")"#,
-            "strflocaltime does not support %n",
-        ),
-        (
-            r#"0 | strflocaltime("%t")"#,
-            "strflocaltime does not support %t",
         ),
         (
             r#"0 | strflocaltime("%EY")"#,
@@ -4232,8 +4315,6 @@ fn strptime_letters_are_limited() {
     let cases = [
         (r#""1970" | strptime("%")"#, "strptime does not support %"),
         (r#""1970" | strptime("%Y%")"#, "strptime does not support %"),
-        (r#""1970" | strptime("%n")"#, "strptime does not support %n"),
-        (r#""1970" | strptime("%t")"#, "strptime does not support %t"),
         (
             r#""1970" | strptime("%Ey")"#,
             "strptime does not support %E",

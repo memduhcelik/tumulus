@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`strftime`, `strflocaltime`, and `strptime` accept `%C`, `%g`, `%G`, `%h`, `%k`, `%l`, `%n`, `%r`, `%t`, `%U`, `%V`, `%W`, `%x`, `%X`, and `%P`. The text is what the host C library prints, which is what jq prints on that machine. Text that does not match is an error and the exit status is 5. A letter still outside that set is rejected. The message names it and the exit status is 5.
+
 An unknown long option exits 2 with `jq: Unknown option ...` and jq's usage text. A directory passed as a file is not a value, and the exit status is 2. `jq: error: Is a directory` is printed when another file follows it. `.[ {start:1, end:3} ]` reads that slice. Both names have to be present. Null is an omitted bound.
 
 `-h` and `--help` print help to stdout and exit 0. `--build-configuration` prints `oniguruma=6.9.10` and exits 0. The filter is not run. The first of those, or of `-V` and `--version`, wins, and later arguments are not read. A short cluster that contains `h` is help. After `--`, none of these is an option.
