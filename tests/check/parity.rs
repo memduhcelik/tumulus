@@ -11130,6 +11130,204 @@ fn output_options_match_jq() {
     assert!(early_byte(&["-c", "."], b"1\n").is_empty());
 }
 
+#[test]
+fn help_and_build_match_jq() {
+    require_jq();
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let version = env!("CARGO_PKG_VERSION");
+    // An object, so a consumed `--indent` is compact and a consumed `-L` is pretty.
+    let input = b"{\"a\":1}\n";
+    let cases: &[&[&str]] = &[
+        &["-h"],
+        &["--help"],
+        &["--build-configuration"],
+        &["-h", "."],
+        &["--help", "."],
+        &["-nh"],
+        &["-hn"],
+        &["-hV"],
+        &["-Vh"],
+        &["-V", "-h"],
+        &["-h", "-V"],
+        &["--help", "--version"],
+        &["--version", "--help"],
+        &["--build-configuration", "."],
+        &["-n", "--build-configuration"],
+        &["--build-configuration", "--help"],
+        &["--help", "--build-configuration"],
+        &["-h", "--bogus"],
+        &["--help", "--bogus"],
+        &["-eh"],
+        &["-he"],
+        &["--", "-h"],
+        &["-f", "-h"],
+        &["--from-file", "--help"],
+        &["-L", "--help"],
+        &["--indent", "--help"],
+        &["-L", "--build-configuration"],
+        &["--indent", "--build-configuration"],
+        &["--arg", "a", "1", "-h"],
+        &["-h", "-c"],
+        &["-ch"],
+        &["--compact-output", "--help"],
+        &["-hx"],
+        &["-xh"],
+        &["-Vhx"],
+        &["-xVh"],
+        &["-h=foo"],
+        &["-hbogus"],
+        &["--build-configuration", "--bogus"],
+        &["--build-configuration", "--version"],
+        &["--version", "--build-configuration"],
+        &[".", "-h"],
+        &[".", "--build-configuration", "-h"],
+        &["-h", ".", "--build-configuration"],
+        &["--args", "-h"],
+        &["--jsonargs", "-h"],
+        &[".", "--", "-h"],
+        &["--", "--help"],
+        &["--", "--build-configuration"],
+        &["!", "-h"],
+        &["!", "--build-configuration"],
+        &["-fh"],
+        &["-hf"],
+        &["-hello"],
+        &["-nh=foo"],
+        &["-ah"],
+        &["-ha"],
+        &["-h."],
+        &["-h", "--arg"],
+        &["--help", "--indent"],
+        &["--stream", "--build-configuration"],
+        &["--tab", "-h"],
+        &["-c", "-h", "."],
+        &["-n", ".", "-h"],
+        &[".", "--args", "-h"],
+        &[".", "/no/such", "-h"],
+        &["-xV"],
+        &["-Vx"],
+        &["-nV"],
+        &["-Vn"],
+    ];
+    let mut help: Option<Vec<u8>> = None;
+    for args in cases {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let jq = run("jq", &owned, input);
+        let got = run(bin, &owned, input);
+        assert_eq!(
+            got.status.code(),
+            jq.status.code(),
+            "{args:?} exit\nours:\n{}\njq:\n{}",
+            String::from_utf8_lossy(&got.stderr),
+            String::from_utf8_lossy(&jq.stderr)
+        );
+        if jq.stdout.starts_with(b"jq - commandline") {
+            assert!(jq.stderr.is_empty(), "{args:?}");
+            assert!(
+                got.stderr.is_empty(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&got.stderr)
+            );
+            assert_eq!(got.status.code(), Some(0), "{args:?}");
+            match &help {
+                Some(earlier) => assert_eq!(&got.stdout, earlier, "{args:?} help differs"),
+                None => {
+                    let text = String::from_utf8(got.stdout.clone()).expect("help is utf-8");
+                    let own = text.replace(bin, "PROG");
+                    assert!(own.starts_with(&format!("tumulus {version}\n")), "{own}");
+                    assert!(own.contains("\nUsage:  PROG [options] <filter> [file...]\n"));
+                    assert!(own.contains("--build-configuration"));
+                    assert!(own.contains("-h, --help"));
+                    assert!(own.contains("Print this text and exit."));
+                    assert!(own.contains("oniguruma=6.9.5"));
+                    assert!(!own.contains("jq"), "{own}");
+                    assert!(!own.contains("commandline JSON processor"));
+                    assert!(!own.contains("jqlang"));
+                    assert!(!own.contains("--with-oniguruma"));
+                    assert!(text.ends_with('\n'));
+                    help = Some(got.stdout.clone());
+                }
+            }
+        } else if jq.stdout == b"--with-oniguruma=builtin\n" {
+            assert_eq!(got.stdout, b"oniguruma=6.9.5\n", "{args:?}");
+            assert!(jq.stderr.is_empty() && got.stderr.is_empty(), "{args:?}");
+            assert_eq!(got.status.code(), Some(0), "{args:?}");
+        } else if jq.stdout.starts_with(b"jq-") {
+            let line = format!("tumulus-{version}\n");
+            assert_eq!(got.stdout, line.as_bytes(), "{args:?}");
+            assert!(jq.stderr.is_empty() && got.stderr.is_empty(), "{args:?}");
+            assert_eq!(got.status.code(), Some(0), "{args:?}");
+        } else {
+            assert_eq!(got.stdout, jq.stdout, "{args:?} stdout");
+            assert_eq!(
+                got.stderr, jq.stderr,
+                "{args:?} stderr\nours {:?}\njq {:?}",
+                got.stderr, jq.stderr
+            );
+        }
+        let mut argv = vec![bin.to_string()];
+        argv.extend(owned);
+        let inplace = tumulus::execute(&argv, input);
+        assert_eq!(inplace.stdout, got.stdout, "{args:?}");
+        assert_eq!(inplace.stderr, got.stderr, "{args:?}");
+        assert_eq!(Some(inplace.code), got.status.code(), "{args:?}");
+    }
+    assert!(help.is_some());
+    for program in ["jq", bin] {
+        for flag in ["-h", "--help", "--build-configuration"] {
+            exits_while_stdin_stays_open(program, flag);
+        }
+    }
+}
+
+/// The pipe stays open. `-h`, `--help`, and `--build-configuration` still exit.
+fn exits_while_stdin_stays_open(program: &str, flag: &str) {
+    let mut child = Command::new(program)
+        .arg(flag)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("could not start {program}: {err}"));
+    let _held = child.stdin.take();
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{program} {flag} waited for stdin");
+            }
+            Err(err) => panic!("{program} {flag}: {err}"),
+        }
+    };
+    assert!(status.success(), "{program} {flag} exited {status}");
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    assert!(!stdout.is_empty(), "{program} {flag} wrote nothing");
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.is_empty(),
+        "{program} {flag} stderr {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
 fn compare_colored(name: &str, args: &[&str], colors: &str) {
     let bin = env!("CARGO_BIN_EXE_tumulus");
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();

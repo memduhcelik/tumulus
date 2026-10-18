@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`-h` and `--help` print help to stdout and exit 0. `--build-configuration` prints `oniguruma=6.9.5` and exits 0. The filter is not run. The first of those, or of `-V` and `--version`, wins, and later arguments are not read. A short cluster that contains `h` is help. After `--`, none of these is an option.
+
 `{$name}` is `{name: $name}`. `{$name: value}` uses the value of `$name` as the key. `{$__loc__}` uses the name `__loc__` and the location as the value. A key that is not a string fails with `Cannot use ... as object key` when a value is produced, and the exit status is 5. A value that yields nothing does not report a bad key. An undefined `$name` fails to compile with `$name is not defined`, and the exit status is 3. `if`, `and`, `reduce`, and `foreach` are names in `{if: 1}`, `{reduce}`, and `.foreach`. Of the 447 programs in jq 1.7.1's test file, 443 come out the same. The three new ones are lines 1911, 1922, and 1926. No previously matching program was lost.
 
 ## 0.10.0

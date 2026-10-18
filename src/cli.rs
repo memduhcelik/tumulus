@@ -1249,6 +1249,14 @@ fn options() -> Result<Options, Error> {
                 print_version();
                 crate::host::stop(0);
             }
+            "--help" => {
+                print_help();
+                crate::host::stop(0);
+            }
+            "--build-configuration" => {
+                print_build();
+                crate::host::stop(0);
+            }
             // The file name is the first operand, not the next argument.
             "-f" | "--from-file" => flags.from_file = true,
             "-" => push_operand(&mut operands, &mut positional, &mut took, tail, arg),
@@ -1259,9 +1267,14 @@ fn options() -> Result<Options, Error> {
             // character after the dash is not a letter.
             other if is_option_cluster(other) => {
                 let body = &other[1..];
-                // `V` prints the version before an unknown letter in the same
-                // cluster is rejected. `h` is left for the help text.
-                if body.contains('V') && !body.contains('h') {
+                // `h` anywhere in the cluster is help, including `-hx` and
+                // `-Vh`, and the other letters are not checked. `V` is the
+                // version only when `h` is absent.
+                if body.contains('h') {
+                    print_help();
+                    crate::host::stop(0);
+                }
+                if body.contains('V') {
                     print_version();
                     crate::host::stop(0);
                 }
@@ -1404,6 +1417,81 @@ fn auto_color() -> bool {
 /// `tumulus-0.10.0`. jq prints its own build the same way.
 fn print_version() {
     crate::host::write_stdout_line(&format!("tumulus-{}", env!("CARGO_PKG_VERSION")));
+}
+
+/// One line. The bundled regex library is Oniguruma 6.9.5.
+fn print_build() {
+    crate::host::write_stdout_line("oniguruma=6.9.5");
+}
+
+fn print_help() {
+    let invoked = crate::host::args()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "tumulus".to_string());
+    let text = help_text(&invoked);
+    for line in text.split('\n') {
+        crate::host::write_stdout_line(line);
+    }
+}
+
+fn help_text(invoked: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "\
+tumulus {version}
+
+Usage:  {invoked} [options] <filter> [file...]
+        {invoked} [options] --args <filter> [string...]
+        {invoked} [options] --jsonargs <filter> [JSON text...]
+
+tumulus reads JSON values, runs the filter on each one, and writes
+each result as JSON. With no filter, the filter is `.`, which passes
+the value through and changes only the layout.
+
+Options:
+  -n, --null-input         Read nothing. Run the filter once on null.
+  -R, --raw-input          Take each line as one string.
+  -s, --slurp              Gather every value into one array, then run once.
+  -c, --compact-output     Print compact JSON.
+  -r, --raw-output         Print a string as text, not as a JSON string.
+  --raw-output0            Like -r, and end each output with a NUL.
+  -j, --join-output        Like -r, and do not add a newline.
+  -a, --ascii-output       Write non-ASCII as \\uXXXX.
+  -S, --sort-keys          Sort the keys of each object.
+  -C, --color-output       Color the JSON.
+  -M, --monochrome-output  Leave the JSON uncolored. This wins over -C.
+  --tab                    Indent with tabs.
+  --indent N               Indent with N spaces, from 1 to 7. 0 is compact
+                           and -1 is tabs.
+  --unbuffered             Flush after each output.
+  --stream                 Read the input as path items.
+  --stream-errors          Like --stream, and hand a parse error to the filter
+                           as one value.
+  --seq                    Read and write application/json-seq.
+  -f, --from-file FILE     Read the filter from FILE.
+  -L DIR                   Search for modules in DIR.
+  --arg NAME VALUE         Set $NAME to the string VALUE.
+  --argjson NAME VALUE     Set $NAME to the JSON value VALUE.
+  --slurpfile NAME FILE    Set $NAME to an array of the JSON values in FILE.
+  --rawfile NAME FILE      Set $NAME to the text of FILE.
+  --args                   Take the remaining arguments as strings.
+  --jsonargs               Take the remaining arguments as JSON values.
+  -e, --exit-status        Exit 1 when the last result is false or null, and
+                           4 when the filter yields nothing.
+  -V, --version            Print the version and exit.
+  --build-configuration    Print oniguruma=6.9.5 and exit.
+  -h, --help               Print this text and exit.
+  --                       Stop reading options.
+
+The first of -h, --help, -V, --version, and --build-configuration is
+enough. Later arguments are not read. In one run of short options, h
+is help, and the other letters are not read.
+
+--arg and --argjson are also fields of $ARGS.named. --args and
+--jsonargs fill $ARGS.positional.\
+"
+    )
 }
 
 fn one_json(text: &str) -> Option<Value> {
