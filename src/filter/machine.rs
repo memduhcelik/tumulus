@@ -535,7 +535,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Filter::Literal(value) => send_once(machine, index, value.clone()),
         Filter::Empty => Ok(Act::Done),
         Filter::Not => send_once(machine, index, Value::Bool(!truthy(&input))),
-        Filter::Var(name) => match env.get(name) {
+        Filter::Var { name, .. } => match env.get(name) {
             Some(value) => send_once(machine, index, value.clone()),
             None => Ok(Act::Fail(fail(format!("unbound {name}")))),
         },

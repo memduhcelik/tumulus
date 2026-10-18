@@ -1165,7 +1165,7 @@ fn run(
             key,
             optional,
         } => run_at(base, key, *optional, input, path, line, input_gen, ctx),
-        Filter::Var(name) => match ctx.pbinds.iter().find(|bind| &bind.name == name) {
+        Filter::Var { name, .. } => match ctx.pbinds.iter().find(|bind| &bind.name == name) {
             Some(bind) => Ok(vec![emit_bind(bind, ctx.root)]),
             None => run_fallback(filter, input, path, line, ctx),
         },

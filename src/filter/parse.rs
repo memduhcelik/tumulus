@@ -14,6 +14,8 @@ use super::value::{apply_op, put};
 
 thread_local! {
     static REACHED: RefCell<Option<HashSet<usize>>> = RefCell::new(None);
+    /// `$name` uses that are not in scope. Collected while checking variables.
+    static UNBOUND: RefCell<Vec<(usize, String)>> = RefCell::new(Vec::new());
     /// File shown in a compile error. Empty means `<top-level>`.
     static PLACE: RefCell<String> = RefCell::new(String::new());
 }
@@ -100,7 +102,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Error
             | Filter::First(None)
             | Filter::Last(None)
-            | Filter::Var(_)
+            | Filter::Var { .. }
             | Filter::Here(_)
             | Filter::Environ
             | Filter::Param(_)
@@ -313,14 +315,21 @@ fn check_finished(
     data_names: &[String],
     filter: &Filter,
 ) -> Result<(), ProgramError> {
-    let (errors, reached) = undefined_calls(filter);
-    if !errors.is_empty() {
-        return Err(report_calls(source, &errors));
-    }
+    let (mut errors, reached) = undefined_calls(filter);
     let _reached = set_reached(reached);
+    let saved = UNBOUND.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     let mut names = scope.to_vec();
     names.extend(data_names.iter().cloned());
-    check_vars(filter, &names)
+    let checked = check_vars(filter, &names);
+    let mut unbound = UNBOUND.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    UNBOUND.with(|slot| *slot.borrow_mut() = saved);
+    checked?;
+    errors.append(&mut unbound);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    errors.sort_by_key(|(at, _)| *at);
+    Err(report_calls(source, &errors))
 }
 
 pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), ProgramError> {
@@ -394,11 +403,15 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             }
             Ok(())
         }
-        Filter::Var(name) => {
+        Filter::Var { name, at } => {
             if scope.iter().any(|bound| bound == name) {
                 Ok(())
             } else {
-                Err(ProgramError::Syntax)
+                UNBOUND.with(|slot| {
+                    slot.borrow_mut()
+                        .push((*at, format!("${name} is not defined")));
+                });
+                Ok(())
             }
         }
         Filter::Pipe(left, right)
@@ -743,7 +756,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Error
         | Filter::First(None)
         | Filter::Last(None)
-        | Filter::Var(_)
+        | Filter::Var { .. }
         | Filter::Here(_)
         | Filter::Input
         | Filter::Inputs
@@ -1160,8 +1173,18 @@ fn regex_two(name: &str, regex: Box<Filter>, flags: Box<Filter>) -> Filter {
 }
 
 fn regex_one(name: &str, arg: Box<Filter>) -> Filter {
-    let val = || Box::new(Filter::Var("val".to_string()));
-    let vt = || Box::new(Filter::Var("vt".to_string()));
+    let val = || {
+        Box::new(Filter::Var {
+            name: "val".to_string(),
+            at: 0,
+        })
+    };
+    let vt = || {
+        Box::new(Filter::Var {
+            name: "vt".to_string(),
+            at: 0,
+        })
+    };
     let string_type = Filter::Literal(Value::String("string".to_string()));
     let array_type = Filter::Literal(Value::String("array".to_string()));
     let is_string = Filter::Bin {
@@ -1255,7 +1278,10 @@ fn capture_reduce() -> Filter {
         update: Box::new(Filter::Bin {
             op: Op::Add,
             left: Box::new(Filter::Identity),
-            right: Box::new(Filter::Var("pair".to_string())),
+            right: Box::new(Filter::Var {
+                name: "pair".to_string(),
+                at: 0,
+            }),
         }),
     }
 }
@@ -2299,28 +2325,7 @@ impl<'a> Parser<'a> {
             return Ok(inner);
         }
         if self.peek() == Some('$') {
-            self.skip_ws();
-            let at = self.index;
-            self.bump();
-            let name = self.ident()?;
-            if self.followed_by_colon_name() {
-                self.index += 2;
-                let rest = self.ident()?;
-                if rest == name && self.data_names.iter().any(|have| have == &name) {
-                    return Ok(Filter::Var(name));
-                }
-                return Err(report_at(
-                    self.src,
-                    at,
-                    &format!("${name}::{rest} is not defined"),
-                ));
-            }
-            // `$__loc__` is the source of that `$`, not a binding. `-f` keeps
-            // the file name `<top-level>`.
-            if name == "__loc__" {
-                return Ok(Filter::Here(line_at(self.src, at).0));
-            }
-            return Ok(Filter::Var(name));
+            return self.parse_dollar();
         }
         if self.peek() == Some('[') {
             return self.parse_array();
@@ -3448,6 +3453,9 @@ impl<'a> Parser<'a> {
             }
             return Ok(ObjField::Lookup(Box::new(key)));
         }
+        if self.peek() == Some('$') {
+            return self.parse_dollar_field();
+        }
         if self.starts_ident() {
             let name = self.ident_key()?;
             self.skip_ws();
@@ -3464,6 +3472,60 @@ impl<'a> Parser<'a> {
             });
         }
         Err(ProgramError::Syntax)
+    }
+
+    /// `$name` or `$__loc__`. `at` is the `$`.
+    fn parse_dollar(&mut self) -> Result<Filter, ProgramError> {
+        let at = self.index;
+        self.bump();
+        let name = self.ident()?;
+        if self.followed_by_colon_name() {
+            self.index += 2;
+            let rest = self.ident()?;
+            if rest == name && self.data_names.iter().any(|have| have == &name) {
+                return Ok(Filter::Var { name, at });
+            }
+            return Err(report_at(
+                self.src,
+                at,
+                &format!("${name}::{rest} is not defined"),
+            ));
+        }
+        // `$__loc__` is the source of that `$`, not a binding. `-f` keeps
+        // the file name `<top-level>`.
+        if name == "__loc__" {
+            return Ok(Filter::Here(line_at(self.src, at).0));
+        }
+        Ok(Filter::Var { name, at })
+    }
+
+    /// `{$name}` copies the binding under that name. `{$name: value}` uses
+    /// the binding's value as the key. `{$__loc__: ...}` is not that form.
+    fn parse_dollar_field(&mut self) -> Result<ObjField, ProgramError> {
+        let value = self.parse_dollar()?;
+        self.skip_ws();
+        let colon =
+            self.src[self.index..].starts_with(':') && !self.src[self.index..].starts_with("::");
+        if colon {
+            self.bump();
+            if matches!(value, Filter::Here(_)) {
+                return Err(ProgramError::Syntax);
+            }
+            let expr = self.parse_expd()?;
+            return Ok(ObjField::Pair {
+                key: Box::new(value),
+                value: Box::new(expr),
+            });
+        }
+        let name = match &value {
+            Filter::Here(_) => "__loc__".to_string(),
+            Filter::Var { name, .. } => name.clone(),
+            _ => return Err(ProgramError::Syntax),
+        };
+        Ok(ObjField::Pair {
+            key: Box::new(Filter::Literal(Value::String(name))),
+            value: Box::new(value),
+        })
     }
 
     /// `foo::bar` is one key.
@@ -3773,6 +3835,7 @@ pub(super) fn const_one(filter: &Filter) -> Option<Value> {
 pub(super) fn const_outputs(filter: &Filter) -> Option<Vec<Value>> {
     match filter {
         Filter::Literal(value) => Some(vec![value.clone()]),
+        Filter::Here(line) => Some(vec![crate::feed::here(*line)]),
         Filter::Pipe(left, right) if is_identity(right) => const_outputs(left),
         Filter::Pipe(left, right) if is_identity(left) => const_outputs(right),
         Filter::Comma(left, right) => {

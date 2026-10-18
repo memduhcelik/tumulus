@@ -18,7 +18,7 @@ chmod +x tumulus
 
 Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
 
-`cargo test --test check -- --exact jq_suite::compare_jq_test_file --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 440 come out the same on stdout, stderr, and the exit status.
+`cargo test --test check -- --exact jq_suite::compare_jq_test_file --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 443 come out the same on stdout, stderr, and the exit status.
 
 ## What works
 
@@ -101,7 +101,7 @@ Each side of a slice is an expression, so a variable, arithmetic, or a call work
 
 `input` reads the next value. `inputs` reads every value still waiting. With `-n`, nothing is read until one of those runs. At the end of the input, `input` fails with `break` and `inputs` stops. A value continues from one file into the next: `1`, a newline, and `2` in the first file and `3` in the second are `1` and `23`. A value that is not valid JSON fails that read with jq's parse message. If the failure is caught, a later `input` continues on the next line. A missing file is named, later files are still read, and the exit status is 2. `input_filename` is the name of the file the current value came from, or null before any value has been read. With `-s`, the stream is one array of every value. With `-R`, each line is one string.
 
-`$__loc__` is an object `{"file":"<top-level>","line":N}`. `N` is the line of that `$`. A program read with `-f` still says `<top-level>`.
+`$__loc__` is an object `{"file":"<top-level>","line":N}`. `N` is the line of that `$`. A program read with `-f` still says `<top-level>`. `{$name}` is `{name: $name}`. `{$name: value}` uses each value of `$name` as one object key. A key that is not a string fails with `Cannot use ... as object key` when a value is produced, and the exit status is 5. A value that yields nothing produces no object, and a bad key is not reported. `{$__loc__}` is `{__loc__: $__loc__}`. A colon after `$__loc__` is a syntax error. `if`, `and`, `reduce`, `foreach`, and the other words the language uses are ordinary names as an object key and after a dot, as in `{if: 1}`, `{reduce}`, and `.foreach`. An unbound `$name` fails to compile with `$name is not defined`, and the exit status is 3.
 
 `$ENV` is the process environment, with each value a string. `env` reads that same object. Binding `$ENV` again with `as` hides it for `$ENV` and leaves `env` alone. `--arg ENV` stores its text on `$ARGS.named` and does not replace `$ENV`.
 
@@ -127,13 +127,11 @@ A missing file is named and the other files are still read. The exit status is 2
 
 ## What does not work yet
 
-Filters past the list above are rejected. A call to a name or a number of arguments this version does not define fails with jq's `name/n is not defined` message and the exit status is 3. Anything else that this version does not parse is `tumulus: syntax error`, also exit status 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`. An unbound `$name` is rejected that way too.
+Filters past the list above are rejected. A call to a name or a number of arguments this version does not define fails with jq's `name/n is not defined` message and the exit status is 3. Anything else that this version does not parse is `tumulus: syntax error`, also exit status 3. A comparison chain such as `1 < 2 < 3` is rejected that way, and so is an object value written as `{a:1+2}`.
 
 A syntax error in a module file is `tumulus: syntax error`. jq prints its own parser message.
 
 `strftime`, `strflocaltime`, and `strptime` reject a format letter other than the ones above. The message names the letter and the exit status is 5.
-
-`{$name}` and `{$name: value}` are rejected. jq uses the variable's name or the variable's value as an object key. `$__loc__` as a field is rejected too.
 
 An object written in the brackets, `.[ {start:1, end:3} ]`, does not read the slice jq reads. It fails with `Array/string slice indices must be integers`. Assignment, `del`, `getpath`, and `setpath` of that object do slice when both `start` and `end` are present. `path` of it prints `start` before `end`. A `?` written immediately after a slice, as in `.[1,error("z"):]?`, also swallows an `error` raised while computing a bound. jq reports that error. `(.[1,error("z"):])?` agrees with jq. When the first slice of an update cannot be written, a later bound is still run. jq does not run it. `try (.[1,(input):] = 9) catch input` therefore reads the next input here and does not in jq.
 

@@ -101,7 +101,7 @@ pub(super) fn produce(
         Filter::Or(left, right) => eval_or(left, right, input, env),
         Filter::Alt(left, right) => eval_alt(left, right, input, env),
         Filter::If { cond, yes, no } => eval_if(cond, yes, no, input, env),
-        Filter::Var(name) => match lookup(env, name) {
+        Filter::Var { name, .. } => match lookup(env, name) {
             Some(value) => Ok(vec![value.clone()]),
             None => Err(fail(format!("unbound {name}"))),
         },
@@ -1511,6 +1511,28 @@ pub(super) fn pair_alts(
 ) -> Alts {
     let (keys, key_err) = parts(eval_in(key, input, env));
     let (values, value_err) = parts(eval_in(value, input, env));
+    // No value was produced. A bad key is not an error until a value needs it.
+    // A value error is kept, unless the key failed before it produced anything.
+    if values.is_empty() {
+        if let Some(failure) = value_err {
+            if keys.is_empty() {
+                if let Some(key_failure) = key_err {
+                    return Alts {
+                        pairs: Vec::new(),
+                        error: Some(key_failure),
+                    };
+                }
+            }
+            return Alts {
+                pairs: Vec::new(),
+                error: Some(failure),
+            };
+        }
+        return Alts {
+            pairs: Vec::new(),
+            error: key_err,
+        };
+    }
     let mut pairs = Vec::new();
     for key_value in &keys {
         let Value::String(name) = key_value else {

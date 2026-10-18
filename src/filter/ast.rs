@@ -104,8 +104,11 @@ pub enum Filter {
         yes: Box<Filter>,
         no: Box<Filter>,
     },
-    /// `$name`
-    Var(String),
+    /// `$name`. `at` is the byte offset of `$`, used when the name is not defined.
+    Var {
+        name: String,
+        at: usize,
+    },
     /// `$__loc__`. The line is the line of that `$` in the program.
     /// The file is always `<top-level>`, including a program read with `-f`.
     Here(usize),

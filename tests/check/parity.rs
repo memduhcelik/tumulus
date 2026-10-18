@@ -2337,34 +2337,23 @@ fn variable_syntax_stays_generic() {
     require_jq();
     let bin = env!("CARGO_BIN_EXE_tumulus");
     let programs = [
-        "$x",
-        "1 as $x | $y",
-        "reduce 1 as $x ($x; $x)",
         "1 as $x",
         ". as []",
         ". as {}",
         ". as [$a,]",
         ". as {a:$a,}",
-        "1 as $x | {$x}",
-        "1 as $x | {$x: 1}",
-        "1 as $x | {$x, a:1}",
         "reduce 1+2 as $x (0; .)",
         "reduce if true then 1 else 2 end as $x (0; $x)",
-        "(1 as $x | $x) | $x",
-        "reduce 1 as $x (0; .+$x) | $x",
         r#"{"a":1} | . as {a:$k, ($k):$v}"#,
         "1 as $x + 1",
         "reduce reduce .[] as $x (0; $x) as $y (0; $y)",
         ". as [$a]? | $a",
         ".[] as $a ?// 1 | $a",
-        "if 1 as $x | $x > 0 then $x else 0 end",
         "{a: 1 as $x | $x}",
         "foreach .[] as $x (0)",
         "reduce .[] as $x (0; .; .)",
-        r#"{"a":{"b":4}} | . as {$a: {($a.b): $x}} | $x"#,
-        r#"[{k:1}, {"1":9}] | . as [{k:$k}, {($k):$v}] | [$k,$v]"#,
-        "reduce 1 as $x (1 as $y | $y; $y)",
         "foreach .[] as $x (0; .; .; .)",
+        "{$__loc__: 1}",
     ];
     for program in programs {
         let args: Vec<String> = ["-n", "-c", "--", program]
@@ -2721,7 +2710,6 @@ fn builtin_syntax_stays_generic() {
         "try .a = 1 catch .",
         "try -=1",
         "{a: 1 | try error(1) catch 2}",
-        "try 1 as $x | error($x) catch $x",
         "type()",
         "type .",
         "type?(1)",
@@ -5466,13 +5454,7 @@ fn rejected_options_stay_ours() {
     assert_rejects("empty filter", &["-n", "-e", "-f", &empty], b"", syntax, 3);
     assert_rejects("bad filter", &["-n", "-f", &bad], b"", syntax, 3);
     assert_rejects("bad byte", &["-n", "-f", &badb], b"", syntax, 3);
-    assert_rejects(
-        "unbound",
-        &["--arg", "a", "1", "-n", "-e", "$b"],
-        b"",
-        syntax,
-        3,
-    );
+    compare_exact("unbound", &["--arg", "a", "1", "-n", "-e", "$b"], b"");
     compare_exact("dash f", &["-n", "--", "-f"], b"");
     compare_exact("dash arg", &["-n", "--", "--arg"], b"");
 }
@@ -11463,6 +11445,86 @@ fn regex_match_jq() {
     ];
     for program in programs {
         compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
+
+#[test]
+fn object_shorthand_match_jq() {
+    require_jq();
+    let programs: &[(&str, &[u8])] = &[
+        (
+            r#"{ a, $__loc__, c }"#,
+            br#"{"a":[1,2,3],"b":"foo","c":{"hi":"hey"}}"#,
+        ),
+        (
+            r#"1 as $x | "2" as $y | "3" as $z | { $x, as, $y: 4, ($z): 5, if: 6, foo: 7 }"#,
+            br#"{"as":8}"#,
+        ),
+        (
+            r#"1 as $foreach | 2 as $and | 3 as $or | { $foreach, $and, $or, a }"#,
+            br#"{"a":4,"b":5}"#,
+        ),
+        (r#"1 as $x | {$x}"#, b""),
+        (r#"1 as $x | {$x, a:1}"#, b""),
+        (r#""2" as $y | {$y: 4}"#, b""),
+        (r#""2" as $y | {$y: 4, if: 6}"#, b""),
+        (r#"("a","b") as $y | {$y: 1}"#, b""),
+        (r#"1 as $x | {$x: 4}"#, b""),
+        (r#"1 as $x | {$x: empty}"#, b""),
+        (r#"1 as $x | {$x: error("z")}"#, b""),
+        (r#"null as $y | {$y: 4}"#, b""),
+        (r#"true as $y | {$y: 4}"#, b""),
+        (r#"[1] as $y | {$y: 4}"#, b""),
+        (r#"{a:1} as $y | {$y: 4}"#, b""),
+        (r#"("a", error("z")) as $y | {$y: 1}"#, b""),
+        (r#"(1, "a") as $y | {$y: empty}"#, b""),
+        (r#"(1, "a") as $y | {$y: error("v")}"#, b""),
+        (r#"{$__loc__}"#, b""),
+        ("1 |\n{$__loc__}", b""),
+        ("def f:\n{$__loc__};\nf", b""),
+        (r#"{($__loc__): 1}"#, b""),
+        (r#"{$missing}"#, b""),
+        (r#"{$a, $b}"#, b""),
+        (r#"1 as $x | {$x, $no}"#, b""),
+        (r#"$x"#, b""),
+        (r#"1 as $x | $y"#, b""),
+        (r#"(1 as $x | $x) | $x"#, b""),
+        (r#"reduce 1 as $x (0; .+$x) | $x"#, b""),
+        (r#"reduce 1 as $x ($x; $x)"#, b""),
+        (r#"foo | $missing"#, b""),
+        (r#"if 1 as $x | $x > 0 then $x else 0 end"#, b""),
+        (r#"{"a":{"b":4}} | . as {$a: {($a.b): $x}} | $x"#, b""),
+        (
+            r#"[{k:1}, {"1":9}] | . as [{k:$k}, {($k):$v}] | [$k,$v]"#,
+            b"",
+        ),
+        (r#"reduce 1 as $x (1 as $y | $y; $y)"#, b""),
+        (r#"try 1 as $x | error($x) catch $x"#, b""),
+        (r#"{if:1, and:2, reduce:3, foreach:4}"#, b""),
+        (
+            r#"{"if":9,"and":8,"reduce":7,"foreach":6} | {if, and, reduce, foreach}"#,
+            b"",
+        ),
+        (
+            r#"{"if":9,"and":8,"reduce":7,"foreach":6} | .if, .and, .reduce, .foreach"#,
+            b"",
+        ),
+        (r#"{"if":{"and":1}} | .if.and"#, b""),
+        (r#"{"reduce":1} | .reduce = 2"#, b""),
+        (r#"{"foreach":1} | .foreach += 1"#, b""),
+        (r#""k" as $if | {$if: 2}"#, b""),
+        (r#"1 as $reduce | {$reduce}"#, b""),
+        (r#""z" as $and | {$and: 4, if: 5}"#, b""),
+        (r#"1 as $x | path({$x})"#, b""),
+        (r#""a" as $y | path({$y: 1})"#, b""),
+        (r#"path({$__loc__})"#, b""),
+    ];
+    for (program, input) in programs {
+        if input.is_empty() {
+            compare_exact(program, &["-n", "-c", "--", program], b"");
+        } else {
+            compare_exact(program, &["-c", "--", program], input);
+        }
     }
 }
 
