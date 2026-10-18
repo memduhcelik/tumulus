@@ -11467,6 +11467,18 @@ fn regex_match_jq() {
 }
 
 #[test]
+fn ua_regex_match_jq() {
+    require_jq();
+    let path = fixture_path("ua-200.ndjson");
+    let file = path.as_str();
+    // Each line is one user-agent string. Both programs yield its browser and version.
+    let with_test = r#"if test("Chrome/") then {name:"Chrome", version:(split("Chrome/")[1]|split(" ")[0])} elif test("Firefox/") then {name:"Firefox", version:(split("Firefox/")[1]|split(" ")[0])} elif test("Version/") then {name:"Safari", version:(split("Version/")[1]|split(" ")[0])} elif test("python-requests/") then {name:"python-requests", version:(split("python-requests/")[1]|split(" ")[0])} elif test("^curl/") then {name:"curl", version:(split("curl/")[1]|split(" ")[0])} else empty end"#;
+    let with_capture = r#"(capture("(?<name>Firefox|Chrome|python-requests|curl)/(?<version>[0-9.]+)") // (capture("Version/(?<version>[0-9.]+)") | .name = "Safari")) | {name, version}"#;
+    compare_exact("ua test", &["-c", "--", with_test, file], b"");
+    compare_exact("ua capture", &["-c", "--", with_capture, file], b"");
+}
+
+#[test]
 fn regex_parts_jq() {
     require_jq();
     let programs = [
