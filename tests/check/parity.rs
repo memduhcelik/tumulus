@@ -11239,7 +11239,7 @@ fn help_and_build_match_jq() {
                     assert!(own.contains("--build-configuration"));
                     assert!(own.contains("-h, --help"));
                     assert!(own.contains("Print this text and exit."));
-                    assert!(own.contains("oniguruma=6.9.5"));
+                    assert!(own.contains("oniguruma=6.9.10"));
                     assert!(!own.contains("jq"), "{own}");
                     assert!(!own.contains("commandline JSON processor"));
                     assert!(!own.contains("jqlang"));
@@ -11252,7 +11252,7 @@ fn help_and_build_match_jq() {
             // tumulus names the Oniguruma it ships. jq names its own build.
             assert_eq!(
                 got.stdout,
-                b"oniguruma=6.9.5\n",
+                b"oniguruma=6.9.10\n",
                 "{args:?}\njq:\n{}",
                 String::from_utf8_lossy(&jq.stdout)
             );

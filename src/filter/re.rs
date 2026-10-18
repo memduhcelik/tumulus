@@ -42,7 +42,7 @@ pub(super) fn apply_pair(
     let regex = compile(pattern, options)?;
     // Longest and not-empty are read while searching. `SearchOptions` does
     // not list those bits, so they have to be kept on the raw value.
-    let search = unsafe { SearchOptions::from_bits_unchecked(options.bits()) };
+    let search = SearchOptions::from_bits_retain(options.bits());
     if testing {
         return Ok(Value::Bool(has_match(&regex, text, search)));
     }

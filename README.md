@@ -39,7 +39,7 @@ Printing:
 - `--unbuffered` flushes after each output.
 - `-V` and `--version` print the version and exit 0. The filter is not run.
 - `-h` and `--help` print help to stdout and exit 0. The filter is not run. A short cluster that contains `h`, such as `-hx` or `-Vh`, is help, and the other letters in that cluster are not read.
-- `--build-configuration` prints `oniguruma=6.9.5` and exits 0. The filter is not run.
+- `--build-configuration` prints `oniguruma=6.9.10` and exits 0. The filter is not run.
 - The first of `-h`, `--help`, `-V`, `--version`, and `--build-configuration` wins. Later arguments are not read. After `--`, none of them is an option.
 
 Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.

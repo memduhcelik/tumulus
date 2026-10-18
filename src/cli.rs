@@ -1419,9 +1419,14 @@ fn print_version() {
     crate::host::write_stdout_line(&format!("tumulus-{}", env!("CARGO_PKG_VERSION")));
 }
 
-/// One line. The bundled regex library is Oniguruma 6.9.5.
+/// One line. The text is the version the bundled library reports.
 fn print_build() {
-    crate::host::write_stdout_line("oniguruma=6.9.5");
+    crate::host::write_stdout_line(&format!("oniguruma={}", oniguruma_version()));
+}
+
+fn oniguruma_version() -> String {
+    let text = unsafe { std::ffi::CStr::from_ptr(onig_sys::onig_version()) };
+    text.to_string_lossy().into_owned()
 }
 
 fn print_help() {
@@ -1437,6 +1442,7 @@ fn print_help() {
 
 fn help_text(invoked: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
+    let onig = oniguruma_version();
     format!(
         "\
 tumulus {version}
@@ -1480,7 +1486,7 @@ Options:
   -e, --exit-status        Exit 1 when the last result is false or null, and
                            4 when the filter yields nothing.
   -V, --version            Print the version and exit.
-  --build-configuration    Print oniguruma=6.9.5 and exit.
+  --build-configuration    Print oniguruma={onig} and exit.
   -h, --help               Print this text and exit.
   --                       Stop reading options.
 
