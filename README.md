@@ -16,7 +16,7 @@ curl -L -o tumulus https://github.com/memduhcelik/tumulus/releases/download/v0.1
 chmod +x tumulus
 ```
 
-Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing.
+Build a release binary with `cargo build --release`. The binary is `target/release/tumulus`. The timed binary below was built with rustc 1.96.0 (ac68faa20 2026-05-25). `cargo test` runs the same inputs through tumulus and jq, and it fails if jq is missing. `scripts/ubuntu-jq.sh` runs that comparison in Ubuntu 24.04 against the jq package the Ubuntu CI job installs.
 
 `cargo test --test check -- --exact jq_suite::compare_jq_test_file --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 443 come out the same on stdout, stderr, and the exit status.
 
