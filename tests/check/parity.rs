@@ -4195,72 +4195,63 @@ fn jq_string_literal(text: &str) -> String {
 }
 
 /// Locale-dependent letters follow `LC_ALL`, then `LC_TIME`, then `LANG`.
-/// Each name is compared only when this machine has it installed.
+/// Every name is required. `scripts/install-date-locales.sh` installs them
+/// on the CI machines.
 #[test]
 fn date_locale_matches_jq() {
     require_jq();
-    let installed = installed_locales();
-    let names = [
-        "C",
-        "POSIX",
-        "C.UTF-8",
-        "C.utf8",
-        "en_US.UTF-8",
-        "en_US.utf8",
-        "en_GB.UTF-8",
-        "en_GB.utf8",
-        "de_DE.UTF-8",
-        "de_DE.utf8",
-        "fr_FR.UTF-8",
-        "fr_FR.utf8",
-        "ja_JP.UTF-8",
-        "ja_JP.utf8",
-    ];
-    let mut present = Vec::new();
-    for name in names {
-        if installed.iter().any(|have| have == name) {
-            present.push(name);
-            for program in DATE_LOCALE_PROGRAMS {
-                compare_date_locale(program, &[("LC_ALL", name)]);
-            }
+    let mut missing = Vec::new();
+    for name in DATE_LOCALES {
+        match locale_problem(name) {
+            None => {}
+            Some(problem) => missing.push(problem),
         }
     }
     assert!(
-        present.iter().any(|name| *name == "C"),
-        "the C locale is not installed"
+        missing.is_empty(),
+        "missing locales: {}",
+        missing.join(", ")
     );
-    #[cfg(target_os = "macos")]
-    assert!(
-        present.iter().any(|name| *name == "en_US.UTF-8"),
-        "en_US.UTF-8 is not installed"
-    );
-    let en = present
-        .iter()
-        .copied()
-        .find(|name| name.starts_with("en_US"));
-    let de = present
-        .iter()
-        .copied()
-        .find(|name| name.starts_with("de_DE"));
-    if let Some(en) = en {
-        for program in DATE_LOCALE_CHOICE {
-            compare_date_locale(program, &[("LANG", en)]);
-            compare_date_locale(program, &[("LC_TIME", en)]);
-            compare_date_locale(program, &[("LC_ALL", "C"), ("LC_TIME", en), ("LANG", en)]);
-            compare_date_locale(program, &[("LC_ALL", ""), ("LANG", en)]);
+    for name in DATE_LOCALES {
+        for program in DATE_LOCALE_PROGRAMS {
+            compare_date_locale(program, &[("LC_ALL", name)]);
         }
     }
-    if let (Some(en), Some(de)) = (en, de) {
-        for program in DATE_LOCALE_CHOICE {
-            compare_date_locale(program, &[("LC_TIME", de), ("LANG", en)]);
-            compare_date_locale(program, &[("LC_ALL", en), ("LC_TIME", de)]);
-        }
+    let en = "en_US.UTF-8";
+    let de = "de_DE.UTF-8";
+    for program in DATE_LOCALE_CHOICE {
+        compare_date_locale(program, &[("LANG", en)]);
+        compare_date_locale(program, &[("LC_TIME", en)]);
+        compare_date_locale(program, &[("LC_ALL", "C"), ("LC_TIME", en), ("LANG", en)]);
+        compare_date_locale(program, &[("LC_ALL", ""), ("LANG", en)]);
+        compare_date_locale(program, &[("LC_TIME", de), ("LANG", en)]);
+        compare_date_locale(program, &[("LC_ALL", en), ("LC_TIME", de)]);
     }
     for program in DATE_LOCALE_CHOICE {
         compare_date_locale(program, &[("LC_ALL", "zz_ZZ.UTF-8")]);
         compare_date_locale(program, &[]);
     }
 }
+
+/// Names compared above. Both spellings are required: glibc lists `utf8`
+/// and accepts `UTF-8`, and Apple ships `UTF-8` only until the utf8 name
+/// is linked to that directory.
+const DATE_LOCALES: &[&str] = &[
+    "C",
+    "POSIX",
+    "C.UTF-8",
+    "C.utf8",
+    "en_US.UTF-8",
+    "en_US.utf8",
+    "en_GB.UTF-8",
+    "en_GB.utf8",
+    "de_DE.UTF-8",
+    "de_DE.utf8",
+    "fr_FR.UTF-8",
+    "fr_FR.utf8",
+    "ja_JP.UTF-8",
+    "ja_JP.utf8",
+];
 
 const DATE_LOCALE_PROGRAMS: &[&str] = &[
     r#"0 | strftime("%x")"#,
@@ -4310,21 +4301,41 @@ const LOCALE_ENV: &[&str] = &[
     "LC_MESSAGES",
 ];
 
-fn installed_locales() -> Vec<String> {
-    let output = Command::new("locale")
-        .arg("-a")
+/// `utf8` and `UTF-8` are the same codeset. glibc prints one spelling and
+/// Apple can print the directory a link points at.
+fn same_locale(requested: &str, reported: &str) -> bool {
+    reported == requested
+        || reported == requested.replacen("utf8", "UTF-8", 1)
+        || reported == requested.replacen("UTF-8", "utf8", 1)
+}
+
+/// `None` when `name` is installed. glibc prints the requested name and a
+/// "Cannot set" warning when it is not. Apple reports the C locale instead.
+fn locale_problem(name: &str) -> Option<String> {
+    let output = Command::new("/usr/bin/locale")
+        .env_clear()
+        .env("LC_ALL", name)
         .output()
-        .unwrap_or_else(|err| panic!("could not run locale -a: {err}"));
+        .unwrap_or_else(|err| panic!("could not run locale: {err}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Cannot set") {
+        return Some(format!("{name} (not installed)"));
+    }
     assert!(
         output.status.success(),
-        "locale -a failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "locale failed for {name}: {stderr}"
     );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect()
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(value) = line.strip_prefix("LC_ALL=") else {
+            continue;
+        };
+        let reported = value.trim().trim_matches('"');
+        if same_locale(name, reported) {
+            return None;
+        }
+        return Some(format!("{name} (reports {reported})"));
+    }
+    Some(format!("{name} (no LC_ALL line)"))
 }
 
 fn compare_date_locale(program: &str, vars: &[(&str, &str)]) {

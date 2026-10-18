@@ -17,6 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install date locales
+        run: bash scripts/install-date-locales.sh
       - name: Compare tumulus with jq
         run: |
           jq --version
@@ -27,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install date locales
+        run: bash scripts/install-date-locales.sh
       - name: Compare tumulus with jq
         # Homebrew jq is earlier on PATH. The comparison is the system jq.
         run: |

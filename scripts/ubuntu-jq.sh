@@ -34,6 +34,7 @@ docker run --platform linux/amd64 --rm -i \
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y jq curl ca-certificates build-essential pkg-config
+bash scripts/install-date-locales.sh
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 fi
