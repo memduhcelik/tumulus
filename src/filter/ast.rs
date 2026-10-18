@@ -380,8 +380,8 @@ pub enum Filter {
         testing: bool,
     },
     /// Bind each value of `expr` and run `body`, and do not read the next
-    /// value once `body` stops or fails. `match`, `test`, and `capture`
-    /// with one argument use this so a later argument is not touched.
+    /// value once `body` stops or fails. Regex filters use this for `$`
+    /// arguments, so a later argument is not touched.
     StreamBind {
         expr: Box<Filter>,
         name: String,

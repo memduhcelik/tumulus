@@ -1050,10 +1050,13 @@ fn is_builtin(name: &str, arity: usize) -> bool {
         | "tostream" => arity == 0,
         "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by" => arity == 1,
         "has" | "select" | "map" | "map_values" | "join" | "ltrimstr" | "rtrimstr"
-        | "startswith" | "endswith" | "index" | "rindex" | "indices" | "split" | "contains"
-        | "inside" | "isempty" | "strftime" | "strflocaltime" | "strptime" | "path" | "getpath"
+        | "startswith" | "endswith" | "index" | "rindex" | "indices" | "contains" | "inside"
+        | "isempty" | "strftime" | "strflocaltime" | "strptime" | "path" | "getpath"
         | "delpaths" | "del" | "repeat" | "walk" | "with_entries" | "fromstream"
         | "truncate_stream" => arity == 1,
+        "split" => arity == 1 || arity == 2,
+        "scan" | "splits" => arity == 1 || arity == 2,
+        "sub" | "gsub" => arity == 2 || arity == 3,
         "paths" | "first" | "last" | "error" | "flatten" | "halt_error" | "combinations" => {
             arity <= 1
         }
@@ -1257,6 +1260,109 @@ fn capture_reduce() -> Filter {
     }
 }
 
+/// `scan` prepends `g`. Null flags add nothing, because `"g" + null` is `"g"`.
+const SCAN: &str = r#"match($re; "g" + $flags) | if (.captures|length > 0) then [ .captures | .[] | .string ] else .string end"#;
+
+/// `splits` prepends `g` and cuts the input at each match. `_nwise` is jq's.
+const SPLITS: &str = r#"def splits(flags): def _nwise($n): def n: if length <= $n then . else .[0:$n], (.[$n:] | n) end; n; . as $s | [ match($re; "g" + flags) | (.offset, .offset + .length) ] | [0] + . + [$s|length] | _nwise(2) | $s[.[0]:.[1]]; splits(null)"#;
+
+/// One argument of `split` stays a string split. Two arguments collect `splits`.
+const SPLIT_RE: &str = r#"def split(flags): [ splits($re; flags) ]; split(null)"#;
+
+/// `sub` replaces the first match unless the flags already ask for more.
+const SUB: &str = r#"def sub(s): . as $in | (reduce match($re; $flags) as $edit ({result: [], previous: 0}; $in[.previous:($edit | .offset)] as $gap | [reduce ($edit | .captures | .[] | select(.name != null) | {(.name): .string}) as $pair ({}; . + $pair) | s] as $inserts | reduce range(0; $inserts|length) as $ix (.; .result[$ix] += $gap + $inserts[$ix]) | .previous = ($edit | .offset + .length)) | .result[] + $in[.previous:]) // $in; sub(null)"#;
+
+/// `gsub` is `sub` with `g` added at the end of the flags.
+const GSUB: &str = r#"def gsub(s; flags): sub($re; s; flags + "g"); gsub(null; null)"#;
+
+fn scan_call(re: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+    let flags = match flags {
+        Some(flags) => *flags,
+        None => Filter::Literal(Value::Null),
+    };
+    bind_lazy(
+        vec![("re", *re), ("flags", flags)],
+        compile_scoped(SCAN, &["re", "flags"]),
+    )
+}
+
+fn splits_call(re: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+    let flags = match flags {
+        Some(flags) => *flags,
+        None => Filter::Literal(Value::Null),
+    };
+    bind_lazy(
+        vec![("re", *re)],
+        call_with(compile_scoped(SPLITS, &["re"]), vec![flags]),
+    )
+}
+
+fn split_regex(re: Filter, flags: Filter) -> Filter {
+    bind_lazy(
+        vec![("re", re)],
+        call_with(compile_scoped(SPLIT_RE, &["re"]), vec![flags]),
+    )
+}
+
+fn sub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+    // Two arguments use an empty flags string. Null is a real flags value.
+    let flags = match flags {
+        Some(flags) => *flags,
+        None => Filter::Literal(Value::String(String::new())),
+    };
+    bind_lazy(
+        vec![("re", *re), ("flags", flags)],
+        call_with(compile_scoped(SUB, &["re", "flags"]), vec![*replacement]),
+    )
+}
+
+fn gsub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+    match flags {
+        Some(flags) => bind_lazy(
+            vec![("re", *re)],
+            call_with(compile_scoped(GSUB, &["re"]), vec![*replacement, *flags]),
+        ),
+        None => sub_call(
+            re,
+            replacement,
+            Some(Box::new(Filter::Literal(Value::String("g".to_string())))),
+        ),
+    }
+}
+
+fn bind_lazy(pairs: Vec<(&str, Filter)>, body: Filter) -> Filter {
+    let mut body = body;
+    for (name, expr) in pairs.into_iter().rev() {
+        body = Filter::StreamBind {
+            expr: Box::new(expr),
+            name: name.to_string(),
+            body: Box::new(body),
+        };
+    }
+    body
+}
+
+fn compile_scoped(source: &str, scope: &[&str]) -> Filter {
+    let names: Vec<String> = scope.iter().copied().map(str::to_string).collect();
+    match compile_with(source, &names) {
+        Ok(filter) => filter,
+        Err(ProgramError::Report(text)) => panic!("regex builtin failed to compile: {text}"),
+        Err(ProgramError::Syntax) => panic!("regex builtin failed to compile"),
+    }
+}
+
+fn call_with(mut filter: Filter, call_args: Vec<Filter>) -> Filter {
+    let Filter::Define { rest, .. } = &mut filter else {
+        panic!("regex builtin is not a definition");
+    };
+    let Filter::Call { args, .. } = rest.as_mut() else {
+        panic!("regex builtin is not a call");
+    };
+    args.clear();
+    args.extend(call_args);
+    filter
+}
+
 fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
     let mut args = args.into_iter();
     match name {
@@ -1305,7 +1411,13 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "select" => Filter::Select(args.next().expect("arg")),
         "map" => Filter::Map(args.next().expect("arg")),
         "map_values" => Filter::MapValues(args.next().expect("arg")),
-        "split" => Filter::Split(args.next().expect("arg")),
+        "split" => match args.next() {
+            Some(sep) => match args.next() {
+                Some(flags) => split_regex(*sep, *flags),
+                None => Filter::Split(sep),
+            },
+            None => unreachable!("split arity"),
+        },
         "contains" => Filter::Contains(args.next().expect("arg")),
         "inside" => Filter::Inside(args.next().expect("arg")),
         "isempty" => Filter::IsEmpty(args.next().expect("arg")),
@@ -1449,6 +1561,18 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "todateiso8601" => compile_stream(TO_ISO),
         "JOIN" => with_call_args(join_source(args.len()), unbox_keep(args)),
         "match" | "test" | "capture" => regex_builtin(name, args.collect()),
+        "scan" => scan_call(args.next().expect("scan"), args.next()),
+        "splits" => splits_call(args.next().expect("splits"), args.next()),
+        "sub" => sub_call(
+            args.next().expect("sub"),
+            args.next().expect("sub"),
+            args.next(),
+        ),
+        "gsub" => gsub_call(
+            args.next().expect("gsub"),
+            args.next().expect("gsub"),
+            args.next(),
+        ),
         "halt_error" => match args.next() {
             None => compile_stream(HALT_ERROR),
             Some(code) => Filter::HaltError(code),

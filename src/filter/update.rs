@@ -1262,6 +1262,20 @@ fn run(
             flags,
             testing,
         } => run_match_value(regex, flags, *testing, input, path, line, ctx),
+        // The inside is walked before the array exists. A failure there, such
+        // as iterating a match array, is the failure jq reports.
+        Filter::Collect(inner) => run_collect(inner, input, path, line, input_gen, ctx),
+        // The stream is walked before the reduction finishes. A match in it
+        // fails at `.[]` instead of leaving the reduced value.
+        Filter::Reduce {
+            stream,
+            pattern,
+            alts,
+            init,
+            update,
+        } => run_reduce_path(
+            stream, pattern, alts, init, update, input, path, line, input_gen, ctx,
+        ),
         other => run_fallback(other, input, path, line, ctx),
     }
 }
@@ -1816,6 +1830,79 @@ fn run_stream_bind(
 
 /// `match` is a search piped into `.[]`. Iterate the array before the next
 /// pattern runs, so a path error names that array.
+fn run_collect(
+    inner: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let items = match run(inner, input, path, line, input_gen, ctx) {
+        Ok(outs) => outs.into_iter().map(|out| out.value).collect(),
+        Err(err) => return Err(bare_path(err)),
+    };
+    Ok(vec![constant(
+        Value::array(items),
+        path,
+        line.get(),
+        ctx.root,
+    )])
+}
+
+fn run_reduce_path(
+    stream: &Filter,
+    pattern: &Pattern,
+    alts: &[Pattern],
+    init: &Filter,
+    update: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let inits = match run(init, input, path, line, input_gen, ctx) {
+        Ok(outs) => outs,
+        Err(err) => return Err(bare_path(err)),
+    };
+    if inits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (index, init_out) in inits.into_iter().enumerate() {
+        let null_input = Value::Null;
+        let stream_input = if index == 0 { input } else { &null_input };
+        let items = match run(stream, stream_input, path, line, input_gen, ctx) {
+            Ok(outs) => outs.into_iter().map(|item| item.value).collect::<Vec<_>>(),
+            Err(err) => return Err(bare_path(err)),
+        };
+        match super::eval::reduce_finished(&init_out.value, &items, pattern, alts, update, ctx.env)
+        {
+            Ok(value) => out.push(constant(value, path, line.get(), ctx.root)),
+            Err(failure) => {
+                return Err(PathErr {
+                    partial: Vec::new(),
+                    message: failure.message,
+                    caught: failure.caught,
+                    stop: failure.stop,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A failure inside `[]` or `reduce` replaces the value being built.
+fn bare_path(err: PathErr) -> PathErr {
+    PathErr {
+        partial: Vec::new(),
+        message: err.message,
+        caught: err.caught,
+        stop: err.stop,
+    }
+}
+
 fn run_match_pipe(
     regex: &Filter,
     flags: &Filter,
