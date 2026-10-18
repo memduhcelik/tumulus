@@ -74,6 +74,7 @@ extern "C" {
     static mut tzname: [*mut c_char; 2];
     fn strftime(buf: *mut c_char, max: usize, format: *const c_char, tm: *const Tm) -> usize;
     fn strptime(text: *const c_char, format: *const c_char, tm: *mut Tm) -> *mut c_char;
+    fn setlocale(category: i32, locale: *const c_char) -> *mut c_char;
     fn isspace(c: i32) -> i32;
     fn gettimeofday(tv: *mut Timeval, tz: *mut c_void) -> i32;
     fn time(tloc: *mut i64) -> i64;
@@ -515,7 +516,12 @@ pub(crate) struct ZoneGuard;
 /// Remember the fresh zone names for this run. Later runs do not see a
 /// `localtime` that happened in an earlier one.
 pub(crate) fn zone_guard() -> ZoneGuard {
-    let (saved0, saved1) = fresh_names();
+    // Set the locale before the first `strftime`, which fills `tzname`.
+    let (saved0, saved1) = {
+        let _hold = TZ_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        use_process_locale();
+        fresh_names()
+    };
     RUN_ZONE.with(|slot| {
         let mut zone = RunZone {
             buf0: [0; 64],
@@ -545,6 +551,25 @@ fn fresh_names() -> (Vec<u8>, Vec<u8>) {
         .clone()
 }
 
+/// `LC_ALL` in `locale.h`. glibc numbers the categories differently.
+#[cfg(target_os = "macos")]
+const LC_ALL: i32 = 0;
+#[cfg(target_os = "linux")]
+const LC_ALL: i32 = 6;
+
+/// An empty locale name is the C library's request for the locale jq uses.
+/// `LC_ALL` wins when it names a locale, then `LC_TIME`, then `LANG`. An
+/// unknown name leaves the C locale in place.
+fn use_process_locale() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let empty = [0u8];
+        unsafe {
+            setlocale(LC_ALL, empty.as_ptr() as *const c_char);
+        }
+    });
+}
+
 /// The first `strftime` of a fresh process fills `tzname`.
 fn prime_tzname() {
     let clock = 0i64;
@@ -570,9 +595,11 @@ fn prime_tzname() {
 fn with_tz<T>(body: impl FnOnce() -> T) -> T {
     let active = RUN_ZONE.with(|slot| slot.borrow().is_some());
     if !active {
+        use_process_locale();
         return body();
     }
     let _hold = TZ_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    use_process_locale();
     point_at_run();
     let out = body();
     save_run();

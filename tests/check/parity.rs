@@ -4194,6 +4194,188 @@ fn jq_string_literal(text: &str) -> String {
     out
 }
 
+/// Locale-dependent letters follow `LC_ALL`, then `LC_TIME`, then `LANG`.
+/// Each name is compared only when this machine has it installed.
+#[test]
+fn date_locale_matches_jq() {
+    require_jq();
+    let installed = installed_locales();
+    let names = [
+        "C",
+        "POSIX",
+        "C.UTF-8",
+        "C.utf8",
+        "en_US.UTF-8",
+        "en_US.utf8",
+        "en_GB.UTF-8",
+        "en_GB.utf8",
+        "de_DE.UTF-8",
+        "de_DE.utf8",
+        "fr_FR.UTF-8",
+        "fr_FR.utf8",
+        "ja_JP.UTF-8",
+        "ja_JP.utf8",
+    ];
+    let mut present = Vec::new();
+    for name in names {
+        if installed.iter().any(|have| have == name) {
+            present.push(name);
+            for program in DATE_LOCALE_PROGRAMS {
+                compare_date_locale(program, &[("LC_ALL", name)]);
+            }
+        }
+    }
+    assert!(
+        present.iter().any(|name| *name == "C"),
+        "the C locale is not installed"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        present.iter().any(|name| *name == "en_US.UTF-8"),
+        "en_US.UTF-8 is not installed"
+    );
+    let en = present
+        .iter()
+        .copied()
+        .find(|name| name.starts_with("en_US"));
+    let de = present
+        .iter()
+        .copied()
+        .find(|name| name.starts_with("de_DE"));
+    if let Some(en) = en {
+        for program in DATE_LOCALE_CHOICE {
+            compare_date_locale(program, &[("LANG", en)]);
+            compare_date_locale(program, &[("LC_TIME", en)]);
+            compare_date_locale(program, &[("LC_ALL", "C"), ("LC_TIME", en), ("LANG", en)]);
+            compare_date_locale(program, &[("LC_ALL", ""), ("LANG", en)]);
+        }
+    }
+    if let (Some(en), Some(de)) = (en, de) {
+        for program in DATE_LOCALE_CHOICE {
+            compare_date_locale(program, &[("LC_TIME", de), ("LANG", en)]);
+            compare_date_locale(program, &[("LC_ALL", en), ("LC_TIME", de)]);
+        }
+    }
+    for program in DATE_LOCALE_CHOICE {
+        compare_date_locale(program, &[("LC_ALL", "zz_ZZ.UTF-8")]);
+        compare_date_locale(program, &[]);
+    }
+}
+
+const DATE_LOCALE_PROGRAMS: &[&str] = &[
+    r#"0 | strftime("%x")"#,
+    r#"0 | strftime("%X")"#,
+    r#"0 | strftime("%c")"#,
+    r#"0 | strftime("%r")"#,
+    r#"0 | strftime("%p")"#,
+    r#"0 | strftime("%a %A %b %B %h %P")"#,
+    r#"0 | strflocaltime("%x")"#,
+    r#"0 | strflocaltime("%c")"#,
+    r#"46800 | strftime("%x %X %r %p %P")"#,
+    r#"46800 | strflocaltime("%x %X %r")"#,
+    r#"1600000000 | strftime("%x %c %B")"#,
+    r#"1600000000 | strflocaltime("%x %c")"#,
+    r#"[2020,8,13,15,4,0,0,256] | strftime("%x %B")"#,
+    r#"0 | strftime("%x") | strptime("%x")"#,
+    r#"0 | strftime("%c") | strptime("%c")"#,
+    r#"0 | strftime("%B") | strptime("%B")"#,
+    r#"0 | strflocaltime("%x") | strptime("%x")"#,
+    r#""01/01/70" | strptime("%x")"#,
+    r#""01/01/1970" | strptime("%x")"#,
+    r#""January" | strptime("%B")"#,
+    r#""Januar" | strptime("%B")"#,
+    r#""janvier" | strptime("%B")"#,
+];
+
+const DATE_LOCALE_CHOICE: &[&str] = &[
+    r#"0 | strftime("%x")"#,
+    r#"0 | strftime("%B")"#,
+    r#"0 | strftime("%c")"#,
+    r#"0 | strflocaltime("%x")"#,
+    r#"0 | strftime("%B") | strptime("%B")"#,
+    r#""January" | strptime("%B")"#,
+    r#""Januar" | strptime("%B")"#,
+    r#"0 | strftime("%x") | strptime("%x")"#,
+];
+
+const LOCALE_ENV: &[&str] = &[
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_TIME",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+];
+
+fn installed_locales() -> Vec<String> {
+    let output = Command::new("locale")
+        .arg("-a")
+        .output()
+        .unwrap_or_else(|err| panic!("could not run locale -a: {err}"));
+    assert!(
+        output.status.success(),
+        "locale -a failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn compare_date_locale(program: &str, vars: &[(&str, &str)]) {
+    let bin = env!("CARGO_BIN_EXE_tumulus");
+    let args = ["-n", "-c", "--", program];
+    let label = if vars.is_empty() {
+        "no locale variables".to_string()
+    } else {
+        vars.iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut ours = Command::new(bin);
+    let mut theirs = Command::new("jq");
+    ours.args(args);
+    theirs.args(args);
+    for key in LOCALE_ENV {
+        ours.env_remove(key);
+        theirs.env_remove(key);
+    }
+    for (key, value) in vars {
+        ours.env(key, value);
+        theirs.env(key, value);
+    }
+    let got = ours
+        .output()
+        .unwrap_or_else(|err| panic!("could not start tumulus: {err}"));
+    let expected = theirs
+        .output()
+        .unwrap_or_else(|err| panic!("could not start jq: {err}"));
+    assert_eq!(
+        got.stdout,
+        expected.stdout,
+        "{program}: stdout differs under {label}\nstderr ours:\n{}\nstderr jq:\n{}",
+        String::from_utf8_lossy(&got.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert_eq!(
+        got.stderr, expected.stderr,
+        "{program}: stderr differs under {label}"
+    );
+    assert_eq!(
+        got.status.code(),
+        expected.status.code(),
+        "{program}: exit status differs under {label}\nstderr ours:\n{}\nstderr jq:\n{}",
+        String::from_utf8_lossy(&got.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
+}
+
 /// jq aborts when `strftime` is given a number and a format that is not a
 /// string. The message here is the one jq prints for an array. Letters
 /// other than the ones these filters accept are not compared with jq.

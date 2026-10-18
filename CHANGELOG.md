@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`strftime`, `strflocaltime`, and `strptime` follow the process locale. `LC_ALL` wins when it names a locale, otherwise `LC_TIME`, otherwise `LANG`. A name the system does not have leaves the C locale.
+
 `strftime`, `strflocaltime`, and `strptime` accept `%C`, `%g`, `%G`, `%h`, `%k`, `%l`, `%n`, `%r`, `%t`, `%U`, `%V`, `%W`, `%x`, `%X`, and `%P`. The text is what the host C library prints, which is what jq prints on that machine. Text that does not match is an error and the exit status is 5. A letter still outside that set is rejected. The message names it and the exit status is 5.
 
 An unknown long option exits 2 with `jq: Unknown option ...` and jq's usage text. A directory passed as a file is not a value, and the exit status is 2. `jq: error: Is a directory` is printed when another file follows it. `.[ {start:1, end:3} ]` reads that slice. Both names have to be present. Null is an omitted bound.
