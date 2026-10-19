@@ -298,7 +298,7 @@ fn finish_program(source: &str, scope: &[String], link: bool) -> Result<Filter, 
     let filter = parser.parse_program()?;
     parser.skip_ws();
     if !parser.eof() {
-        return Err(ProgramError::Syntax);
+        return Err(parser.trailing_token());
     }
     if parser.tail_missing {
         return Err(ProgramError::Report(
@@ -1756,6 +1756,8 @@ pub(super) struct Parser<'a> {
     reject_block: bool,
     /// Object values reject `try`. Parentheses and arguments clear it.
     reject_try: bool,
+    /// Inside `"\( ... )"`. A `)` there ends the interpolation.
+    interp: u32,
     /// The leading minus of a `try` operand. `?` there marks only the last suffix.
     suffix_question: bool,
     /// Inner scopes are at the back. Each `def` body gets its own scope.
@@ -1802,6 +1804,7 @@ impl<'a> Parser<'a> {
             index: 0,
             reject_block: false,
             reject_try: false,
+            interp: 0,
             suffix_question: false,
             scopes: vec![PScope {
                 funcs: Vec::new(),
@@ -2093,7 +2096,13 @@ impl<'a> Parser<'a> {
 
     fn parse_pipe(&mut self) -> Result<Filter, ProgramError> {
         let mut filter = self.parse_comma()?;
-        while self.eat('|') {
+        while self.sees_pipe() {
+            let token_at = self.index;
+            self.bump();
+            let token_end = self.index;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             let right = self.parse_comma()?;
             filter = Filter::Pipe(Box::new(filter), Box::new(right));
         }
@@ -2102,7 +2111,13 @@ impl<'a> Parser<'a> {
 
     fn parse_comma(&mut self) -> Result<Filter, ProgramError> {
         let mut filter = self.parse_alt()?;
-        while self.eat(',') {
+        while self.sees(',') {
+            let token_at = self.index;
+            self.bump();
+            let token_end = self.index;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             let right = self.parse_alt()?;
             filter = Filter::Comma(Box::new(filter), Box::new(right));
         }
@@ -2113,6 +2128,11 @@ impl<'a> Parser<'a> {
     fn parse_alt(&mut self) -> Result<Filter, ProgramError> {
         let left = self.parse_update()?;
         if self.eat_alt() {
+            let token_end = self.index;
+            let token_at = token_end - 2;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             let right = self.parse_alt()?;
             return Ok(Filter::Alt(Box::new(left), Box::new(right)));
         }
@@ -2139,6 +2159,11 @@ impl<'a> Parser<'a> {
     fn parse_or(&mut self) -> Result<Filter, ProgramError> {
         let mut left = self.parse_and()?;
         while self.eat_keyword("or") {
+            let token_end = self.index;
+            let token_at = token_end - 2;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             let right = self.parse_and()?;
             left = Filter::Or(Box::new(left), Box::new(right));
         }
@@ -2148,6 +2173,11 @@ impl<'a> Parser<'a> {
     fn parse_and(&mut self) -> Result<Filter, ProgramError> {
         let mut left = self.parse_cmp()?;
         while self.eat_keyword("and") {
+            let token_end = self.index;
+            let token_at = token_end - 3;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             let right = self.parse_cmp()?;
             left = Filter::And(Box::new(left), Box::new(right));
         }
@@ -2157,9 +2187,16 @@ impl<'a> Parser<'a> {
     /// Comparisons do not chain. `1<2<3` is a syntax error.
     fn parse_cmp(&mut self) -> Result<Filter, ProgramError> {
         let left = self.parse_add()?;
-        let Some(op) = self.cmp_op() else {
+        self.skip_ws();
+        let Some((op, len)) = cmp_at(&self.src[self.index..]) else {
             return Ok(left);
         };
+        let token_at = self.index;
+        self.index += len;
+        let token_end = self.index;
+        if let Some(err) = self.after_operator(token_at, token_end) {
+            return Err(err);
+        }
         let right = self.parse_add()?;
         if self.cmp_op_pending() {
             return Err(ProgramError::Syntax);
@@ -2187,9 +2224,8 @@ impl<'a> Parser<'a> {
             let token_at = self.index;
             self.bump();
             let token_end = self.index;
-            self.skip_ws();
-            if self.eof() {
-                return Err(self.unexpected_eof(token_at, token_end));
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
             }
             let right = self.parse_signed()?;
             left = Filter::Bin {
@@ -2215,6 +2251,11 @@ impl<'a> Parser<'a> {
     fn parse_mul(&mut self) -> Result<Filter, ProgramError> {
         let mut left = self.parse_binding()?;
         while let Some(op) = self.mul_op() {
+            let token_end = self.index;
+            let token_at = token_end - 1;
+            if let Some(err) = self.after_operator(token_at, token_end) {
+                return Err(err);
+            }
             // A minus here is the start of the operand, and that operand
             // includes the tighter `*` `/` `%` that follow it: `2/-3*4`
             // is `2/-(3*4)`. Without the minus, `8/2/2` stays left-associative.
@@ -2329,7 +2370,11 @@ impl<'a> Parser<'a> {
             self.reject_block = saved_block;
             self.reject_try = saved_try;
             let inner = inner?;
+            let token_end = self.index;
             self.skip_ws();
+            if self.eof() {
+                return Err(self.unexpected_eof(token_start(self.src, token_end), token_end));
+            }
             if !self.eat(')') {
                 return Err(ProgramError::Syntax);
             }
@@ -3005,7 +3050,11 @@ impl<'a> Parser<'a> {
             // A missing else yields the input, which is null under -n.
             Filter::Identity
         };
+        let token_end = self.index;
         if !self.eat_keyword("end") {
+            if self.eof() {
+                return Err(self.unterminated_if(token_start(self.src, token_end), token_end));
+            }
             return Err(ProgramError::Syntax);
         }
         Ok(no)
@@ -3077,13 +3126,6 @@ impl<'a> Parser<'a> {
     fn sees(&mut self, expected: char) -> bool {
         self.skip_ws();
         self.peek() == Some(expected)
-    }
-
-    fn cmp_op(&mut self) -> Option<Op> {
-        self.skip_ws();
-        let (op, len) = cmp_at(&self.src[self.index..])?;
-        self.index += len;
-        Some(op)
     }
 
     fn cmp_op_pending(&mut self) -> bool {
@@ -3199,9 +3241,13 @@ impl<'a> Parser<'a> {
         if !self.eat('[') {
             return Err(ProgramError::Syntax);
         }
+        let token_end = self.index;
         self.skip_ws();
         if self.eat(']') {
             return Ok(chain(base, Filter::Iterate));
+        }
+        if self.eof() {
+            return Err(self.unexpected_eof(token_start(self.src, token_end), token_end));
         }
         if self.bracket_has_slice() {
             let mut segment = self.parse_slice_body()?;
@@ -3429,6 +3475,9 @@ impl<'a> Parser<'a> {
             if self.eat('}') {
                 break;
             }
+            if let Some(err) = self.object_operator() {
+                return Err(err);
+            }
             return Err(ProgramError::Syntax);
         }
         if let Some(value) = const_object(&fields) {
@@ -3635,7 +3684,9 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let saved_try = self.reject_try;
                     self.reject_try = false;
+                    self.interp += 1;
                     let inner = self.parse_pipe();
+                    self.interp -= 1;
                     self.reject_try = saved_try;
                     let inner = inner?;
                     if !self.eat(')') {
@@ -3828,6 +3879,90 @@ fn token_start(src: &str, token_end: usize) -> usize {
 }
 
 impl<'a> Parser<'a> {
+    /// The operand after an operator is missing, or the next token cannot
+    /// be that operand. `1 *` is the end of the file. `"\(1 +)"` ends the
+    /// interpolation. `def f: 1 +; f` hits the semicolon.
+    fn after_operator(&mut self, token_at: usize, token_end: usize) -> Option<ProgramError> {
+        self.skip_ws();
+        if self.eof() {
+            return Some(self.unexpected_eof(token_at, token_end));
+        }
+        if self.interp > 0 && self.peek() == Some(')') {
+            return Some(self.unexpected_token(self.index, "unexpected QQSTRING_INTERP_END"));
+        }
+        if self.peek() == Some(';') {
+            return Some(self.unexpected_token(self.index, "unexpected ';'"));
+        }
+        None
+    }
+
+    /// `|` that is not `|=`.
+    fn sees_pipe(&mut self) -> bool {
+        self.skip_ws();
+        self.peek() == Some('|') && self.peek_at(1) != Some('=')
+    }
+
+    /// A finished value with something still written after it.
+    /// `1 2` is a literal. `.a }` is not a token jq names.
+    fn trailing_token(&self) -> ProgramError {
+        match self.peek() {
+            Some('}' | ']' | ')') => self.unexpected_token(
+                self.index,
+                "unexpected INVALID_CHARACTER, expecting end of file",
+            ),
+            Some(ch) if ch.is_ascii_digit() => {
+                self.unexpected_token(self.index, "unexpected LITERAL, expecting end of file")
+            }
+            _ => ProgramError::Syntax,
+        }
+    }
+
+    /// `{a:1+2}`. The value stopped, and jq expected the object to close.
+    fn object_operator(&self) -> Option<ProgramError> {
+        let ch = self.peek()?;
+        if !matches!(ch, '+' | '-' | '*' | '/' | '%') || self.peek_at(1) == Some('=') {
+            return None;
+        }
+        let detail = match ch {
+            '+' => "unexpected '+', expecting '}'",
+            '-' => "unexpected '-', expecting '}'",
+            '*' => "unexpected '*', expecting '}'",
+            '/' => "unexpected '/', expecting '}'",
+            '%' => "unexpected '%', expecting '}'",
+            _ => return None,
+        };
+        Some(self.unexpected_token(self.index, detail))
+    }
+
+    fn unexpected_token(&self, at: usize, detail: &str) -> ProgramError {
+        if place_label() != "<top-level>" {
+            return ProgramError::Syntax;
+        }
+        let (line_no, line, column) = line_at(self.src, at);
+        jq_syntax(detail, line_no, &line, column)
+    }
+
+    /// `if 1 then 2` with no `end`. The end of the file is one error, and
+    /// the open `if` is another.
+    fn unterminated_if(&self, token_at: usize, token_end: usize) -> ProgramError {
+        if place_label() != "<top-level>" {
+            return ProgramError::Syntax;
+        }
+        let (line_no, line, column) = line_at(self.src, token_at);
+        let pad = column + usize::from(token_end < self.src.len());
+        let place = place_label();
+        let mut text = format!(
+            "jq: error: syntax error, unexpected end of file (Unix shell quoting issues?) at {place}, line {line_no}:\n{line}"
+        );
+        text.extend(std::iter::repeat(' ').take(pad));
+        text.push('\n');
+        text.push_str(&format!(
+            "jq: error: Possibly unterminated 'if' statement at {place}, line {line_no}:\n{line}\n"
+        ));
+        text.push_str("jq: 2 compile errors\n");
+        ProgramError::Report(text)
+    }
+
     /// `1 +` and `[1,2`. The column is the last token. Whitespace after
     /// that token adds one more space, which is what jq prints.
     fn unexpected_eof(&self, token_at: usize, token_end: usize) -> ProgramError {

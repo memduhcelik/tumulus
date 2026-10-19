@@ -965,11 +965,43 @@ fn early_syntax_matches_jq() {
 }
 
 #[test]
+fn more_syntax_matches_jq() {
+    require_jq();
+    let programs = [
+        "(1",
+        ".[",
+        "1 2",
+        "{a:1+2}",
+        "if 1 then 2",
+        "1 *",
+        "1 /",
+        "1 %",
+        "1 |",
+        "1 and",
+        "1 or",
+        "1 //",
+        "1 ==",
+        "1 <",
+        "1 >",
+        "1 !=",
+        "1 <=",
+        "1 >=",
+        "[1,",
+        ".a }",
+        r#""\(1 +)""#,
+        "def f: 1 +; f",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "--", program], b"");
+    }
+}
+
+#[test]
 fn operator_syntax_stays_generic() {
     require_jq();
     let bin = env!("CARGO_BIN_EXE_tumulus");
     for program in [
-        "1<2<3", "1==1==1", "{a:1+2}", "not true", "1++2", ".a=.b=1", ".a|=.|=.", ".a+=1+=2",
+        "1<2<3", "1==1==1", "not true", "1++2", ".a=.b=1", ".a|=.|=.", ".a+=1+=2",
     ] {
         let args: Vec<String> = ["-n", "-c", "--", program]
             .into_iter()
