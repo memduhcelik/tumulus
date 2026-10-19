@@ -11,9 +11,8 @@ use std::io::{self, Read as IoRead};
 
 use crate::eprintln;
 use crate::parse::{
-    closer_is_detached, finished_on_eof_cut, nul_cut, parse_seq, program_stream,
-    program_stream_with, pull_stream, scan_input, stream_line, InputScan, LineCursor, SeqItem,
-    StreamState,
+    closer_is_detached, nul_cut, parse_seq, program_stream, program_stream_with, pull_stream,
+    scan_input, stream_line, EofCut, InputScan, LineCursor, SeqItem, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -275,6 +274,8 @@ struct Chunk {
     bom: usize,
     /// Newlines already counted in `raw`. Later values continue from here.
     lines: LineCursor,
+    /// End-of-file read already passed in `raw`. Later values continue from here.
+    cut: EofCut,
 }
 
 struct Item {
@@ -959,6 +960,7 @@ impl Session {
                 raw: bytes.to_vec(),
                 bom,
                 lines: LineCursor::default(),
+                cut: EofCut::default(),
             });
             self.live_chunk = Some(self.chunks.len() - 1);
             return;
@@ -999,6 +1001,7 @@ impl Session {
                         raw: bytes,
                         bom,
                         lines: LineCursor::default(),
+                        cut: EofCut::default(),
                     });
                     return Ok(More::Added);
                 }
@@ -1082,7 +1085,7 @@ impl Session {
         let chunk = &mut self.chunks[index];
         let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
         let line = chunk.lines.line_at(&chunk.raw, raw_end, atom);
-        let cut = finished_on_eof_cut(&chunk.raw, raw_end);
+        let cut = chunk.cut.at(&chunk.raw, raw_end);
         let name = chunk.name.clone();
         self.cut_at_eof = cut;
         (name, line)

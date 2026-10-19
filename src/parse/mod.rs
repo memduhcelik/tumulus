@@ -583,34 +583,58 @@ fn read_chunk(text: &[u8], start: usize) -> usize {
     end
 }
 
-/// The value ending at `end` was completed in the last read of `bytes`, and
-/// that read did not end on a newline.
+/// Where the next end-of-file check can start.
 ///
-/// `end` is the first byte after the value, or `bytes.len()` when the value
-/// runs to the end of the file. A read that ends on a newline does not count.
-/// A full 4095-byte read with more of the file after it does not count either.
-pub(crate) fn finished_on_eof_cut(bytes: &[u8], end: usize) -> bool {
-    if bytes.is_empty() || end == 0 {
-        return false;
-    }
-    let pos = if end < bytes.len() {
-        end
-    } else {
-        bytes.len() - 1
-    };
-    let mut at = 0;
-    while at < bytes.len() {
-        let next = read_chunk(bytes, at);
-        if next == at {
-            break;
+/// Each value used to walk from the first byte of the file. A file of many
+/// values then reread every earlier line once per value. A check continues
+/// from the last read it has passed. A read is passed only when it ended
+/// before the end of the buffer, so more bytes can still lengthen a short
+/// read at the end.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EofCut {
+    at: usize,
+}
+
+impl EofCut {
+    /// The value ending at `end` was completed in the last read of `bytes`,
+    /// and that read did not end on a newline.
+    ///
+    /// `end` is the first byte after the value, or `bytes.len()` when the
+    /// value runs to the end of the file. A read that ends on a newline does
+    /// not count. A full 4095-byte read with more of the file after it does
+    /// not count either.
+    pub(crate) fn at(&mut self, bytes: &[u8], end: usize) -> bool {
+        if bytes.is_empty() || end == 0 {
+            return false;
         }
-        if pos < next {
-            let saw_nl = bytes[next - 1] == b'\n';
-            return next == bytes.len() && !saw_nl;
+        // The last read ended on a newline. No value was completed by a
+        // short read at the end of the buffer.
+        if bytes.last() == Some(&b'\n') {
+            return false;
         }
-        at = next;
+        let pos = if end < bytes.len() {
+            end
+        } else {
+            bytes.len() - 1
+        };
+        if self.at > pos || self.at > bytes.len() {
+            self.at = 0;
+        }
+        let mut at = self.at;
+        while at < bytes.len() {
+            let next = read_chunk(bytes, at);
+            if next == at {
+                break;
+            }
+            if pos < next {
+                self.at = at;
+                return next == bytes.len() && bytes[next - 1] != b'\n';
+            }
+            at = next;
+            self.at = at;
+        }
+        false
     }
-    false
 }
 
 fn newline_count(text: &[u8]) -> usize {
@@ -631,7 +655,11 @@ fn is_atom(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{finished_on_eof_cut, stream_line, LineCursor};
+    use super::{stream_line, EofCut, LineCursor};
+
+    fn finished_on_eof_cut(bytes: &[u8], end: usize) -> bool {
+        EofCut::default().at(bytes, end)
+    }
 
     fn bytes(len: usize, newline_every: usize) -> Vec<u8> {
         let mut text = vec![b'a'; len];
@@ -715,5 +743,129 @@ mod tests {
         assert!(finished_on_eof_cut(&long, 4095));
         long.push(b'\n');
         assert!(!finished_on_eof_cut(&long, 4095));
+    }
+
+    /// The read loop `finished_on_eof_cut` used before it continued forward.
+    fn slow_eof_cut(bytes: &[u8], end: usize) -> bool {
+        if bytes.is_empty() || end == 0 {
+            return false;
+        }
+        let pos = if end < bytes.len() {
+            end
+        } else {
+            bytes.len() - 1
+        };
+        let mut at = 0;
+        while at < bytes.len() {
+            let next = super::read_chunk(bytes, at);
+            if next == at {
+                break;
+            }
+            if pos < next {
+                let saw_nl = bytes[next - 1] == b'\n';
+                return next == bytes.len() && !saw_nl;
+            }
+            at = next;
+        }
+        false
+    }
+
+    fn agrees(walk: &mut EofCut, bytes: &[u8], end: usize) {
+        assert_eq!(
+            walk.at(bytes, end),
+            slow_eof_cut(bytes, end),
+            "end {end} len {}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn eof_cut_continues_from_the_read_it_passed() {
+        let mut texts = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"3".to_vec(),
+            b"1\n".to_vec(),
+            b"1\n2\n3".to_vec(),
+            b"1\n2\n3\n".to_vec(),
+            b"1\n2\n3 ".to_vec(),
+            b"1\n2\n3\n ".to_vec(),
+            b"1\n2\n   ".to_vec(),
+            vec![b'1'; 4095],
+            vec![b'1'; 4096],
+            vec![b'a'; 8190],
+        ];
+        let mut nl_then = vec![b'\n'];
+        nl_then.extend(std::iter::repeat(b'a').take(5000));
+        texts.push(nl_then);
+        let mut boundary = vec![b'a'; 4094];
+        boundary.push(b'\n');
+        boundary.push(b'b');
+        texts.push(boundary);
+
+        for text in &texts {
+            let mut walk = EofCut::default();
+            for end in 0..=text.len() {
+                agrees(&mut walk, text, end);
+            }
+            if text.len() > 4 {
+                agrees(&mut walk, text, 1);
+                agrees(&mut walk, text, text.len());
+            }
+        }
+
+        // Bytes arriving later extend a short read. The same walk has to
+        // agree after each extra byte, including a newline that ends it.
+        let mut buf = Vec::new();
+        let mut walk = EofCut::default();
+        for &byte in b"12\n3 4\n5\n6789" {
+            buf.push(byte);
+            for end in 0..=buf.len() {
+                agrees(&mut walk, &buf, end);
+            }
+        }
+
+        // A short tail that grows past a 4095-byte read is a new last read.
+        let mut grown = vec![b'\n'];
+        grown.extend(std::iter::repeat(b'a').take(100));
+        let mut walk = EofCut::default();
+        agrees(&mut walk, &grown, grown.len());
+        grown.extend(std::iter::repeat(b'a').take(4090));
+        agrees(&mut walk, &grown, 50);
+        agrees(&mut walk, &grown, grown.len());
+        grown.push(b'\n');
+        agrees(&mut walk, &grown, grown.len());
+        grown.push(b'z');
+        agrees(&mut walk, &grown, grown.len());
+
+        let mut many = Vec::new();
+        for _ in 0..200_000 {
+            many.extend_from_slice(b"1\n");
+        }
+        many.pop();
+        let marks = [
+            0,
+            1,
+            2,
+            4094,
+            4095,
+            4096,
+            many.len() / 2,
+            many.len().saturating_sub(1),
+            many.len(),
+        ];
+        let mut walk = EofCut::default();
+        for end in marks {
+            agrees(&mut walk, &many, end);
+        }
+        let started = std::time::Instant::now();
+        let mut walk = EofCut::default();
+        for end in 0..=many.len() {
+            let _ = walk.at(&many, end);
+        }
+        assert!(
+            started.elapsed().as_millis() < 3_000,
+            "reread the file for every value"
+        );
     }
 }

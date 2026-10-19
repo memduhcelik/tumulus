@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A file of many JSON values is read in one pass again. Finding the read that completed a value no longer walks the earlier bytes once per value. The values and the line numbers are unchanged.
+
 `(1`, `.[`, `1 2`, `{a:1+2}`, `if 1 then 2`, an operator left at the end such as `1 *`, `[1,`, `.a }`, `"\(1 +)"`, and `def f: 1 +; f` are syntax errors. Each prints jq's message, and the exit status is 3.
 
 Files are one JSON stream. An array or an object can open in one file and close in a later one. A value already written is kept when the joined text is not valid JSON. The message is jq's parse error and the exit status is 5.

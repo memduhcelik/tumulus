@@ -151,25 +151,25 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 1.87 | 1.09 | 2.07 | 0.83 |
-| 2 | 1.88 | 0.79 | 2.06 | 0.84 |
-| 3 | 1.91 | 0.79 | 2.09 | 0.82 |
+| 1 | 1.90 | 0.86 | 2.05 | 0.89 |
+| 2 | 1.90 | 0.86 | 2.05 | 0.89 |
+| 3 | 1.91 | 0.87 | 2.08 | 0.91 |
 
 `citylots.json` is 189778220 bytes and 413125 lines. Compact output was 169215413 bytes. Pretty output was 395218854 bytes.
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 3.67 | 2.36 | 7.29 | 2.45 |
-| 2 | 3.66 | 2.33 | 7.35 | 2.44 |
-| 3 | 3.67 | 2.33 | 7.32 | 2.46 |
+| 1 | 3.59 | 2.33 | 7.18 | 2.47 |
+| 2 | 3.53 | 2.36 | 7.23 | 2.48 |
+| 3 | 3.59 | 2.35 | 7.24 | 2.49 |
 
 `[.features[] | select(.properties.STREET == "UNKNOWN")] | length` reads that same file and prints `2843`. Compact and pretty printing of that number are the same text, so these runs used `-c`.
 
 | run | `jq -c` | `tumulus -c` |
 | --- | ---: | ---: |
-| 1 | 1.70 | 2.60 |
-| 2 | 1.70 | 2.62 |
-| 3 | 1.72 | 2.64 |
+| 1 | 1.73 | 2.24 |
+| 2 | 1.74 | 2.27 |
+| 3 | 1.77 | 2.26 |
 
 Times are seconds.
 
