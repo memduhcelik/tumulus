@@ -2182,7 +2182,15 @@ impl<'a> Parser<'a> {
                 (Some('-'), _) => Op::Sub,
                 _ => break,
             };
+            // `1 +` has nothing after the operator. jq names that as the
+            // end of the file, at the operator.
+            let token_at = self.index;
             self.bump();
+            let token_end = self.index;
+            self.skip_ws();
+            if self.eof() {
+                return Err(self.unexpected_eof(token_at, token_end));
+            }
             let right = self.parse_signed()?;
             left = Filter::Bin {
                 op,
@@ -2309,6 +2317,9 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<Filter, ProgramError> {
         self.skip_ws();
+        if let Some(err) = self.lone_closing_brace() {
+            return Err(err);
+        }
         if self.eat('(') {
             let saved_block = self.reject_block;
             let saved_try = self.reject_try;
@@ -3380,7 +3391,13 @@ impl<'a> Parser<'a> {
             return Ok(Filter::Literal(Value::array(Vec::new())));
         }
         let inner = self.parse_pipe()?;
+        // `[1,2` parsed the elements and then the file ended.
+        let token_end = self.index;
         self.skip_ws();
+        if self.eof() {
+            let token_at = token_start(self.src, token_end);
+            return Err(self.unexpected_eof(token_at, token_end));
+        }
         if !self.eat(']') {
             return Err(ProgramError::Syntax);
         }
@@ -3780,6 +3797,79 @@ pub(super) fn number_value(token: &str) -> Result<Value, ProgramError> {
 
 pub(super) fn decode_string_token(text: &str) -> Result<String, String> {
     crate::parse::decode_string_token(text)
+}
+
+/// Spaces, tabs, and newlines. A comment is not whitespace here.
+fn only_ws(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// The start of the token that ends at `token_end`.
+fn token_start(src: &str, token_end: usize) -> usize {
+    let bytes = src.as_bytes();
+    if token_end == 0 || token_end > bytes.len() {
+        return 0;
+    }
+    let mut index = token_end - 1;
+    if bytes[index].is_ascii_digit() {
+        while index > 0 && (bytes[index - 1].is_ascii_digit() || bytes[index - 1] == b'.') {
+            index -= 1;
+        }
+        return index;
+    }
+    if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+        while index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_') {
+            index -= 1;
+        }
+        return index;
+    }
+    index
+}
+
+impl<'a> Parser<'a> {
+    /// `1 +` and `[1,2`. The column is the last token. Whitespace after
+    /// that token adds one more space, which is what jq prints.
+    fn unexpected_eof(&self, token_at: usize, token_end: usize) -> ProgramError {
+        if place_label() != "<top-level>" {
+            return ProgramError::Syntax;
+        }
+        let (line_no, line, column) = line_at(self.src, token_at);
+        let pad = column + usize::from(token_end < self.src.len());
+        jq_syntax("unexpected end of file", line_no, &line, pad)
+    }
+
+    /// A `}` with nothing else in the program. jq calls that character
+    /// invalid and says it expected the end of the file.
+    fn lone_closing_brace(&self) -> Option<ProgramError> {
+        if self.peek() != Some('}') {
+            return None;
+        }
+        let after = self.index + 1;
+        if !only_ws(&self.src[..self.index]) || !only_ws(&self.src[after..]) {
+            return None;
+        }
+        if place_label() != "<top-level>" {
+            return Some(ProgramError::Syntax);
+        }
+        let (line_no, line, column) = line_at(self.src, self.index);
+        Some(jq_syntax(
+            "unexpected INVALID_CHARACTER, expecting end of file",
+            line_no,
+            &line,
+            column,
+        ))
+    }
+}
+
+fn jq_syntax(detail: &str, line_no: usize, line: &str, pad: usize) -> ProgramError {
+    let mut text = format!(
+        "jq: error: syntax error, {detail} (Unix shell quoting issues?) at {}, line {line_no}:\n{line}",
+        place_label()
+    );
+    text.extend(std::iter::repeat(' ').take(pad));
+    text.push_str("\njq: 1 compile error\n");
+    ProgramError::Report(text)
 }
 
 pub(super) fn report_at(source: &str, pos: usize, message: &str) -> ProgramError {

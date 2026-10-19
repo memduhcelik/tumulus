@@ -1295,6 +1295,16 @@ fn operators_match_jq() {
 }
 
 #[test]
+fn early_syntax_matches_jq() {
+    require_jq();
+    for program in [
+        "1 +", "1 -", "1 +\n", "1 + 2 +", "[1,2", "[1,2\n", "[1,2 ", "}", " }", "}\n", "\n}",
+    ] {
+        compare_exact(program, &["-n", "--", program], b"");
+    }
+}
+
+#[test]
 fn operator_syntax_stays_generic() {
     require_jq();
     let bin = env!("CARGO_BIN_EXE_tumulus");

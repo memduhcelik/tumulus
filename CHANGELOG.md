@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A program that ends after `+` or `-`, such as `1 +`, is a syntax error. `[1,2` is a syntax error: the elements are there and the `]` is missing at the end. A `}` on its own is a syntax error. Each prints jq's message and the exit status is 3. Of the 447 programs in jq 1.7.1's test file, 444 come out the same. The new one is line 1726, `}`. No previously matching program was lost.
+
 `strftime`, `strflocaltime`, and `strptime` follow the process locale. `LC_ALL` wins when it names a locale, otherwise `LC_TIME`, otherwise `LANG`. A name the system does not have leaves the C locale.
 
 `strftime`, `strflocaltime`, and `strptime` accept `%C`, `%g`, `%G`, `%h`, `%k`, `%l`, `%n`, `%r`, `%t`, `%U`, `%V`, `%W`, `%x`, `%X`, and `%P`. The text is what the host C library prints, which is what jq prints on that machine. Text that does not match is an error and the exit status is 5. A letter still outside that set is rejected. The message names it and the exit status is 5.
