@@ -5781,12 +5781,12 @@ fn rejected_options_stay_ours() {
         "--args=foo",
         "--bogus",
         "--Help",
+        "-Z",
+        "-eQ",
+        "-fprog.jq",
+        "-cZ",
     ] {
         compare_exact(option, &[option], b"");
-    }
-    for option in ["-fprog.jq", "-eQ"] {
-        let stderr = format!("tumulus: unknown option: {option}\n");
-        assert_rejects(option, &[option], b"", stderr.as_bytes(), 1);
     }
 
     let (dir, _guard) = scratch("reject");

@@ -1476,7 +1476,8 @@ fn apply_short_cluster(flags: &mut Flags, arg: &str) -> Result<(), Error> {
             'f' => flags.from_file = true,
             'C' => flags.color = true,
             'M' => flags.mono = true,
-            _ => return Err(Error::new(format!("unknown option: {arg}"))),
+            // The whole argument is named, including letters that are known.
+            _ => jq_usage(&format!("jq: Unknown option {arg}")),
         }
     }
     Ok(())

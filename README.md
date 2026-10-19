@@ -41,7 +41,7 @@ Printing:
 - `-h` and `--help` print help to stdout and exit 0. The filter is not run. A short cluster that contains `h`, such as `-hx` or `-Vh`, is help, and the other letters in that cluster are not read.
 - `--build-configuration` prints `oniguruma=6.9.10` and exits 0. The filter is not run.
 - The first of `-h`, `--help`, `-V`, `--version`, and `--build-configuration` wins. Later arguments are not read. After `--`, none of them is an option.
-- An unknown long option exits 2. The message is `jq: Unknown option ...`, then jq's usage text.
+- An unknown option exits 2. The message is `jq: Unknown option ...`, then jq's usage text. A short cluster names the whole argument, as in `-Z` and `-eQ`.
 
 Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.
 
@@ -140,8 +140,6 @@ A syntax error in a module file is `tumulus: syntax error`. jq prints its own pa
 `strftime`, `strflocaltime`, and `strptime` reject a format letter other than the ones above. The message names the letter and the exit status is 5.
 
 `path` of an object in the brackets, `.[ {start:1, end:3} ]`, prints that object, with `start` before `end`. A `?` written immediately after a slice, as in `.[1,error("z"):]?`, also swallows an `error` raised while computing a bound. jq reports that error. `(.[1,error("z"):])?` agrees with jq. When the first slice of an update cannot be written, a later bound is still run. jq does not run it. `try (.[1,(input):] = 9) catch input` therefore reads the next input here and does not in jq.
-
-An unknown short option exits 1 with `tumulus: unknown option: ...`. jq exits 2 and prints its usage text.
 
 A value that runs past the end of one file does not continue into the next file, unless `--stream` is set or the program calls `input`, `inputs`, or `input_filename`. jq keeps parsing across that boundary. After a parse error, later files are not read, unless `input` or `inputs` caught the bad value and asked for another one, or `--stream-errors` is set.
 
