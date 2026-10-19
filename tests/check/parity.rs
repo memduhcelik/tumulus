@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 fn require_jq() {
     match Command::new("jq").arg("--version").output() {
@@ -4195,14 +4195,16 @@ fn jq_string_literal(text: &str) -> String {
 }
 
 /// Locale-dependent letters follow `LC_ALL`, then `LC_TIME`, then `LANG`.
-/// Every name is required. `scripts/install-date-locales.sh` installs them
-/// on the CI machines.
+/// Every name is required. glibc accepts both codeset spellings. Apple
+/// ships `UTF-8` only, and `/usr/share/locale` is on a read-only volume,
+/// so the `utf8` names are links reached through `PATH_LOCALE`.
 #[test]
 fn date_locale_matches_jq() {
     require_jq();
+    let aliases = utf8_locale_aliases();
     let mut missing = Vec::new();
     for name in DATE_LOCALES {
-        match locale_problem(name) {
+        match locale_problem(name, aliases.as_deref()) {
             None => {}
             Some(problem) => missing.push(problem),
         }
@@ -4214,28 +4216,40 @@ fn date_locale_matches_jq() {
     );
     for name in DATE_LOCALES {
         for program in DATE_LOCALE_PROGRAMS {
-            compare_date_locale(program, &[("LC_ALL", name)]);
+            compare_date_locale(program, &[("LC_ALL", name)], aliases.as_deref());
         }
     }
     let en = "en_US.UTF-8";
     let de = "de_DE.UTF-8";
     for program in DATE_LOCALE_CHOICE {
-        compare_date_locale(program, &[("LANG", en)]);
-        compare_date_locale(program, &[("LC_TIME", en)]);
-        compare_date_locale(program, &[("LC_ALL", "C"), ("LC_TIME", en), ("LANG", en)]);
-        compare_date_locale(program, &[("LC_ALL", ""), ("LANG", en)]);
-        compare_date_locale(program, &[("LC_TIME", de), ("LANG", en)]);
-        compare_date_locale(program, &[("LC_ALL", en), ("LC_TIME", de)]);
+        compare_date_locale(program, &[("LANG", en)], aliases.as_deref());
+        compare_date_locale(program, &[("LC_TIME", en)], aliases.as_deref());
+        compare_date_locale(
+            program,
+            &[("LC_ALL", "C"), ("LC_TIME", en), ("LANG", en)],
+            aliases.as_deref(),
+        );
+        compare_date_locale(program, &[("LC_ALL", ""), ("LANG", en)], aliases.as_deref());
+        compare_date_locale(
+            program,
+            &[("LC_TIME", de), ("LANG", en)],
+            aliases.as_deref(),
+        );
+        compare_date_locale(
+            program,
+            &[("LC_ALL", en), ("LC_TIME", de)],
+            aliases.as_deref(),
+        );
     }
     for program in DATE_LOCALE_CHOICE {
-        compare_date_locale(program, &[("LC_ALL", "zz_ZZ.UTF-8")]);
-        compare_date_locale(program, &[]);
+        compare_date_locale(program, &[("LC_ALL", "zz_ZZ.UTF-8")], aliases.as_deref());
+        compare_date_locale(program, &[], aliases.as_deref());
     }
 }
 
-/// Names compared above. Both spellings are required: glibc lists `utf8`
-/// and accepts `UTF-8`, and Apple ships `UTF-8` only until the utf8 name
-/// is linked to that directory.
+/// Names compared above. Both spellings are required. glibc accepts
+/// `utf8` and `UTF-8`. Apple ships `UTF-8` only; the other spelling is
+/// added by `utf8_locale_aliases`.
 const DATE_LOCALES: &[&str] = &[
     "C",
     "POSIX",
@@ -4301,6 +4315,45 @@ const LOCALE_ENV: &[&str] = &[
     "LC_MESSAGES",
 ];
 
+/// Links whose names are the `utf8` spelling of each shipped `UTF-8` locale.
+/// `None` where the C library already accepts that spelling. `PATH_LOCALE`
+/// replaces the locale search directory, so it is set only for a `utf8` name.
+#[cfg(target_os = "macos")]
+fn utf8_locale_aliases() -> Option<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("date-locales");
+    fs::create_dir_all(&root)
+        .unwrap_or_else(|err| panic!("could not create {}: {err}", root.display()));
+    for name in DATE_LOCALES {
+        let Some(spec) = name.strip_suffix(".utf8") else {
+            continue;
+        };
+        let src = format!("/usr/share/locale/{spec}.UTF-8");
+        assert!(Path::new(&src).is_dir(), "missing locale directory {src}");
+        let dst = root.join(name);
+        if dst.symlink_metadata().is_ok() {
+            continue;
+        }
+        std::os::unix::fs::symlink(&src, &dst)
+            .unwrap_or_else(|err| panic!("could not link {} to {src}: {err}", dst.display()));
+    }
+    Some(root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn utf8_locale_aliases() -> Option<PathBuf> {
+    None
+}
+
+fn apply_path_locale(cmd: &mut Command, aliases: Option<&Path>, names: &[&str]) {
+    cmd.env_remove("PATH_LOCALE");
+    let Some(dir) = aliases else {
+        return;
+    };
+    if names.iter().any(|name| name.ends_with(".utf8")) {
+        cmd.env("PATH_LOCALE", dir);
+    }
+}
+
 /// `utf8` and `UTF-8` are the same codeset. glibc prints one spelling and
 /// Apple can print the directory a link points at.
 fn same_locale(requested: &str, reported: &str) -> bool {
@@ -4311,10 +4364,11 @@ fn same_locale(requested: &str, reported: &str) -> bool {
 
 /// `None` when `name` is installed. glibc prints the requested name and a
 /// "Cannot set" warning when it is not. Apple reports the C locale instead.
-fn locale_problem(name: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/locale")
-        .env_clear()
-        .env("LC_ALL", name)
+fn locale_problem(name: &str, aliases: Option<&Path>) -> Option<String> {
+    let mut cmd = Command::new("/usr/bin/locale");
+    cmd.env_clear().env("LC_ALL", name);
+    apply_path_locale(&mut cmd, aliases, &[name]);
+    let output = cmd
         .output()
         .unwrap_or_else(|err| panic!("could not run locale: {err}"));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4338,7 +4392,7 @@ fn locale_problem(name: &str) -> Option<String> {
     Some(format!("{name} (no LC_ALL line)"))
 }
 
-fn compare_date_locale(program: &str, vars: &[(&str, &str)]) {
+fn compare_date_locale(program: &str, vars: &[(&str, &str)], aliases: Option<&Path>) {
     let bin = env!("CARGO_BIN_EXE_tumulus");
     let args = ["-n", "-c", "--", program];
     let label = if vars.is_empty() {
@@ -4361,6 +4415,9 @@ fn compare_date_locale(program: &str, vars: &[(&str, &str)]) {
         ours.env(key, value);
         theirs.env(key, value);
     }
+    let names = vars.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+    apply_path_locale(&mut ours, aliases, &names);
+    apply_path_locale(&mut theirs, aliases, &names);
     let got = ours
         .output()
         .unwrap_or_else(|err| panic!("could not start tumulus: {err}"));

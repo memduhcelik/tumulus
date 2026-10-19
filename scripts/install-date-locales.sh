@@ -2,8 +2,9 @@
 # Install every locale date_locale_matches_jq compares.
 # On Linux, locale-gen builds the language locales. C, POSIX, and C.utf8
 # are already part of glibc, and glibc accepts the UTF-8 spelling of those
-# names too. Apple ships the UTF-8 directories only, so the utf8 names are
-# links to them.
+# names too. Apple ships the UTF-8 directories only. They live on a
+# read-only volume, so this script only checks that those directories are
+# there. The test adds the utf8 names through PATH_LOCALE.
 set -eu
 
 as_root() {
@@ -17,15 +18,10 @@ as_root() {
 if [ "$(uname)" = "Darwin" ]; then
   for spec in C en_US en_GB de_DE fr_FR ja_JP; do
     src="/usr/share/locale/${spec}.UTF-8"
-    dst="/usr/share/locale/${spec}.utf8"
-    if [ -e "$dst" ]; then
-      continue
-    fi
     if [ ! -d "$src" ]; then
       echo "missing locale directory $src" >&2
       exit 1
     fi
-    as_root ln -s "${spec}.UTF-8" "$dst"
   done
   exit 0
 fi
