@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Files are one JSON stream. An array or an object can open in one file and close in a later one. A value already written is kept when the joined text is not valid JSON. The message is jq's parse error and the exit status is 5.
+
 An unknown short option, such as `-Z`, exits 2. The message is `jq: Unknown option` and the whole argument, then jq's usage text.
 
 A program that ends after `+` or `-`, such as `1 +`, is a syntax error. `[1,2` is a syntax error: the elements are there and the `]` is missing at the end. A `}` on its own is a syntax error. Each prints jq's message and the exit status is 3. Of the 447 programs in jq 1.7.1's test file, 444 come out the same. The new one is line 1726, `}`. No previously matching program was lost.

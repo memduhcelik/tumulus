@@ -22,7 +22,7 @@ Build a release binary with `cargo build --release`. The binary is `target/relea
 
 ## What works
 
-Input is standard input or files. `-` is standard input. With no filter, the filter is `.`.
+Input is standard input or files. `-` is standard input. With no filter, the filter is `.`. The files are one stream. An array or an object can open in one file and close in a later one. A value already written is kept when that joined text is not valid JSON. The message is jq's parse error and the exit status is 5.
 
 Printing:
 
@@ -141,7 +141,7 @@ A syntax error in a module file is `tumulus: syntax error`. jq prints its own pa
 
 `path` of an object in the brackets, `.[ {start:1, end:3} ]`, prints that object, with `start` before `end`. A `?` written immediately after a slice, as in `.[1,error("z"):]?`, also swallows an `error` raised while computing a bound. jq reports that error. `(.[1,error("z"):])?` agrees with jq. When the first slice of an update cannot be written, a later bound is still run. jq does not run it. `try (.[1,(input):] = 9) catch input` therefore reads the next input here and does not in jq.
 
-A value that runs past the end of one file does not continue into the next file, unless `--stream` is set or the program calls `input`, `inputs`, or `input_filename`. jq keeps parsing across that boundary. After a parse error, later files are not read, unless `input` or `inputs` caught the bad value and asked for another one, or `--stream-errors` is set.
+After a parse error, later files are not read, unless `input` or `inputs` caught the bad value and asked for another one, or `--stream-errors` is set.
 
 ## Time against jq
 

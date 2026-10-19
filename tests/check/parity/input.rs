@@ -593,6 +593,51 @@ fn directory_files_match_jq() {
 }
 
 #[test]
+fn joined_files_match_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("joined");
+    let open_array = write_bytes(&dir, "open-array.json", b"[1,\n");
+    let close_array = write_bytes(&dir, "close-array.json", b"2]\n");
+    let open_object = write_bytes(&dir, "open-object.json", b"{\"a\":\n");
+    let close_object = write_bytes(&dir, "close-object.json", b"1}\n");
+    let nested_open = write_bytes(&dir, "nested-open.json", b"{\"a\":[1,\n");
+    let nested_close = write_bytes(&dir, "nested-close.json", b"{\"b\":2}]}\n");
+    let empty = write_bytes(&dir, "empty.json", b"");
+    let third = write_bytes(&dir, "third.json", b"3]\n");
+    let begun = write_bytes(&dir, "begun.json", b"1\n[2,\n");
+    let bad = write_bytes(&dir, "bad.json", b"not\n");
+    let wrong = write_bytes(&dir, "wrong.json", b"}\n");
+    let alone = write_bytes(&dir, "alone.json", b"[1,\n");
+    let later = write_bytes(&dir, "later.json", b"9\n");
+    compare_exact("array", &["-c", ".", &open_array, &close_array], b"");
+    compare_exact("object", &["-c", ".", &open_object, &close_object], b"");
+    compare_exact("nested", &["-c", ".", &nested_open, &nested_close], b"");
+    compare_exact(
+        "empty between",
+        &["-c", ".", &open_array, &empty, &close_array],
+        b"",
+    );
+    compare_exact(
+        "three files",
+        &["-c", ".", &open_array, &empty, &third],
+        b"",
+    );
+    compare_exact("value then bad", &["-c", ".", &begun, &bad], b"");
+    compare_exact("wrong closer", &["-c", ".", &open_array, &wrong], b"");
+    compare_exact("unfinished alone", &["-c", ".", &alone], b"");
+    compare_exact(
+        "bad stops the next file",
+        &["-c", ".", &begun, &bad, &later],
+        b"",
+    );
+    compare_exact(
+        "error names the closing file",
+        &["-c", "error(\"z\")", &open_array, &close_array],
+        b"",
+    );
+}
+
+#[test]
 fn inputs_span_files_match_jq() {
     require_jq();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

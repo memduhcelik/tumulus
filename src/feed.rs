@@ -878,6 +878,9 @@ impl Session {
                 match open_live(&path)? {
                     LiveOpen::Reader(live) => self.live = Some(live),
                     LiveOpen::Missing(reason) => {
+                        if self.dir_pending {
+                            self.flush_dir();
+                        }
                         eprintln!("jq: error: Could not open file {name}: {reason}");
                         self.missing = true;
                         self.failed_here = Some(name.clone());
@@ -1000,6 +1003,11 @@ impl Session {
                     return Ok(More::Added);
                 }
                 Opened::Missing(reason) => {
+                    // A directory is announced when the next file is tried,
+                    // including one that cannot be opened.
+                    if self.dir_pending {
+                        self.flush_dir();
+                    }
                     eprintln!("jq: error: Could not open file {name}: {reason}");
                     self.missing = true;
                     self.failed_here = Some(name.clone());

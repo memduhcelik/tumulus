@@ -165,8 +165,10 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
             &mut run,
             out,
         )?;
-    } else if options.stream {
-        // The same reader as `inputs`, so a value can run on into the next file.
+    } else if options.stream || (!options.seq && !options.files.is_empty()) {
+        // Every file is one stream. An array or an object can open in one
+        // file and close in a later one. `--seq` still reads each file alone.
+        // Standard input on its own stays one read.
         apply_shared(&options, &program, &env, &mut run, out)?;
     } else {
         apply_values(
