@@ -92,6 +92,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parse) fn peek(&self) -> Option<char> {
+        let byte = *self.src.get(self.index)?;
+        if byte < 0x80 {
+            return Some(byte as char);
+        }
         self.char_at(self.index)
     }
 
@@ -106,6 +110,17 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parse) fn bump(&mut self) -> Option<char> {
+        let byte = *self.src.get(self.index)?;
+        if byte < 0x80 {
+            self.index += 1;
+            if byte == b'\n' {
+                self.line += 1;
+                self.column = 0;
+            } else {
+                self.column += 1;
+            }
+            return Some(byte as char);
+        }
         let (c, width) = decode_at(self.src, self.index)?;
         self.index += width;
         if c == '\n' {

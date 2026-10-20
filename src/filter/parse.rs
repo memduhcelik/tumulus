@@ -1001,14 +1001,14 @@ fn dep_record(meta: Option<Value>, alias: Option<&str>, data: bool, rel: &str) -
         super::value::put(
             &mut pairs,
             "as".to_string(),
-            Value::String(alias.to_string()),
+            Value::String(crate::value::Text::from(alias.to_string())),
         );
     }
     super::value::put(&mut pairs, "is_data".to_string(), Value::Bool(data));
     super::value::put(
         &mut pairs,
         "relpath".to_string(),
-        Value::String(rel.to_string()),
+        Value::String(crate::value::Text::from(rel.to_string())),
     );
     Value::object(pairs)
 }
@@ -1138,7 +1138,9 @@ fn type_is(kind: &str) -> Filter {
     Filter::Bin {
         op: Op::Eq,
         left: Box::new(Filter::Type),
-        right: Box::new(Filter::Literal(Value::String(kind.to_string()))),
+        right: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+            kind.to_string(),
+        )))),
     }
 }
 
@@ -1146,7 +1148,9 @@ fn type_is_not(kind: &str) -> Filter {
     Filter::Bin {
         op: Op::Ne,
         left: Box::new(Filter::Type),
-        right: Box::new(Filter::Literal(Value::String(kind.to_string()))),
+        right: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+            kind.to_string(),
+        )))),
     }
 }
 
@@ -1191,8 +1195,10 @@ fn regex_one(name: &str, arg: Box<Filter>) -> Filter {
             at: 0,
         })
     };
-    let string_type = Filter::Literal(Value::String("string".to_string()));
-    let array_type = Filter::Literal(Value::String("array".to_string()));
+    let string_type = Filter::Literal(Value::String(crate::value::Text::from(
+        "string".to_string(),
+    )));
+    let array_type = Filter::Literal(Value::String(crate::value::Text::from("array".to_string())));
     let is_string = Filter::Bin {
         op: Op::Eq,
         left: vt(),
@@ -1207,18 +1213,24 @@ fn regex_one(name: &str, arg: Box<Filter>) -> Filter {
     let longer = Filter::Bin {
         op: Op::Gt,
         left: Box::new(length.clone()),
-        right: Box::new(Filter::Literal(Value::Number("1".to_string()))),
+        right: Box::new(Filter::Literal(Value::Number(crate::value::Text::from(
+            "1".to_string(),
+        )))),
     };
     let nonempty = Filter::Bin {
         op: Op::Gt,
         left: Box::new(length),
-        right: Box::new(Filter::Literal(Value::Number("0".to_string()))),
+        right: Box::new(Filter::Literal(Value::Number(crate::value::Text::from(
+            "0".to_string(),
+        )))),
     };
     let none = || Box::new(Filter::Literal(Value::Null));
     let at = |index: &str| {
         Box::new(Filter::At {
             base: val(),
-            key: Box::new(Filter::Literal(Value::Number(index.to_string()))),
+            key: Box::new(Filter::Literal(Value::Number(crate::value::Text::from(
+                index.to_string(),
+            )))),
             optional: false,
         })
     };
@@ -1235,9 +1247,9 @@ fn regex_one(name: &str, arg: Box<Filter>) -> Filter {
                 no: Box::new(Filter::Raise(Box::new(Filter::Bin {
                     op: Op::Add,
                     left: vt(),
-                    right: Box::new(Filter::Literal(Value::String(
+                    right: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
                         " not a string or array".to_string(),
-                    ))),
+                    )))),
                 }))),
             }),
         }),
@@ -1340,7 +1352,7 @@ fn sub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter>
     // Two arguments use an empty flags string. Null is a real flags value.
     let flags = match flags {
         Some(flags) => *flags,
-        None => Filter::Literal(Value::String(String::new())),
+        None => Filter::Literal(Value::String(crate::value::Text::from(String::new()))),
     };
     bind_lazy(
         vec![("re", *re), ("flags", flags)],
@@ -1357,7 +1369,9 @@ fn gsub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter
         None => sub_call(
             re,
             replacement,
-            Some(Box::new(Filter::Literal(Value::String("g".to_string())))),
+            Some(Box::new(Filter::Literal(Value::String(
+                crate::value::Text::from("g".to_string()),
+            )))),
         ),
     }
 }
@@ -1845,7 +1859,12 @@ impl<'a> Parser<'a> {
             Value::array(
                 self.exports
                     .iter()
-                    .map(|exp| Value::String(format!("{}/{}", exp.name, exp.arity)))
+                    .map(|exp| {
+                        Value::String(crate::value::Text::from(format!(
+                            "{}/{}",
+                            exp.name, exp.arity
+                        )))
+                    })
                     .collect(),
             ),
         );
@@ -2032,7 +2051,7 @@ impl<'a> Parser<'a> {
             return Err(ProgramError::Syntax);
         }
         match self.parse_string_expr()? {
-            Filter::Literal(Value::String(ref text)) => Ok((text.clone(), at)),
+            Filter::Literal(Value::String(ref text)) => Ok((text.to_string(), at)),
             _ => Err(report_at(self.src, at, "Import path must be constant")),
         }
     }
@@ -2477,7 +2496,9 @@ impl<'a> Parser<'a> {
             } else {
                 number::pos_inf()
             };
-            return Ok(Filter::Literal(Value::Number(text)));
+            return Ok(Filter::Literal(Value::Number(crate::value::Text::from(
+                text,
+            ))));
         }
         if is_builtin(&name, arity) {
             return Ok(build_builtin(&name, args));
@@ -2854,13 +2875,17 @@ impl<'a> Parser<'a> {
             if self.eat(':') {
                 let pattern = self.parse_pattern()?;
                 return Ok(PatField {
-                    key: Box::new(Filter::Literal(Value::String(name.clone()))),
+                    key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                        name.clone(),
+                    )))),
                     pattern,
                     also: Some(name),
                 });
             }
             return Ok(PatField {
-                key: Box::new(Filter::Literal(Value::String(name.clone()))),
+                key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                    name.clone(),
+                )))),
                 pattern: Pattern::Var(name),
                 also: None,
             });
@@ -2904,7 +2929,9 @@ impl<'a> Parser<'a> {
             }
             let pattern = self.parse_pattern()?;
             return Ok(PatField {
-                key: Box::new(Filter::Literal(Value::String(name))),
+                key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                    name,
+                )))),
                 pattern,
                 also: None,
             });
@@ -3542,12 +3569,16 @@ impl<'a> Parser<'a> {
             if self.eat(':') {
                 let value = self.parse_expd()?;
                 return Ok(ObjField::Pair {
-                    key: Box::new(Filter::Literal(Value::String(name))),
+                    key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                        name,
+                    )))),
                     value: Box::new(value),
                 });
             }
             return Ok(ObjField::Pair {
-                key: Box::new(Filter::Literal(Value::String(name.clone()))),
+                key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                    name.clone(),
+                )))),
                 value: Box::new(Filter::Field(name)),
             });
         }
@@ -3603,7 +3634,9 @@ impl<'a> Parser<'a> {
             _ => return Err(ProgramError::Syntax),
         };
         Ok(ObjField::Pair {
-            key: Box::new(Filter::Literal(Value::String(name))),
+            key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                name,
+            )))),
             value: Box::new(value),
         })
     }
@@ -3668,7 +3701,9 @@ impl<'a> Parser<'a> {
                     combined.push_str(&part);
                 }
             }
-            return Ok(Filter::Literal(Value::String(combined)));
+            return Ok(Filter::Literal(Value::String(crate::value::Text::from(
+                combined,
+            ))));
         }
         Ok(Filter::Interpolate(pieces))
     }
@@ -3825,7 +3860,9 @@ fn question(filter: Filter) -> Filter {
         // general form and still catches an invalid path.
         Filter::Field(name) => Filter::At {
             base: Box::new(Filter::Identity),
-            key: Box::new(Filter::Literal(Value::String(name))),
+            key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
+                name,
+            )))),
             optional: true,
         },
         other => Filter::Optional(Box::new(other)),
@@ -3852,7 +3889,7 @@ pub(super) fn cmp_at(rest: &str) -> Option<(Op, usize)> {
 
 pub(super) fn at_key(base: Option<Filter>, key: Filter) -> Filter {
     if let Filter::Literal(Value::String(name)) = &key {
-        return chain(base, Filter::Field(name.clone()));
+        return chain(base, Filter::Field(name.to_string()));
     }
     Filter::At {
         base: Box::new(base.unwrap_or(Filter::Identity)),
@@ -3868,7 +3905,7 @@ pub(super) fn canonical_number(literal: &str) -> String {
     match crate::parse_stream(literal.as_bytes()) {
         Ok(parsed) if parsed.error.is_none() => match parsed.values.as_slice() {
             [one] => match &one.value {
-                Value::Number(text) => return text.clone(),
+                Value::Number(text) => return text.to_string(),
                 _ => {}
             },
             _ => {}

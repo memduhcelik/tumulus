@@ -201,7 +201,7 @@ fn match_object(
             None if whole_empty => (
                 codepoints_before(text, from) as i64,
                 0,
-                Value::String(String::new()),
+                Value::String(crate::value::Text::from(String::new())),
             ),
             None => (-1, 0, Value::Null),
             Some((start, end)) => {
@@ -211,7 +211,7 @@ fn match_object(
                 (
                     offset,
                     length,
-                    Value::String(slice_between(text, start, end)),
+                    Value::String(crate::value::Text::from(slice_between(text, start, end))),
                 )
             }
         };
@@ -224,7 +224,7 @@ fn match_object(
         ("length".to_string(), number(length)),
         (
             "string".to_string(),
-            Value::String(slice_between(text, from, to)),
+            Value::String(crate::value::Text::from(slice_between(text, from, to))),
         ),
         ("captures".to_string(), Value::array(captures)),
     ])
@@ -235,10 +235,10 @@ fn match_object(
 /// characters puts `length` first.
 fn capture_object(offset: i64, length: usize, string: Value, name: Option<String>) -> Value {
     let name = match name {
-        Some(name) => Value::String(name),
+        Some(name) => Value::String(crate::value::Text::from(name)),
         None => Value::Null,
     };
-    let offset_value = Value::Number(offset.to_string());
+    let offset_value = Value::Number(crate::value::Text::from(offset.to_string()));
     let length_value = number(length);
     if offset < 0 || length == 0 {
         Value::object(vec![
@@ -274,5 +274,5 @@ fn slice_between(text: &str, start: usize, end: usize) -> String {
 }
 
 fn number(value: usize) -> Value {
-    Value::Number(value.to_string())
+    Value::Number(crate::value::Text::from(value.to_string()))
 }

@@ -1953,12 +1953,12 @@ fn limit_take(machine: &mut Machine, index: usize, value: Value) -> Result<Taken
         },
         _ => return Ok(Taken::Send(value)),
     };
-    let one = Value::Number("1".to_string());
+    let one = Value::Number(crate::value::Text::from("1".to_string()));
     let next = match sub_values(&take, &one) {
         Ok(next) => next,
         Err(message) => return Err(fresh(Vec::new(), message)),
     };
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     let stop = cmp_value(&next, &zero) <= 0;
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.take = Take::Sub(next);
@@ -2414,7 +2414,7 @@ fn finish_try_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
     };
     let caught = match failure.caught {
         Some(value) => value,
-        None => Value::String(failure.message),
+        None => Value::String(crate::value::Text::from(failure.message)),
     };
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.buf = partial;
@@ -2999,7 +2999,7 @@ fn lookup_alt(keys: &[Value], key_err: Option<Failure>, input: &Value) -> eval::
         match eval::index_by(input, &Value::String(name.clone())) {
             Ok(got) => {
                 let one = got.into_iter().next().unwrap_or(Value::Null);
-                pairs.push((name.clone(), one));
+                pairs.push((name.to_string(), one));
             }
             Err(failure) => {
                 return eval::Alts {
@@ -3030,7 +3030,7 @@ fn pair_alt(
             };
         };
         for item in values {
-            pairs.push((name.clone(), item.clone()));
+            pairs.push((name.to_string(), item.clone()));
         }
         if let Some(failure) = &value_err {
             return eval::Alts {

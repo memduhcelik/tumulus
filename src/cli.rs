@@ -193,6 +193,10 @@ struct Run {
     last_false: bool,
     /// `halt` or `halt_error` already chose the status.
     stopped: bool,
+    /// Source and line already written to `output_place`.
+    place_source: Option<String>,
+    place_line: usize,
+    place_text: String,
 }
 
 impl Run {
@@ -203,6 +207,9 @@ impl Run {
             produced: false,
             last_false: false,
             stopped: false,
+            place_source: None,
+            place_line: 0,
+            place_text: String::new(),
         }
     }
 }
@@ -989,7 +996,10 @@ fn apply_slurp(
             } else {
                 format!("{}:{}", at.source, item.line)
             };
-            failed = emit_at(program, &item.value, env, style, &place, run, out)?;
+            set_output_place(place.clone());
+            run.place_text = place;
+            run.place_source = None;
+            failed = emit_at(program, &item.value, env, style, run, out)?;
         }
         if let Some(message) = fed.error {
             eprintln!("jq: parse error: {message}");
@@ -1056,7 +1066,7 @@ fn apply_raw_slurp(
             }
         }
     }
-    let input = Value::String(decode_raw(&buf));
+    let input = Value::String(crate::value::Text::from(decode_raw(&buf)));
     set_input_line(at.line);
     let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
     run.status = stopped_status(run, missing, failed);
@@ -1110,7 +1120,7 @@ fn apply_raw(
                         set_input_line(line);
                         last_failed = emit(
                             program,
-                            &Value::String(text),
+                            &Value::String(crate::value::Text::from(text)),
                             env,
                             style,
                             &at.source,
@@ -1138,7 +1148,7 @@ fn apply_raw(
         set_input_line(at.line);
         last_failed = emit(
             program,
-            &Value::String(decode_raw(&pending)),
+            &Value::String(crate::value::Text::from(decode_raw(&pending))),
             env,
             style,
             &at.source,
@@ -1172,15 +1182,15 @@ fn emit(
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<bool, Error> {
-    emit_at(
-        program,
-        input,
-        env,
-        style,
-        &format!("{source}:{line}"),
-        run,
-        out,
-    )
+    let same = run.place_source.as_deref() == Some(source) && run.place_line == line;
+    if !same {
+        let at = format!("{source}:{line}");
+        set_output_place(at.clone());
+        run.place_text = at;
+        run.place_source = Some(source.to_string());
+        run.place_line = line;
+    }
+    emit_at(program, input, env, style, run, out)
 }
 
 fn emit_at(
@@ -1188,17 +1198,15 @@ fn emit_at(
     input: &Value,
     env: &[(String, Value)],
     style: Style,
-    at: &str,
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<bool, Error> {
-    set_output_place(at.to_string());
     match run_program(program, input, env, style, run, out)? {
         Ok(()) => Ok(false),
         Err(failure) => {
             write_values(&failure.partial, style, run, out)?;
             if !note_stop(&failure, run) {
-                report_error(at, &failure);
+                report_error(&run.place_text, &failure);
             }
             Ok(true)
         }
@@ -1478,7 +1486,7 @@ fn options() -> Result<Options, Error> {
                     None => jq_usage("jq: invalid JSON text passed to --argjson"),
                 }
             } else {
-                Value::String(text)
+                Value::String(crate::value::Text::from(text))
             };
             named.push((name, value));
             continue;
@@ -1641,7 +1649,7 @@ fn push_operand(
     }
     match tail {
         Tail::Files => operands.push(arg),
-        Tail::Text => positional.push(Value::String(arg)),
+        Tail::Text => positional.push(Value::String(crate::value::Text::from(arg))),
         Tail::Json => match one_json(&arg) {
             Some(value) => positional.push(value),
             None => jq_usage("jq: invalid JSON text passed to --jsonargs"),
@@ -1660,7 +1668,9 @@ fn file_binding(flag: &str, name: &str, path: &str) -> Value {
         }
     };
     if flag == "--rawfile" {
-        return Value::String(String::from_utf8_lossy(&bytes).into_owned());
+        return Value::String(crate::value::Text::from(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ));
     }
     let parsed = match parse_stream(&bytes) {
         Ok(parsed) => parsed,

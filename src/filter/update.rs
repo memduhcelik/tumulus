@@ -1541,7 +1541,7 @@ fn assignment_paths(
 fn classify_step(container: &Value, key: &Value) -> Result<Step, String> {
     match key {
         Value::String(name) => match container {
-            Value::Null | Value::Object(_) => Ok(Step::Key(name.clone())),
+            Value::Null | Value::Object(_) => Ok(Step::Key(name.to_string())),
             other => Err(format!(
                 "Cannot index {} with string \"{name}\"",
                 other.type_name()
@@ -1948,7 +1948,7 @@ fn run(
         // `first` and `nth` keep the path of the value they select. `last(expr)`
         // is the value itself, so it falls through and is not a path.
         Filter::First(None) => index_here(
-            &Value::Number("0".to_string()),
+            &Value::Number(crate::value::Text::from("0".to_string())),
             input,
             path,
             line,
@@ -1956,7 +1956,7 @@ fn run(
             ctx,
         ),
         Filter::Last(None) => index_here(
-            &Value::Number("-1".to_string()),
+            &Value::Number(crate::value::Text::from("-1".to_string())),
             input,
             path,
             line,
@@ -2002,7 +2002,9 @@ fn run(
             );
             let indexed = Filter::At {
                 base: Box::new(Filter::Collect(Box::new(pair))),
-                key: Box::new(Filter::Literal(Value::Number("0".to_string()))),
+                key: Box::new(Filter::Literal(Value::Number(crate::value::Text::from(
+                    "0".to_string(),
+                )))),
                 optional: false,
             };
             run(&indexed, input, path, line, input_gen, ctx)
@@ -2591,7 +2593,10 @@ fn take_limit_path(
         LimitHow::Subtract => match run_take(expr, input, path, line, input_gen, ctx, 1) {
             Err(err) => Err(err),
             Ok(vals) if vals.is_empty() => Ok(Vec::new()),
-            Ok(_) => match sub_values(count, &Value::Number("1".to_string())) {
+            Ok(_) => match sub_values(
+                count,
+                &Value::Number(crate::value::Text::from("1".to_string())),
+            ) {
                 Err(message) => Err(bare(message)),
                 Ok(_) => Ok(Vec::new()),
             },
@@ -3172,7 +3177,7 @@ fn run_try(
     };
     let caught = match err.caught {
         Some(value) => value,
-        None => Value::String(err.message),
+        None => Value::String(crate::value::Text::from(err.message)),
     };
     // The handler is not a carrier. A null or bool can still match the root.
     let cell = Cell::new(0);
@@ -3222,7 +3227,7 @@ fn run_field(
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
     if !carrier_now(line, input_gen) {
-        let elem = Value::String(key.to_string());
+        let elem = Value::String(crate::value::Text::from(key.to_string()));
         return Err(bare(near_access(&elem, input)));
     }
     match input {
@@ -3250,7 +3255,7 @@ fn run_fixed_index(
 ) -> Result<Vec<POut>, PathErr> {
     match index {
         ArrayIndex::At(_) => {
-            let key = Value::Number(text.to_string());
+            let key = Value::Number(crate::value::Text::from(text.to_string()));
             index_here(&key, input, path, line, input_gen, ctx)
         }
         ArrayIndex::OutOfRange => {
@@ -4054,7 +4059,7 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
     match key {
         Value::String(name) => match container {
             Value::Null | Value::Object(_) => Ok(Real::Done(
-                Step::Key(name.clone()),
+                Step::Key(name.to_string()),
                 object_field(container, name),
             )),
             other => Err(format!(
@@ -4122,7 +4127,7 @@ fn bound_text(value: &Value) -> Result<Option<String>, String> {
 
 fn as_bound(bound: Option<String>) -> Value {
     match bound {
-        Some(text) => Value::Number(text),
+        Some(text) => Value::Number(crate::value::Text::from(text)),
         None => Value::Null,
     }
 }
@@ -4258,7 +4263,7 @@ fn exec_array_from(
     if index == 0 {
         return resume(jobs, binds, path, line, tail, ctx);
     }
-    let key = Value::Number((index - 1).to_string());
+    let key = Value::Number(crate::value::Text::from((index - 1).to_string()));
     let hit = pat_index(value, &key, path, line, carrier, input_gen, ctx)?;
     let sub = index - 1;
     jobs.insert(
@@ -5384,11 +5389,17 @@ fn path_child(value: &Value, index: usize) -> Option<(Value, Value)> {
     match value {
         Value::Array(items) => {
             let child = items.get(index)?.clone();
-            Some((child, Value::Number(index.to_string())))
+            Some((
+                child,
+                Value::Number(crate::value::Text::from(index.to_string())),
+            ))
         }
         Value::Object(items) => {
             let (key, child) = items.get(index)?;
-            Some((child.clone(), Value::String(key.clone())))
+            Some((
+                child.clone(),
+                Value::String(crate::value::Text::from(key.clone())),
+            ))
         }
         _ => None,
     }
@@ -5400,8 +5411,10 @@ fn render_steps(steps: &[Step]) -> Value {
 
 fn render_step(step: &Step) -> Value {
     match step {
-        Step::Key(key) => Value::String(key.clone()),
-        Step::Index { text, .. } | Step::Huge(text) => Value::Number(text.clone()),
+        Step::Key(key) => Value::String(crate::value::Text::from(key.clone())),
+        Step::Index { text, .. } | Step::Huge(text) => {
+            Value::Number(crate::value::Text::from(text.clone()))
+        }
         Step::Raw(value) => value.clone(),
         Step::Slice { start, end } => shown_slice(start, end),
     }
@@ -5409,7 +5422,7 @@ fn render_step(step: &Step) -> Value {
 
 fn render_bound(bound: &Value) -> Value {
     match bound {
-        Value::Number(text) => Value::Number(canonical_number(text)),
+        Value::Number(text) => Value::Number(crate::value::Text::from(canonical_number(text))),
         other => other.clone(),
     }
 }
@@ -5520,7 +5533,7 @@ fn get_one(value: &Value, key: &Value) -> Result<Value, String> {
             Value::Null => Ok(Value::Null),
             Value::Object(items) => Ok(items
                 .iter()
-                .find(|(item, _)| item == name)
+                .find(|(item, _)| item == name.as_str())
                 .map(|(_, item)| item.clone())
                 .unwrap_or(Value::Null)),
             other => Err(format!(
@@ -5678,7 +5691,7 @@ fn delete_leaf(value: &Value, key: &Value) -> Result<Leaf, String> {
             )),
         },
         Value::Object(_) => match key {
-            Value::String(name) => Ok(Leaf::Step(Step::Key(name.clone()))),
+            Value::String(name) => Ok(Leaf::Step(Step::Key(name.to_string()))),
             other => Err(format!(
                 "Cannot delete {} field of object",
                 other.type_name()
@@ -5701,7 +5714,7 @@ fn read_step(value: &Value, key: &Value) -> Result<(Step, Value), String> {
                     ))
                 }
             };
-            Ok((Step::Key(name.clone()), child))
+            Ok((Step::Key(name.to_string()), child))
         }
         Value::Number(text) => {
             let shown = canonical_number(text);

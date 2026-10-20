@@ -1,7 +1,7 @@
 //! Arithmetic, comparison, and merging of values.
 
 use crate::number;
-use crate::value::Value;
+use crate::value::{Text, Value};
 
 use super::ast::*;
 use super::eval::shown;
@@ -27,9 +27,10 @@ pub(super) fn add_values(left: &Value, right: &Value) -> Result<Value, String> {
         (Value::Null, other) | (other, Value::Null) => Ok(other.clone()),
         (Value::Number(a), Value::Number(b)) => Ok(num_binop(a, b, NumOp::Add)),
         (Value::String(a), Value::String(b)) => {
-            let mut text = a.clone();
+            let mut text = String::with_capacity(a.len() + b.len());
+            text.push_str(a);
             text.push_str(b);
-            Ok(Value::String(text))
+            Ok(Value::String(Text::from(text)))
         }
         (Value::Array(a), Value::Array(b)) => {
             let mut items = Vec::with_capacity(a.len() + b.len());
@@ -88,7 +89,9 @@ pub(super) enum NumOp {
 pub(super) fn num_binop(left: &str, right: &str, op: NumOp) -> Value {
     let value = match (number::real(left), number::real(right)) {
         (number::Real::Nan, _) | (_, number::Real::Nan) => {
-            return Value::Number(number::mark_f64(number::nan_text()))
+            return Value::Number(crate::value::Text::from(number::mark_f64(
+                number::nan_text(),
+            )))
         }
         (number::Real::Num(a), number::Real::Num(b)) => match op {
             NumOp::Add => a + b,
@@ -96,7 +99,9 @@ pub(super) fn num_binop(left: &str, right: &str, op: NumOp) -> Value {
             NumOp::Mul => a * b,
         },
     };
-    Value::Number(number::mark_f64(number::format_jq_f64(value)))
+    Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(value),
+    )))
 }
 
 pub(super) fn num_div(left: &Value, right: &Value, a: &str, b: &str) -> Result<Value, String> {
@@ -107,12 +112,14 @@ pub(super) fn num_div(left: &Value, right: &Value, a: &str, b: &str) -> Result<V
     }
     let value = match (number::real(a), number::real(b)) {
         (number::Real::Nan, _) | (_, number::Real::Nan) => {
-            return Ok(Value::Number(number::mark_f64(number::nan_text())))
+            return Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+                number::nan_text(),
+            ))))
         }
         (number::Real::Num(x), number::Real::Num(y)) => x / y,
     };
-    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
-        value,
+    Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(value),
     ))))
 }
 
@@ -120,10 +127,14 @@ pub(super) fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<V
     // A NaN operand wins over a zero divisor. `nan % 0` is NaN.
     if matches!(number::real(a), number::Real::Nan) || matches!(number::real(b), number::Real::Nan)
     {
-        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+        return Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+            number::nan_text(),
+        ))));
     }
     let number::Real::Num(y) = number::real(b) else {
-        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+        return Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+            number::nan_text(),
+        ))));
     };
     // Truncate toward zero into jq's integer width. A fractional divisor
     // such as `0.5` is zero after that truncation.
@@ -132,7 +143,9 @@ pub(super) fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<V
         return Err(zero_divisor(left, right, true));
     }
     let number::Real::Num(x) = number::real(a) else {
-        return Ok(Value::Number(number::mark_f64(number::nan_text())));
+        return Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+            number::nan_text(),
+        ))));
     };
     // `i64::MIN % -1` does not fit in the quotient. Every integer divides by -1.
     let remainder = if divisor == -1 {
@@ -140,8 +153,8 @@ pub(super) fn num_rem(left: &Value, right: &Value, a: &str, b: &str) -> Result<V
     } else {
         (number::jq_dtoi(x) % divisor) as f64
     };
-    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
-        remainder,
+    Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(remainder),
     ))))
 }
 
@@ -155,8 +168,8 @@ pub(super) fn negate_value(value: &Value) -> Result<Value, String> {
     };
     // The sign bit flips, including NaN and zero. `-(nan)` is a negative NaN.
     let negated = -number::f64_of(text);
-    Ok(Value::Number(number::mark_f64(number::format_jq_f64(
-        negated,
+    Ok(Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(negated),
     ))))
 }
 
@@ -175,14 +188,16 @@ pub(super) fn string_times(text: &str, n: number::Real) -> Option<Value> {
     if count > 8_000_000.0 {
         return None;
     }
-    Some(Value::String(text.repeat(count as usize)))
+    Some(Value::String(crate::value::Text::from(
+        text.repeat(count as usize),
+    )))
 }
 
 pub(super) fn split_string(text: &str, sep: &str) -> Value {
     if sep.is_empty() {
         return Value::array(
             text.chars()
-                .map(|ch| Value::String(ch.to_string()))
+                .map(|ch| Value::String(crate::value::Text::from(ch.to_string())))
                 .collect(),
         );
     }
@@ -192,10 +207,12 @@ pub(super) fn split_string(text: &str, sep: &str) -> Value {
     let mut parts = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find(sep) {
-        parts.push(Value::String(rest[..at].to_string()));
+        parts.push(Value::String(crate::value::Text::from(
+            rest[..at].to_string(),
+        )));
         rest = &rest[at + sep.len()..];
     }
-    parts.push(Value::String(rest.to_string()));
+    parts.push(Value::String(crate::value::Text::from(rest.to_string())));
     Value::array(parts)
 }
 

@@ -12,9 +12,9 @@ use std::io::{self, Read as IoRead};
 use crate::eprintln;
 use crate::parse::{
     closer_is_detached, parse_seq, program_stream_with, pull_stream, scan_input, stream_line,
-    EofCut, InputScan, LineCursor, NulScan, SeqItem, StreamState,
+    EofCut, Fgets, InputScan, LineCursor, NulScan, SeqItem, StreamState,
 };
-use crate::value::Value;
+use crate::value::{Text, Value};
 use crate::Error;
 
 thread_local! {
@@ -95,8 +95,14 @@ pub fn environ() -> Value {
 
 pub fn here(line: usize) -> Value {
     Value::object(vec![
-        ("file".to_string(), Value::String("<top-level>".to_string())),
-        ("line".to_string(), Value::Number(line.to_string())),
+        (
+            "file".to_string(),
+            Value::String(crate::value::Text::from("<top-level>".to_string())),
+        ),
+        (
+            "line".to_string(),
+            Value::Number(crate::value::Text::from(line.to_string())),
+        ),
     ])
 }
 
@@ -105,7 +111,9 @@ pub fn set_input_line(line: usize) {
 }
 
 pub fn input_line_value() -> Value {
-    Value::Number(INPUT_LINE.with(|slot| slot.get()).to_string())
+    Value::Number(crate::value::Text::from(
+        INPUT_LINE.with(|slot| slot.get()).to_string(),
+    ))
 }
 
 pub fn set_dump_flags(ascii: bool, sort_keys: bool) {
@@ -173,7 +181,10 @@ pub fn input_filename() -> Value {
 }
 
 pub fn set_unknown() {
-    let _ = with_mut(|session| session.at = "<unknown>".to_string());
+    let _ = with_mut(|session| {
+        session.at = "<unknown>".to_string();
+        session.loc_known = false;
+    });
 }
 
 /// Where a dump error is reported when the input reader is not running.
@@ -186,7 +197,14 @@ pub fn output_place() -> String {
 }
 
 pub fn location() -> Option<String> {
-    with(|session| session.at.clone())
+    with(|session| {
+        if session.loc_known {
+            if let Some(name) = &session.yielded {
+                return format!("{name}:{}", session.loc_line);
+            }
+        }
+        session.at.clone()
+    })
 }
 
 pub fn open_failed() -> bool {
@@ -274,21 +292,26 @@ struct Chunk {
     bom: usize,
     /// Newlines already counted in `raw`. Later values continue from here.
     lines: LineCursor,
+    /// Finished fgets reads in `raw`. Line numbers come from here.
+    fgets: Fgets,
     /// End-of-file read already passed in `raw`. Later values continue from here.
     cut: EofCut,
 }
 
 struct Item {
     value: Value,
-    name: String,
+    /// Chunk that holds the bytes, or `NO_CHUNK` when the name is `<stdin>`.
+    source: u32,
     line: usize,
     /// A final scalar closer. jq names that error `<unknown>`.
     unknown: bool,
 }
 
+const NO_CHUNK: u32 = u32::MAX;
+
 struct Fault {
     message: String,
-    name: String,
+    name: Text,
     line: usize,
     /// `input` reports this parse error at `<unknown>`.
     unknown: bool,
@@ -316,7 +339,14 @@ struct Session {
     fault: Option<Fault>,
     /// Where to continue after the program catches a bad value.
     staged: Option<(usize, usize)>,
-    yielded: Option<String>,
+    yielded: Option<Text>,
+    /// Line stored with `yielded`. `at` is formatted from these when an error asks.
+    loc_line: usize,
+    loc_known: bool,
+    /// `source` already copied into `yielded`.
+    noted: Option<u32>,
+    /// Name `load_stream_slurp` gives every item, when it is not a chunk.
+    slurp_label: Option<Text>,
     at: String,
     cur: Option<Cur>,
     eof_once: bool,
@@ -346,6 +376,8 @@ struct Session {
     seq_queue: VecDeque<SeqQueued>,
     /// The last value was completed in an EOF read that did not end on a newline.
     cut_at_eof: bool,
+    /// Chunk index and raw end of the value `place` saw last.
+    last_end: Option<(usize, usize)>,
     /// NUL search already done over the prefix of `buf`.
     nul: NulScan,
 }
@@ -403,6 +435,10 @@ impl Session {
             fault: None,
             staged: None,
             yielded: None,
+            loc_line: 0,
+            loc_known: false,
+            noted: None,
+            slurp_label: None,
             at: "<unknown>".to_string(),
             cur: None,
             eof_once: false,
@@ -425,6 +461,7 @@ impl Session {
             seq_done: false,
             seq_queue: VecDeque::new(),
             cut_at_eof: false,
+            last_end: None,
             nul: NulScan::default(),
         }
     }
@@ -473,11 +510,12 @@ impl Session {
             }) => {
                 if failure {
                     self.yielded = None;
+                    self.loc_known = false;
                     self.at = "<unknown>".to_string();
                     set_input_line(0);
                 } else if let Some(end) = end {
-                    let (name, line) = self.place(end, atom);
-                    self.note(&name, line);
+                    let (source, line) = self.place(end, atom);
+                    self.note_source(source, line);
                 }
                 Pulled::Value(value)
             }
@@ -487,13 +525,14 @@ impl Session {
                 unknown,
             }) => {
                 if from_input {
-                    let (name, line) = self.place(at, false);
+                    let (source, line) = self.place(at, false);
                     if unknown {
-                        self.yielded = Some(name);
+                        self.yielded = Some(Text::from(self.source_name(source)));
+                        self.loc_known = false;
                         self.at = "<unknown>".to_string();
                         set_input_line(0);
                     } else {
-                        self.note(&name, line);
+                        self.note_source(source, line);
                     }
                     Pulled::Parse(message)
                 } else {
@@ -620,16 +659,18 @@ impl Session {
         loop {
             if let Some(item) = self.pending.pop_front() {
                 if item.unknown {
-                    self.yielded = Some(item.name);
+                    self.yielded = Some(Text::from(self.source_name(item.source)));
+                    self.loc_known = false;
                     self.at = "<unknown>".to_string();
                 } else {
-                    self.note(&item.name, item.line);
+                    self.note_source(item.source, item.line);
                 }
                 return Ok(Pulled::Value(item.value));
             }
             if let Some(fault) = self.fault.take() {
                 if fault.unknown {
                     self.yielded = Some(fault.name);
+                    self.loc_known = false;
                     self.at = "<unknown>".to_string();
                 } else {
                     self.note(&fault.name, fault.line);
@@ -691,10 +732,10 @@ impl Session {
 
     fn push_scanned(&mut self, values: Vec<(Value, usize)>) {
         for (value, end) in values {
-            let (name, line) = self.place(end, is_atom(&value));
+            let (source, line) = self.place(end, is_atom(&value));
             self.pending.push_back(Item {
                 value,
-                name,
+                source,
                 line,
                 unknown: false,
             });
@@ -705,12 +746,14 @@ impl Session {
         let message = scan.error.unwrap_or_else(|| "parse error".to_string());
         let (name, line) = if scan.incomplete {
             if let Some(name) = self.failed_here.clone() {
-                (name, 0)
+                (Text::from(name), 0)
             } else {
-                self.place(scan.error_at, false)
+                let (source, line) = self.place(scan.error_at, false);
+                (Text::from(self.source_name(source)), line)
             }
         } else {
-            self.place(scan.error_at, false)
+            let (source, line) = self.place(scan.error_at, false);
+            (Text::from(self.source_name(source)), line)
         };
         self.fault = Some(Fault {
             message,
@@ -781,7 +824,7 @@ impl Session {
                 && (self.prev.is_some() || !self.staging.is_empty() || !self.pending.is_empty());
             let path = Value::array(out.path);
             self.staging.push_back(Staged {
-                value: Value::array(vec![Value::String(message), path]),
+                value: Value::array(vec![Value::String(Text::from(message)), path]),
                 end: out.error_at.min(end),
                 atom: false,
                 unknown,
@@ -791,12 +834,14 @@ impl Session {
         self.release();
         let (name, line) = if out.incomplete {
             if let Some(name) = self.failed_here.clone() {
-                (name, 0)
+                (Text::from(name), 0)
             } else {
-                self.place(out.error_at.min(end), false)
+                let (source, line) = self.place(out.error_at.min(end), false);
+                (Text::from(self.source_name(source)), line)
             }
         } else {
-            self.place(out.error_at.min(end), false)
+            let (source, line) = self.place(out.error_at.min(end), false);
+            (Text::from(self.source_name(source)), line)
         };
         let visible = &self.buf[..end];
         let prior = self.prev.is_some() || !self.pending.is_empty();
@@ -822,9 +867,17 @@ impl Session {
         // A parse error stops the input. A closer staged before that error
         // has already happened, so it is not still waiting to see EOF.
         let flush = finished || self.fault.is_some();
-        while let Some(front) = self.staging.front() {
-            let hold = !flush && self.staging.len() == 1 && self.might_detach(&front.value);
-            if hold || !self.item_ready(front.end, front.atom) {
+        loop {
+            let (end, atom, single) = match self.staging.front() {
+                Some(front) => (
+                    front.end,
+                    front.atom,
+                    matches!(front.value, Value::Array(ref items) if items.len() == 1),
+                ),
+                None => break,
+            };
+            let hold = !flush && self.staging.len() == 1 && single;
+            if hold || !self.item_ready(end, atom) {
                 break;
             }
             let item = self.staging.pop_front().expect("staged item");
@@ -832,32 +885,44 @@ impl Session {
             if finished && self.staging.is_empty() {
                 unknown = unknown || self.pair_detach(&item.value);
             }
-            let (name, line) = self.place(item.end, item.atom);
+            let (source, line) = self.place(item.end, item.atom);
             self.prev = Some(item.value.clone());
             self.pending.push_back(Item {
                 value: item.value,
-                name,
+                source,
                 line,
                 unknown,
             });
         }
     }
 
-    fn item_ready(&self, end: usize, atom: bool) -> bool {
+    fn item_ready(&mut self, end: usize, atom: bool) -> bool {
         let Some(index) = self.chunk_index(end) else {
             return true;
         };
-        let chunk = &self.chunks[index];
-        let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
         let file_done = self.input_eof || self.live_chunk != Some(index);
-        chunk.lines.ready(&chunk.raw, raw_end, atom, file_done)
-    }
-
-    fn might_detach(&self, value: &Value) -> bool {
-        let Value::Array(closer) = value else {
+        let chunk = &mut self.chunks[index];
+        let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
+        // An atom at the end of the buffer is not finished until more bytes
+        // arrive or the file ends. `line_at` can also walk an open tail while
+        // naming an error, and the next check then sees that walk. Fall back
+        // to it when the table has not recorded the read yet.
+        if atom && raw_end >= chunk.raw.len() && !file_done {
             return false;
+        }
+        if file_done {
+            chunk.fgets.push(&chunk.raw, true);
+        }
+        let len = chunk.raw.len();
+        let need = if atom && raw_end < len {
+            raw_end
+        } else {
+            raw_end.saturating_sub(1)
         };
-        closer.len() == 1
+        if chunk.fgets.line(need).is_some() {
+            return true;
+        }
+        chunk.lines.ready(&chunk.raw, raw_end, atom, file_done)
     }
 
     fn pair_detach(&mut self, value: &Value) -> bool {
@@ -879,7 +944,9 @@ impl Session {
                     let line = self.cur.as_ref().map(|cur| cur.line).unwrap_or(0);
                     let name = self.name_at(self.raw_at);
                     self.note(&name, line);
-                    return Ok(Pulled::Value(Value::String(decode(&pending))));
+                    return Ok(Pulled::Value(Value::String(crate::value::Text::from(
+                        decode(&pending),
+                    ))));
                 }
                 continue;
             }
@@ -893,10 +960,10 @@ impl Session {
             };
             pending.extend_from_slice(&self.buf[self.raw_at..self.raw_at + cut]);
             self.raw_at += cut + 1;
-            let (name, line) = self.place(self.raw_at, false);
+            let (source, line) = self.place(self.raw_at, false);
             let text = decode(&pending);
-            self.note(&name, line);
-            return Ok(Pulled::Value(Value::String(text)));
+            self.note_source(source, line);
+            return Ok(Pulled::Value(Value::String(Text::from(text))));
         }
     }
 
@@ -917,7 +984,9 @@ impl Session {
             if let Some(name) = name {
                 self.note(&name, line);
             }
-            return Ok(Pulled::Value(Value::String(decode(&self.buf))));
+            return Ok(Pulled::Value(Value::String(crate::value::Text::from(
+                decode(&self.buf),
+            ))));
         }
         if self.stream {
             self.load_stream_slurp();
@@ -925,16 +994,16 @@ impl Session {
         }
         let scan = scan_input(&self.buf, 0, 1, false);
         if let Some(message) = scan.error {
-            let (name, line) = if scan.incomplete {
+            let (source, line) = if scan.incomplete {
                 if let Some(name) = self.failed_here.clone() {
-                    (name, 0)
-                } else {
-                    self.place(scan.error_at, false)
+                    self.note(&name, 0);
+                    return Ok(Pulled::Parse(message));
                 }
+                self.place(scan.error_at, false)
             } else {
                 self.place(scan.error_at, false)
             };
-            self.note(&name, line);
+            self.note_source(source, line);
             return Ok(Pulled::Parse(message));
         }
         let items: Vec<Value> = scan.values.into_iter().map(|(value, _)| value).collect();
@@ -952,20 +1021,25 @@ impl Session {
             .map(|chunk| chunk.parse_start)
             .collect();
         let fed = program_stream_with(&self.buf, true, self.stream_errors, &bounds);
-        let name = self
-            .cur
-            .as_ref()
-            .map(|cur| cur.name.clone())
-            .unwrap_or_else(|| "<stdin>".to_string());
+        self.slurp_label = Some(Text::from(
+            self.cur
+                .as_ref()
+                .map(|cur| cur.name.as_str())
+                .unwrap_or("<stdin>"),
+        ));
         for value in fed.values {
             self.pending.push_back(Item {
                 value: value.value,
-                name: name.clone(),
+                source: NO_CHUNK,
                 line: value.line,
                 unknown: value.unknown,
             });
         }
         if let Some(message) = fed.error {
+            let name = self
+                .slurp_label
+                .clone()
+                .unwrap_or_else(|| Text::from("<stdin>"));
             self.fault = Some(Fault {
                 message,
                 name,
@@ -978,10 +1052,13 @@ impl Session {
     fn pop_slurp(&mut self) -> Result<Pulled, String> {
         if let Some(item) = self.pending.pop_front() {
             if item.unknown {
-                self.yielded = Some(item.name);
+                self.yielded = self.slurp_label.clone();
+                self.loc_known = false;
                 self.at = "<unknown>".to_string();
+            } else if let Some(label) = self.slurp_label.clone() {
+                self.note(label.as_str(), item.line);
             } else {
-                self.note(&item.name, item.line);
+                self.note_source(item.source, item.line);
             }
             return Ok(Pulled::Value(item.value));
         }
@@ -1087,12 +1164,16 @@ impl Session {
             let bom = bom.min(bytes.len());
             let parse_start = self.buf.len();
             self.buf.extend_from_slice(&bytes[bom..]);
+            let raw = bytes.to_vec();
+            let mut fgets = Fgets::default();
+            fgets.push(&raw, false);
             self.chunks.push(Chunk {
                 name: name.to_string(),
                 parse_start,
-                raw: bytes.to_vec(),
+                raw,
                 bom,
                 lines: LineCursor::default(),
+                fgets,
                 cut: EofCut::default(),
             });
             self.live_chunk = Some(self.chunks.len() - 1);
@@ -1100,6 +1181,8 @@ impl Session {
         }
         let index = self.live_chunk.expect("live chunk");
         self.chunks[index].raw.extend_from_slice(bytes);
+        let chunk = &mut self.chunks[index];
+        chunk.fgets.push(&chunk.raw, false);
         self.buf.extend_from_slice(bytes);
     }
 
@@ -1134,6 +1217,7 @@ impl Session {
                         raw: bytes,
                         bom,
                         lines: LineCursor::default(),
+                        fgets: Fgets::default(),
                         cut: EofCut::default(),
                     });
                     return Ok(More::Added);
@@ -1203,7 +1287,14 @@ impl Session {
     /// newlines in the current file, unless the last value was completed in
     /// a final read that did not end on a newline: that read leaves 0.
     fn finish_line(&mut self) {
-        if self.slurp || self.cut_at_eof {
+        let cut = match self.last_end {
+            Some((index, raw_end)) => {
+                let chunk = &mut self.chunks[index];
+                chunk.cut.at(&chunk.raw, raw_end)
+            }
+            None => self.cut_at_eof,
+        };
+        if self.slurp || cut {
             set_input_line(0);
             return;
         }
@@ -1211,17 +1302,52 @@ impl Session {
         set_input_line(line);
     }
 
-    fn place(&mut self, end: usize, atom: bool) -> (String, usize) {
+    fn place(&mut self, end: usize, atom: bool) -> (u32, usize) {
         let Some(index) = self.chunk_index(end) else {
-            return ("<stdin>".to_string(), 0);
+            return (NO_CHUNK, 0);
         };
+        let file_done = self.input_eof || self.live_chunk != Some(index);
         let chunk = &mut self.chunks[index];
         let raw_end = chunk.bom + end.saturating_sub(chunk.parse_start);
-        let line = chunk.lines.line_at(&chunk.raw, raw_end, atom);
-        let cut = chunk.cut.at(&chunk.raw, raw_end);
-        let name = chunk.name.clone();
-        self.cut_at_eof = cut;
-        (name, line)
+        if file_done {
+            chunk.fgets.push(&chunk.raw, true);
+        }
+        let len = chunk.raw.len();
+        let need = if atom && raw_end < len {
+            raw_end
+        } else {
+            raw_end.saturating_sub(1)
+        };
+        let line = match chunk.fgets.line(need) {
+            Some(line) => line as usize,
+            None => chunk.lines.line_at(&chunk.raw, raw_end, atom),
+        };
+        self.last_end = Some((index, raw_end));
+        (index as u32, line)
+    }
+
+    fn source_name(&self, source: u32) -> String {
+        if source == NO_CHUNK {
+            "<stdin>".to_string()
+        } else {
+            self.chunks
+                .get(source as usize)
+                .map(|chunk| chunk.name.clone())
+                .unwrap_or_else(|| "<stdin>".to_string())
+        }
+    }
+
+    fn note_source(&mut self, source: u32, line: usize) {
+        if self.noted != Some(source) {
+            let name = self.source_name(source);
+            self.yielded = Some(Text::from(name));
+            self.noted = Some(source);
+        }
+        if self.loc_line != line || !self.loc_known {
+            self.loc_line = line;
+            self.loc_known = true;
+            set_input_line(line);
+        }
     }
 
     fn name_at(&self, end: usize) -> String {
@@ -1244,6 +1370,9 @@ impl Session {
         if self.chunks.is_empty() {
             return None;
         }
+        if self.chunks.len() == 1 {
+            return Some(0);
+        }
         let found = self
             .chunks
             .iter()
@@ -1255,12 +1384,16 @@ impl Session {
     }
 
     fn note(&mut self, name: &str, line: usize) {
-        self.yielded = Some(name.to_string());
-        self.at = format!("{name}:{line}");
+        if self.yielded.as_deref() != Some(name) {
+            self.yielded = Some(Text::from(name));
+        }
+        self.loc_line = line;
+        self.loc_known = true;
         set_input_line(line);
     }
 
     fn mark_break(&mut self) {
+        self.loc_known = false;
         self.at = if self.eof_once {
             "<unknown>".to_string()
         } else {
@@ -1414,7 +1547,7 @@ fn is_atom(value: &Value) -> bool {
 
 fn environment() -> Value {
     let fields = std::env::vars()
-        .map(|(key, value)| (key, Value::String(value)))
+        .map(|(key, value)| (key, Value::String(Text::from(value))))
         .collect();
     Value::object(fields)
 }

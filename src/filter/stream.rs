@@ -695,7 +695,7 @@ pub(super) enum LimitHow {
 }
 
 pub(super) fn limit_how(count: &Value) -> LimitHow {
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     if cmp_value(count, &zero) < 0 {
         return LimitHow::All;
     }
@@ -788,8 +788,8 @@ fn take_count(
         }
         LimitHow::Subtract => {
             let left = RefCell::new(count.clone());
-            let zero = Value::Number("0".to_string());
-            let one = Value::Number("1".to_string());
+            let zero = Value::Number(crate::value::Text::from("0".to_string()));
+            let one = Value::Number(crate::value::Text::from("1".to_string()));
             let outer = Cell::new(false);
             let failure: RefCell<Option<Failure>> = RefCell::new(None);
             let mut on_value = |value: &Value| {
@@ -827,7 +827,13 @@ fn drive_first(
     emit: &Emit,
 ) -> Result<bool, Failure> {
     let Some(expr) = expr else {
-        return relay(index_by(input, &Value::Number("0".to_string())), emit);
+        return relay(
+            index_by(
+                input,
+                &Value::Number(crate::value::Text::from("0".to_string())),
+            ),
+            emit,
+        );
     };
     let outer = Cell::new(false);
     let mut on_value = |value: &Value| {
@@ -848,7 +854,13 @@ fn drive_last(
     emit: &Emit,
 ) -> Result<bool, Failure> {
     let Some(expr) = expr else {
-        return relay(index_by(input, &Value::Number("-1".to_string())), emit);
+        return relay(
+            index_by(
+                input,
+                &Value::Number(crate::value::Text::from("-1".to_string())),
+            ),
+            emit,
+        );
     };
     let last: RefCell<Option<Value>> = RefCell::new(None);
     let mut on_value = |value: &Value| {
@@ -876,11 +888,14 @@ pub(super) enum NthSpan {
 }
 
 pub(super) fn nth_span(index: &Value) -> NthSpan {
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     if cmp_value(index, &zero) < 0 {
         return NthSpan::Negative;
     }
-    let summed = match add_values(index, &Value::Number("1".to_string())) {
+    let summed = match add_values(
+        index,
+        &Value::Number(crate::value::Text::from("1".to_string())),
+    ) {
         Ok(value) => value,
         Err(message) => return NthSpan::Add(message),
     };
@@ -998,8 +1013,8 @@ fn drive_range(
     let implicit = step.is_none();
     let failure: RefCell<Option<Failure>> = RefCell::new(None);
     let stopped = Cell::new(false);
-    let zero = Value::Number("0".to_string());
-    let one = Value::Number("1".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
+    let one = Value::Number(crate::value::Text::from("1".to_string()));
     let mut on_from = |from_value: &Value| {
         if stopped.get() {
             return true;
@@ -1104,7 +1119,7 @@ fn gen_range(
 }
 
 fn keeps_going(from: &Value, to: &Value, step: &Value, implicit_unit: bool) -> bool {
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     if cmp_value(step, &zero) > 0 {
         // `range(from; nan)` and `range(nan)` do not stop. `range(from; nan; 1)` does.
         cmp_value(from, to) < 0 || (implicit_unit && is_nan(to))

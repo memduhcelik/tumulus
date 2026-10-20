@@ -173,9 +173,13 @@ pub(super) fn produce(
         Filter::Has(arg) => eval_has(arg, input, env),
         Filter::Select(arg) => eval_select(arg, input, env),
         Filter::Map(arg) => eval_map(arg, input, env),
-        Filter::Type => Ok(vec![Value::String(input.type_name().to_string())]),
+        Filter::Type => Ok(vec![Value::String(crate::value::Text::from(
+            input.type_name().to_string(),
+        ))]),
         Filter::ToNumber => eval_tonumber(input),
-        Filter::ToString => Ok(vec![Value::String(jq_text(input))]),
+        Filter::ToString => Ok(vec![Value::String(crate::value::Text::from(jq_text(
+            input,
+        )))]),
         Filter::ToJson => super::builtin::eval_tojson(input),
         Filter::Add => super::builtin::eval_add(input),
         Filter::ToEntries => super::builtin::eval_to_entries(input),
@@ -235,12 +239,16 @@ pub(super) fn produce(
         Filter::Builtins => Ok(vec![super::builtin::builtins_value()]),
         Filter::SearchList => Ok(vec![super::modules::search_list_value()]),
         Filter::ModuleMeta => super::modules::eval_module_meta(input),
-        Filter::JqOrigin => Ok(vec![Value::String(crate::feed::jq_origin())]),
-        Filter::ProgOrigin => Ok(vec![Value::String(crate::feed::prog_origin())]),
+        Filter::JqOrigin => Ok(vec![Value::String(crate::value::Text::from(
+            crate::feed::jq_origin(),
+        ))]),
+        Filter::ProgOrigin => Ok(vec![Value::String(crate::value::Text::from(
+            crate::feed::prog_origin(),
+        ))]),
         Filter::FormatBy(name) => super::builtin::eval_format_by(name, input, env),
-        Filter::Pow10 => Err(raise(Value::String(
+        Filter::Pow10 => Err(raise(Value::String(crate::value::Text::from(
             "Error: pow10/0 not found at build time".to_string(),
-        ))),
+        )))),
         Filter::Error => Err(raise(input.clone())),
         Filter::Raise(arg) => eval_raise(arg, input, env),
         Filter::Try { body, handler } => eval_try(body, handler.as_deref(), input, env),
@@ -339,7 +347,9 @@ pub(super) fn slice(
         Value::String(text) => {
             let chars: Vec<char> = text.chars().collect();
             let (from, to) = slice_range(start, end, chars.len());
-            Ok(vec![Value::String(chars[from..to].iter().collect())])
+            Ok(vec![Value::String(crate::value::Text::from(
+                chars[from..to].iter().collect::<String>(),
+            ))])
         }
         other => Err(fail(format!(
             "Cannot index {} with object",
@@ -482,7 +492,7 @@ pub(super) fn require_slice_index(value: &Value) -> Result<(), Failure> {
 
 fn number_text(value: &Value) -> Option<String> {
     match value {
-        Value::Number(text) => Some(text.clone()),
+        Value::Number(text) => Some(text.to_string()),
         _ => None,
     }
 }
@@ -832,7 +842,7 @@ pub(super) fn lookup_label(slot: u32) -> Option<u32> {
 pub(super) fn label_object(runtime: u32) -> Value {
     Value::object(vec![(
         "__jq".to_string(),
-        Value::Number(runtime.to_string()),
+        Value::Number(crate::value::Text::from(runtime.to_string())),
     )])
 }
 
@@ -1386,7 +1396,10 @@ pub(super) fn eval_interpolate(
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
     let strings = expand_pieces(pieces, 0, String::new(), input, env)?;
-    Ok(strings.into_iter().map(Value::String).collect())
+    Ok(strings
+        .into_iter()
+        .map(|text| Value::String(crate::value::Text::from(text)))
+        .collect())
 }
 
 pub(super) fn expand_pieces(
@@ -1427,12 +1440,15 @@ pub(super) fn expand_pieces(
                         Err(inner) => {
                             for value in inner.partial {
                                 if let Value::String(text) = &value {
-                                    partial.push(text.clone());
+                                    partial.push(text.to_string());
                                 }
                             }
                             // An inner piece that fails reuses this piece's error.
                             return Err(Failure {
-                                partial: partial.into_iter().map(Value::String).collect(),
+                                partial: partial
+                                    .into_iter()
+                                    .map(|text| Value::String(crate::value::Text::from(text)))
+                                    .collect(),
                                 message,
                                 caught,
                                 stop: failure.stop.clone(),
@@ -1441,7 +1457,10 @@ pub(super) fn expand_pieces(
                     }
                 }
                 Err(Failure {
-                    partial: partial.into_iter().map(Value::String).collect(),
+                    partial: partial
+                        .into_iter()
+                        .map(|text| Value::String(crate::value::Text::from(text)))
+                        .collect(),
                     message,
                     caught,
                     stop: failure.stop,
@@ -1453,7 +1472,7 @@ pub(super) fn expand_pieces(
 
 pub(super) fn jq_text(value: &Value) -> String {
     match value {
-        Value::String(text) => text.clone(),
+        Value::String(text) => text.to_string(),
         other => {
             let style = Style {
                 layout: Layout::Compact,
@@ -1498,7 +1517,10 @@ pub(super) fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) 
                 error: Some(fail(key_message(&value))),
             };
         };
-        match index_by(input, &Value::String(name.clone())) {
+        match index_by(
+            input,
+            &Value::String(crate::value::Text::from(name.clone())),
+        ) {
             Ok(got) => {
                 let one = got.into_iter().next().unwrap_or(Value::Null);
                 pairs.push((name, one));
@@ -1556,7 +1578,7 @@ pub(super) fn pair_alts(
             };
         };
         for item in &values {
-            pairs.push((name.clone(), item.clone()));
+            pairs.push((name.to_string(), item.clone()));
         }
         if let Some(failure) = &value_err {
             return Alts {

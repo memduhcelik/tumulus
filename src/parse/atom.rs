@@ -99,6 +99,21 @@ impl<'a> Parser<'a> {
     /// A NUL sits in this token before the next delimiter.
     fn nul_in_token(&self) -> bool {
         let mut index = self.index;
+        // One file has no boundary. Searching the empty list on every byte
+        // dominated `--stream` over a large document.
+        if self.boundaries.is_empty() {
+            while index < self.src.len() {
+                let byte = self.src[index];
+                if byte == 0 {
+                    return true;
+                }
+                if is_delim_byte(byte) {
+                    return false;
+                }
+                index += 1;
+            }
+            return false;
+        }
         while index < self.src.len() {
             if self.boundaries.binary_search(&index).is_ok() && index != self.index {
                 return false;
@@ -175,7 +190,7 @@ impl<'a> Parser<'a> {
         if !self.token_boundary_ok() {
             return Err(());
         }
-        Ok(Value::Number(number::nan_text()))
+        Ok(Value::Number(crate::value::Text::from(number::nan_text())))
     }
 
     fn nan_payload(&self) -> bool {
@@ -189,7 +204,9 @@ impl<'a> Parser<'a> {
 
     fn parse_infinity(&mut self, negative: bool) -> Result<Value, ()> {
         if self.take_nonfinite_word("infinity") || self.take_nonfinite_word("inf") {
-            return Ok(Value::Number(number::infinite(negative)));
+            return Ok(Value::Number(crate::value::Text::from(number::infinite(
+                negative,
+            ))));
         }
         Err(())
     }
@@ -282,7 +299,7 @@ impl<'a> Parser<'a> {
                 .as_ref()
                 .map(|(exp_negative, digits)| (*exp_negative, digits.as_str())),
         );
-        Ok(Value::Number(text))
+        Ok(Value::Number(crate::value::Text::from(text)))
     }
 
     fn take_digits(&mut self) -> String {
@@ -309,7 +326,7 @@ fn invalid_phrase(token: &[u8]) -> &'static str {
 ///
 /// `0.0000001` and anything with an exponent are left out. Six leading
 /// zeros in the fraction of `0.…` is where jq switches to an exponent.
-fn plain_number(token: &[u8]) -> Option<String> {
+fn plain_number(token: &[u8]) -> Option<crate::value::Text> {
     if token.is_empty() || token[0] == b'+' || token[0] == b'.' {
         return None;
     }
@@ -356,7 +373,8 @@ fn plain_number(token: &[u8]) -> Option<String> {
     if index != token.len() {
         return None;
     }
-    std::str::from_utf8(token).ok().map(str::to_owned)
+    let text = std::str::from_utf8(token).ok()?;
+    Some(crate::value::Text::from(text))
 }
 
 fn is_delim_byte(byte: u8) -> bool {

@@ -227,7 +227,7 @@ pub(super) fn search_list_value() -> Value {
     Value::array(
         crate::feed::library_paths()
             .into_iter()
-            .map(Value::String)
+            .map(|path| Value::String(crate::value::Text::from(path)))
             .collect(),
     )
 }
@@ -368,11 +368,11 @@ fn expand_search(entry: &str) -> Result<String, String> {
 
 fn search_entries(search: &Value) -> Vec<String> {
     match search {
-        Value::String(text) => vec![text.clone()],
+        Value::String(text) => vec![text.to_string()],
         Value::Array(items) => items
             .iter()
             .filter_map(|item| match item {
-                Value::String(text) => Some(text.clone()),
+                Value::String(text) => Some(text.to_string()),
                 _ => None,
             })
             .collect(),

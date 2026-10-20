@@ -787,7 +787,7 @@ pub(crate) struct LineCursor {
 impl LineCursor {
     /// The line jq would report is fixed. More bytes would not change it,
     /// or the input has already ended.
-    pub(crate) fn ready(&self, text: &[u8], end: usize, atom: bool, eof: bool) -> bool {
+    pub(crate) fn ready(&mut self, text: &[u8], end: usize, atom: bool, eof: bool) -> bool {
         if atom && end >= text.len() && !eof {
             return false;
         }
@@ -796,35 +796,35 @@ impl LineCursor {
         } else {
             end.saturating_sub(1)
         };
-        let mut filled = self.filled;
-        let mut last_start = self.last_start;
-        if filled > 0 && need < last_start {
-            filled = 0;
-            last_start = 0;
+        // This read already finished: more bytes follow it, so a later read
+        // cannot change the line. The tail at the end of the buffer still
+        // waits, because another read can lengthen it.
+        if self.filled > need && need >= self.last_start && self.filled < text.len() {
+            return true;
         }
-        let _ = last_start;
-        while filled <= need {
-            if filled >= text.len() {
+        if self.filled > 0 && need < self.last_start {
+            *self = Self::default();
+        }
+        while self.filled <= need {
+            if self.filled >= text.len() {
                 return eof;
             }
-            let start = filled;
-            let limit = start.saturating_add(FGETS_MAX).min(text.len());
-            let mut next = start;
-            let mut at_newline = false;
-            while next < limit {
-                next += 1;
-                if text[next - 1] == b'\n' {
-                    at_newline = true;
-                    break;
-                }
-            }
+            let start = self.filled;
+            let next = read_chunk(text, start);
             if next == start {
                 return eof;
             }
-            if next == text.len() && !at_newline && !eof && next - start < FGETS_MAX {
+            let saw_nl = text[next - 1] == b'\n';
+            if next == text.len() && !saw_nl && !eof && next - start < FGETS_MAX {
                 return false;
             }
-            filled = next;
+            // A finished read contains at most one newline, and it is the
+            // last byte. Counting the slice again walked the file per value.
+            if saw_nl {
+                self.line += 1;
+            }
+            self.last_start = start;
+            self.filled = next;
         }
         true
     }
@@ -835,13 +835,20 @@ impl LineCursor {
         } else {
             end.saturating_sub(1)
         };
+        // Values are stamped in order. A later value in the same read has
+        // this line: jq counts every newline that read already consumed.
+        if self.filled > need && need >= self.last_start {
+            return self.line;
+        }
         if self.filled > 0 && need < self.last_start {
             *self = Self::default();
         }
         while self.filled <= need && self.filled < text.len() {
             let start = self.filled;
             let next = read_chunk(text, start);
-            self.line += newline_count(&text[start..next]);
+            if next > start && text[next - 1] == b'\n' {
+                self.line += 1;
+            }
             if next == start {
                 break;
             }
@@ -886,14 +893,82 @@ fn locate(text: &[u8], bom: usize, parsed: Vec<(Value, usize)>) -> Vec<LocatedVa
 
 fn read_chunk(text: &[u8], start: usize) -> usize {
     let limit = start.saturating_add(FGETS_MAX).min(text.len());
-    let mut end = start;
-    while end < limit {
-        end += 1;
-        if text[end - 1] == b'\n' {
-            break;
+    if start >= limit {
+        return start;
+    }
+    match find_newline(&text[start..limit]) {
+        Some(at) => start + at + 1,
+        None => limit,
+    }
+}
+
+/// fgets reads already finished in a buffer. A short tail with no newline is
+/// left out so a later append can lengthen that same read.
+#[derive(Clone, Default)]
+pub(crate) struct Fgets {
+    ends: Vec<usize>,
+    lines: Vec<u32>,
+    at: usize,
+}
+
+impl Fgets {
+    /// Record reads in `raw`. `eof` finishes a short tail that has no newline.
+    /// Without it, that tail stays open so a later append can lengthen the
+    /// same read.
+    pub(crate) fn push(&mut self, raw: &[u8], eof: bool) {
+        let mut at = self.ends.last().copied().unwrap_or(0);
+        let mut line = self.lines.last().copied().unwrap_or(0);
+        while at < raw.len() {
+            let next = read_chunk(raw, at);
+            if next == at {
+                break;
+            }
+            let saw_nl = raw[next - 1] == b'\n';
+            let full = next - at == FGETS_MAX;
+            if next == raw.len() && !saw_nl && !full && !eof {
+                break;
+            }
+            if saw_nl {
+                line = line.saturating_add(1);
+            }
+            self.ends.push(next);
+            self.lines.push(line);
+            at = next;
         }
     }
-    end
+
+    /// Line number once the read containing `need` has finished.
+    /// `None` while that read can still grow.
+    pub(crate) fn line(&mut self, need: usize) -> Option<u32> {
+        if self.at > 0 && need < self.ends[self.at - 1] {
+            self.at = 0;
+        }
+        while self.at < self.ends.len() && self.ends[self.at] <= need {
+            self.at += 1;
+        }
+        if self.at < self.ends.len() {
+            Some(self.lines[self.at])
+        } else {
+            None
+        }
+    }
+}
+
+/// First `\n` in `slice`.
+fn find_newline(slice: &[u8]) -> Option<usize> {
+    if slice.is_empty() {
+        return None;
+    }
+    let found = unsafe { memchr(slice.as_ptr(), b'\n' as i32, slice.len()) };
+    if found.is_null() {
+        None
+    } else {
+        Some(unsafe { found.offset_from(slice.as_ptr()) } as usize)
+    }
+}
+
+unsafe extern "C" {
+    fn memchr(haystack: *const u8, needle: i32, len: usize) -> *const u8;
 }
 
 /// Where the next end-of-file check can start.
@@ -905,8 +980,18 @@ fn read_chunk(text: &[u8], start: usize) -> usize {
 /// read at the end.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct EofCut {
-    at: usize,
+    /// Length of `bytes` this answer was classified for.
+    seen: usize,
+    /// First byte of the read that may still grow, or `seen` when every
+    /// read is finished.
+    resume: usize,
+    /// Start of the unfinished tail read. `None` when that tail is not an
+    /// end-of-file cut.
+    open: Option<usize>,
 }
+
+#[cfg(test)]
+static EOF_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl EofCut {
     /// The value ending at `end` was completed in the last read of `bytes`,
@@ -920,38 +1005,56 @@ impl EofCut {
         if bytes.is_empty() || end == 0 {
             return false;
         }
-        // The last read ended on a newline. No value was completed by a
-        // short read at the end of the buffer.
-        if bytes.last() == Some(&b'\n') {
-            return false;
+        if self.seen != bytes.len() {
+            self.classify(bytes);
         }
+        let Some(open) = self.open else {
+            return false;
+        };
         let pos = if end < bytes.len() {
             end
         } else {
             bytes.len() - 1
         };
-        if self.at > pos || self.at > bytes.len() {
-            self.at = 0;
+        pos >= open
+    }
+
+    /// One pass over the bytes added since the last call. A value inside a
+    /// finished read does not walk that read again.
+    fn classify(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        if self.resume > len {
+            self.resume = 0;
+            self.open = None;
         }
-        let mut at = self.at;
-        while at < bytes.len() {
+        self.seen = len;
+        // A buffer that ends on a newline has no end-of-file cut.
+        if bytes.last() == Some(&b'\n') {
+            self.open = None;
+            self.resume = len;
+            return;
+        }
+        let mut at = match self.open {
+            Some(open) => open,
+            None => self.resume.min(len),
+        };
+        while at < len {
             let next = read_chunk(bytes, at);
+            #[cfg(test)]
+            EOF_SCANNED.fetch_add((next - at) as u64, std::sync::atomic::Ordering::Relaxed);
             if next == at {
                 break;
             }
-            if pos < next {
-                self.at = at;
-                return next == bytes.len() && bytes[next - 1] != b'\n';
+            if next == len {
+                self.open = Some(at);
+                self.resume = at;
+                return;
             }
             at = next;
-            self.at = at;
         }
-        false
+        self.open = None;
+        self.resume = at;
     }
-}
-
-fn newline_count(text: &[u8]) -> usize {
-    text.iter().filter(|byte| **byte == b'\n').count()
 }
 
 pub(in crate::parse) fn split_bom(bytes: &[u8]) -> (usize, &[u8]) {
@@ -968,7 +1071,7 @@ fn is_atom(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{nul_cut, stream_line, EofCut, LineCursor, NulScan};
+    use super::{nul_cut, stream_line, EofCut, Fgets, LineCursor, NulScan};
 
     fn finished_on_eof_cut(bytes: &[u8], end: usize) -> bool {
         EofCut::default().at(bytes, end)
@@ -1035,6 +1138,82 @@ mod tests {
                     assert_eq!(back, stream_line(text, 10, !atom));
                     let again = cursor.line_at(text, text.len(), atom);
                     assert_eq!(again, stream_line(text, text.len(), atom));
+                }
+            }
+        }
+    }
+
+    /// A finished file with no trailing newline still has a line. The table
+    /// used to leave that tail out, so the value at the end had no line.
+    #[test]
+    fn fgets_sealed_tail_matches_line_cursor() {
+        let text = b"12345";
+        let mut table = Fgets::default();
+        table.push(text, true);
+        let mut cursor = LineCursor::default();
+        assert!(cursor.ready(text, text.len(), false, true));
+        let line = cursor.line_at(text, text.len(), false);
+        assert_eq!(table.line(text.len() - 1), Some(line as u32));
+
+        let mut samples = vec![
+            b"abc".to_vec(),
+            b"abc\n".to_vec(),
+            b"\n\n\n".to_vec(),
+            b"no-newline-at-all".to_vec(),
+            bytes(10, 1),
+            bytes(80, 7),
+            bytes(4096, 10),
+            bytes(9000, 4095),
+            vec![0xEF, 0xBB, 0xBF, b'1', b'\n'],
+        ];
+        let mut boundary = vec![b'x'; 4095];
+        boundary.push(b'\n');
+        boundary.extend(std::iter::repeat(b'y').take(20));
+        samples.push(boundary);
+        for text in samples {
+            let step = if text.len() > 500 { 128 } else { 1 };
+            let mut table = Fgets::default();
+            let mut built = 0;
+            while built < text.len() {
+                let next = (built + step).min(text.len());
+                let eof = next == text.len();
+                table.push(&text[..next], eof);
+                agree(&mut table, &text[..next], eof);
+                built = next;
+            }
+        }
+    }
+
+    fn agree(table: &mut Fgets, text: &[u8], eof: bool) {
+        for end in ends_for(text.len()) {
+            for atom in [false, true] {
+                if atom && end >= text.len() && !eof {
+                    continue;
+                }
+                let mut cursor = LineCursor::default();
+                let ready = cursor.ready(text, end, atom, eof);
+                let need = if atom && end < text.len() {
+                    end
+                } else {
+                    end.saturating_sub(1)
+                };
+                let got = table.line(need);
+                if ready {
+                    let mut fresh = LineCursor::default();
+                    let line = fresh.line_at(text, end, atom);
+                    assert_eq!(
+                        got,
+                        Some(line as u32),
+                        "end {end} atom {atom} eof {eof} len {}",
+                        text.len()
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        None,
+                        "end {end} atom {atom} eof {eof} len {}",
+                        text.len()
+                    );
                 }
             }
         }
@@ -1179,6 +1358,24 @@ mod tests {
         assert!(
             started.elapsed().as_millis() < 3_000,
             "reread the file for every value"
+        );
+    }
+
+    /// A long line is one fgets window after another. Asking for every value
+    /// must not read that window again for each value.
+    #[test]
+    fn eof_cut_does_not_reread_a_long_line() {
+        let many = vec![b'1'; 200_000];
+        super::EOF_SCANNED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut walk = EofCut::default();
+        for end in 0..=many.len() {
+            let _ = walk.at(&many, end);
+        }
+        let scanned = super::EOF_SCANNED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            scanned < many.len() as u64 * 8,
+            "scanned {scanned} bytes of a {}-byte line",
+            many.len()
         );
     }
 

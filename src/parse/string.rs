@@ -1,6 +1,7 @@
 //! JSON strings, escapes, and the jq messages for a bad one.
 
 use super::parser::{ParseErr, Parser};
+use crate::value::Text;
 
 const CONTROL: &str =
     "Invalid string: control characters from U+0000 through U+001F must be escaped";
@@ -9,6 +10,43 @@ const BAD_U_CHARS: &str = "Invalid characters in \\uXXXX escape";
 const SURROGATE: &str = "Invalid \\uXXXX\\uXXXX surrogate pair escape";
 
 impl<'a> Parser<'a> {
+    /// The characters between the quotes. Plain ASCII is copied once.
+    pub(in crate::parse) fn parse_text(&mut self) -> Result<Text, ParseErr> {
+        if let Some(text) = self.plain_text() {
+            return Ok(text);
+        }
+        self.parse_string().map(Text::from)
+    }
+
+    /// A string with no escape and no byte above ASCII. `None` leaves the
+    /// parser where it was so [`Parser::parse_string`] can read it.
+    fn plain_text(&mut self) -> Option<Text> {
+        let bytes = self.src;
+        let start = self.index;
+        if bytes.get(start) != Some(&b'"') {
+            return None;
+        }
+        let mut index = start + 1;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == b'"' {
+                if self.boundaries.iter().any(|at| *at > start && *at <= index) {
+                    return None;
+                }
+                let content = &bytes[start + 1..index];
+                let text = std::str::from_utf8(content).ok()?;
+                let text = Text::from(text);
+                self.advance_ascii(index + 1);
+                return Some(text);
+            }
+            if byte == b'\\' || byte < 0x20 || byte >= 0x80 {
+                return None;
+            }
+            index += 1;
+        }
+        None
+    }
+
     pub(in crate::parse) fn parse_string(&mut self) -> Result<String, ParseErr> {
         self.bump();
         // Raw content bytes, with escapes already turned into their bytes.

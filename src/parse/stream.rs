@@ -6,9 +6,11 @@
 //! words a few errors differently from the ordinary parser, and a final
 //! closer that names a scalar is split off when nothing follows it.
 
+use std::cell::OnceCell;
+
 use super::parser::{ParseErr, Parser};
 use super::{skip_rest_of_line, split_bom, LineCursor};
-use crate::value::Value;
+use crate::value::{Text, Value};
 
 struct RawItem {
     value: Value,
@@ -106,9 +108,18 @@ enum Act {
 struct Arr {
     path: Vec<Value>,
     index: usize,
+    /// `index` already rendered, so each element reuses it.
+    index_value: Value,
     held: Option<Value>,
     after_comma: bool,
     started: bool,
+}
+
+impl Arr {
+    fn advance(&mut self) {
+        self.index += 1;
+        self.index_value = Value::Number(index_text(self.index));
+    }
 }
 
 enum ObjStage {
@@ -121,7 +132,7 @@ enum ObjStage {
 struct Obj {
     path: Vec<Value>,
     after_comma: bool,
-    key: String,
+    key: Text,
     held: Option<Value>,
     stage: ObjStage,
     started: bool,
@@ -136,7 +147,7 @@ impl Frame {
     fn note_child(&mut self) {
         match self {
             Frame::Arr(arr) => {
-                arr.index += 1;
+                arr.advance();
                 arr.after_comma = false;
                 arr.held = None;
             }
@@ -152,6 +163,7 @@ fn new_arr(path: Vec<Value>) -> Frame {
     Frame::Arr(Arr {
         path,
         index: 0,
+        index_value: Value::Number(index_text(0)),
         held: None,
         after_comma: false,
         started: false,
@@ -162,7 +174,7 @@ fn new_obj(path: Vec<Value>) -> Frame {
     Frame::Obj(Obj {
         path,
         after_comma: false,
-        key: String::new(),
+        key: empty_text(),
         held: None,
         stage: ObjStage::Key,
         started: false,
@@ -436,7 +448,7 @@ fn walk_all(text: &[u8], errors: bool, bounds: &[usize]) -> RawScan {
 
 pub(crate) fn error_value(message: &str, path: &[Value]) -> Value {
     Value::array(vec![
-        Value::String(message.to_string()),
+        Value::String(Text::from(message)),
         Value::array(path.to_vec()),
     ])
 }
@@ -607,8 +619,8 @@ impl<'a> Walker<'a> {
                 }
                 // A string is finished at its closing quote. A bad byte after
                 // it is a separate error, and the string is still a value.
-                let value = Value::String(self.parser.parse_string()?);
-                self.emit_pair(&[], value, false);
+                let value = Value::String(self.parser.parse_text()?);
+                self.emit_pair(Vec::new(), value, false);
                 self.top_glue()?;
                 Ok(())
             }
@@ -620,7 +632,7 @@ impl<'a> Walker<'a> {
                 let value = self.parser.scan_atom()?;
                 self.top_glue()?;
                 let atom = is_atom_value(&value);
-                self.emit_pair(&[], value, atom);
+                self.emit_pair(Vec::new(), value, atom);
                 Ok(())
             }
         }
@@ -687,36 +699,39 @@ impl<'a> Walker<'a> {
             arr.started = true;
             if self.parser.peek() == Some(']') {
                 self.parser.bump();
-                self.emit_pair(&arr.path, Value::array(Vec::new()), false);
+                self.emit_pair(clone_path(&arr.path), Value::array(Vec::new()), false);
                 return Ok(Act::Done);
             }
         }
-        self.mark_arr(arr);
         match self.parser.peek() {
             None => {
                 if !self.final_eof {
                     return Ok(Act::Block);
                 }
+                self.mark_arr(arr);
                 Err(self.parser.fail("Unfinished JSON term", true))
             }
             Some(']') => {
                 if arr.after_comma && arr.held.is_none() {
+                    self.mark_arr(arr);
                     return Err(self.parser.bump_fail("Expected another array element"));
                 }
                 self.parser.bump();
                 if let Some(value) = arr.held.take() {
-                    let child = with_index(&arr.path, arr.index);
+                    let child = path_index(arr);
                     let atom = is_atom_value(&value);
-                    self.emit_pair(&child, value, atom);
-                    self.emit_closer(&child);
+                    self.emit_pair(clone_path(&child), value, atom);
+                    self.emit_closer(child);
                 } else if arr.index == 0 {
+                    self.mark_arr(arr);
                     return Err(self.parser.fail("Unfinished JSON term", true));
                 } else {
-                    self.emit_closer(&with_index(&arr.path, arr.index - 1));
+                    self.emit_closer(with_index(&arr.path, arr.index - 1));
                 }
                 Ok(Act::Done)
             }
             Some('}') => {
+                self.mark_arr(arr);
                 if arr.after_comma && arr.held.is_none() {
                     return Err(self.parser.bump_fail("Expected another key:value pair"));
                 }
@@ -727,10 +742,10 @@ impl<'a> Walker<'a> {
             Some(',') => {
                 if let Some(value) = arr.held.take() {
                     self.parser.bump();
-                    let child = with_index(&arr.path, arr.index);
+                    let child = path_index(arr);
                     let atom = is_atom_value(&value);
-                    self.emit_pair(&child, value, atom);
-                    arr.index += 1;
+                    self.emit_pair(child, value, atom);
+                    arr.advance();
                     arr.after_comma = true;
                     Ok(Act::Keep)
                 } else if arr.index > 0 && !arr.after_comma {
@@ -738,44 +753,65 @@ impl<'a> Walker<'a> {
                     arr.after_comma = true;
                     Ok(Act::Keep)
                 } else {
+                    self.mark_arr(arr);
                     Err(self.parser.bump_fail("Expected value before ','"))
                 }
             }
-            Some(':') => Err(self.parser.bump_fail("':' not as part of an object")),
+            Some(':') => {
+                self.mark_arr(arr);
+                Err(self.parser.bump_fail("':' not as part of an object"))
+            }
             Some(_) => {
                 if arr.held.is_some() || (arr.index > 0 && !arr.after_comma) {
+                    self.mark_arr(arr);
                     return Err(self.parser.expected_stream_separator());
                 }
-                let child = with_index(&arr.path, arr.index);
                 match self.parser.peek() {
                     Some('[') => {
                         self.parser.bump();
-                        Ok(Act::Nest(new_arr(child)))
+                        Ok(Act::Nest(new_arr(path_index(arr))))
                     }
                     Some('{') => {
                         self.parser.bump();
-                        Ok(Act::Nest(new_obj(child)))
+                        Ok(Act::Nest(new_obj(path_index(arr))))
                     }
                     Some('"') => {
                         if !self.string_ready() {
                             return Ok(Act::Block);
                         }
-                        arr.held = Some(Value::String(self.parser.parse_string()?));
-                        arr.after_comma = false;
-                        Ok(Act::Keep)
+                        match self.parser.parse_text() {
+                            Ok(text) => {
+                                arr.held = Some(Value::String(text));
+                                arr.after_comma = false;
+                                Ok(Act::Keep)
+                            }
+                            Err(err) => {
+                                self.mark_arr(arr);
+                                Err(err)
+                            }
+                        }
                     }
                     Some(_) => {
                         if !self.atom_ready() {
                             return Ok(Act::Block);
                         }
-                        arr.held = Some(self.parser.scan_atom()?);
-                        arr.after_comma = false;
-                        Ok(Act::Keep)
+                        match self.parser.scan_atom() {
+                            Ok(value) => {
+                                arr.held = Some(value);
+                                arr.after_comma = false;
+                                Ok(Act::Keep)
+                            }
+                            Err(err) => {
+                                self.mark_arr(arr);
+                                Err(err)
+                            }
+                        }
                     }
                     None => {
                         if !self.final_eof {
                             return Ok(Act::Block);
                         }
+                        self.mark_arr(arr);
                         Err(self.parser.fail("Unfinished JSON term", true))
                     }
                 }
@@ -789,7 +825,6 @@ impl<'a> Walker<'a> {
             ObjStage::Value => return self.object_value(obj),
             ObjStage::Key => {}
         }
-        self.mark_obj(obj, false);
         self.parser.skip_ws();
         if !obj.started {
             if self.parser.peek().is_none() && !self.final_eof {
@@ -798,34 +833,49 @@ impl<'a> Walker<'a> {
             obj.started = true;
             if self.parser.peek() == Some('}') {
                 self.parser.bump();
-                self.emit_pair(&obj.path, Value::object(Vec::new()), false);
+                self.emit_pair(clone_path(&obj.path), Value::object(Vec::new()), false);
                 return Ok(Act::Done);
             }
         }
         if self.hold_for_token() || !self.colon_ready() {
             return Ok(Act::Block);
         }
-        let key = self.parse_key(obj.after_comma)?;
-        self.parser.expect_colon()?;
+        let key = match self.parse_key(obj.after_comma) {
+            Ok(key) => key,
+            Err(err) => {
+                self.mark_obj(obj, false);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.parser.expect_colon() {
+            self.mark_obj(obj, false);
+            return Err(err);
+        }
         obj.key = key;
         obj.stage = ObjStage::Value;
         self.object_value(obj)
     }
 
     fn object_value(&mut self, obj: &mut Obj) -> Result<Act, ParseErr> {
-        self.mark_obj(obj, true);
         self.parser.skip_ws();
         match self.parser.peek() {
             None => {
                 if !self.final_eof {
                     return Ok(Act::Block);
                 }
+                self.mark_obj(obj, true);
                 Err(self.parser.fail("Unfinished JSON term", true))
             }
-            Some('}') => Err(self.parser.bump_fail("Missing value in key:value pair")),
-            Some(']') => Err(self
-                .parser
-                .bump_fail("Unmatched ']' in the middle of an object")),
+            Some('}') => {
+                self.mark_obj(obj, true);
+                Err(self.parser.bump_fail("Missing value in key:value pair"))
+            }
+            Some(']') => {
+                self.mark_obj(obj, true);
+                Err(self
+                    .parser
+                    .bump_fail("Unmatched ']' in the middle of an object"))
+            }
             Some('[') => {
                 self.parser.bump();
                 Ok(Act::Nest(new_arr(with_key(&obj.path, &obj.key))))
@@ -838,17 +888,33 @@ impl<'a> Walker<'a> {
                 if !self.string_ready() {
                     return Ok(Act::Block);
                 }
-                obj.held = Some(Value::String(self.parser.parse_string()?));
-                obj.stage = ObjStage::Sep;
-                Ok(Act::Keep)
+                match self.parser.parse_text() {
+                    Ok(text) => {
+                        obj.held = Some(Value::String(text));
+                        obj.stage = ObjStage::Sep;
+                        Ok(Act::Keep)
+                    }
+                    Err(err) => {
+                        self.mark_obj(obj, true);
+                        Err(err)
+                    }
+                }
             }
             Some(_) => {
                 if !self.atom_ready() {
                     return Ok(Act::Block);
                 }
-                obj.held = Some(self.parser.scan_atom()?);
-                obj.stage = ObjStage::Sep;
-                Ok(Act::Keep)
+                match self.parser.scan_atom() {
+                    Ok(value) => {
+                        obj.held = Some(value);
+                        obj.stage = ObjStage::Sep;
+                        Ok(Act::Keep)
+                    }
+                    Err(err) => {
+                        self.mark_obj(obj, true);
+                        Err(err)
+                    }
+                }
             }
         }
     }
@@ -914,13 +980,13 @@ impl<'a> Walker<'a> {
     }
 
     fn object_sep(&mut self, obj: &mut Obj) -> Result<Act, ParseErr> {
-        self.mark_obj(obj, true);
         self.parser.skip_ws();
         match self.parser.peek() {
             None => {
                 if !self.final_eof {
                     return Ok(Act::Block);
                 }
+                self.mark_obj(obj, true);
                 Err(self.parser.fail("Unfinished JSON term", true))
             }
             Some(',') => {
@@ -928,7 +994,7 @@ impl<'a> Walker<'a> {
                 if let Some(value) = obj.held.take() {
                     let child = with_key(&obj.path, &obj.key);
                     let atom = is_atom_value(&value);
-                    self.emit_pair(&child, value, atom);
+                    self.emit_pair(child, value, atom);
                 }
                 obj.after_comma = true;
                 obj.stage = ObjStage::Key;
@@ -939,19 +1005,27 @@ impl<'a> Walker<'a> {
                 if let Some(value) = obj.held.take() {
                     let child = with_key(&obj.path, &obj.key);
                     let atom = is_atom_value(&value);
-                    self.emit_pair(&child, value, atom);
+                    self.emit_pair(clone_path(&child), value, atom);
+                    self.emit_closer(child);
+                } else {
+                    self.emit_closer(with_key(&obj.path, &obj.key));
                 }
-                self.emit_closer(&with_key(&obj.path, &obj.key));
                 Ok(Act::Done)
             }
-            Some(']') => Err(self
-                .parser
-                .bump_fail("Unmatched ']' in the middle of an object")),
-            Some(_) => Err(self.parser.expected_stream_separator()),
+            Some(']') => {
+                self.mark_obj(obj, true);
+                Err(self
+                    .parser
+                    .bump_fail("Unmatched ']' in the middle of an object"))
+            }
+            Some(_) => {
+                self.mark_obj(obj, true);
+                Err(self.parser.expected_stream_separator())
+            }
         }
     }
 
-    fn parse_key(&mut self, after_comma: bool) -> Result<String, ParseErr> {
+    fn parse_key(&mut self, after_comma: bool) -> Result<Text, ParseErr> {
         self.parser.skip_ws();
         match self.parser.peek() {
             None => Err(self.parser.fail("Unfinished JSON term", true)),
@@ -970,7 +1044,7 @@ impl<'a> Walker<'a> {
             Some(':') => Err(self.parser.bump_fail("Expected string key before ':'")),
             Some('[') => Err(self.key_open(after_comma, false)),
             Some('{') => Err(self.key_open(after_comma, true)),
-            Some('"') => self.parser.parse_string(),
+            Some('"') => self.parser.parse_text(),
             Some(_) => {
                 self.parser.parse_value()?;
                 Err(self.stream_bad_key())
@@ -1004,20 +1078,23 @@ impl<'a> Walker<'a> {
         self.parser.fail(phrase, false)
     }
 
-    fn emit_pair(&mut self, path: &[Value], value: Value, atom: bool) {
-        let item = Value::array(vec![Value::array(path.to_vec()), value]);
+    fn emit_pair(&mut self, path: Vec<Value>, value: Value, atom: bool) {
+        let mut pair = crate::value::scratch_vec(2);
+        pair.push(Value::array(path));
+        pair.push(value);
         self.items.push(RawItem {
-            value: item,
+            value: Value::array(pair),
             end: self.parser.index,
             atom,
             unknown: false,
         });
     }
 
-    fn emit_closer(&mut self, path: &[Value]) {
-        let item = Value::array(vec![Value::array(path.to_vec())]);
+    fn emit_closer(&mut self, path: Vec<Value>) {
+        let mut item = crate::value::scratch_vec(1);
+        item.push(Value::array(path));
         self.items.push(RawItem {
-            value: item,
+            value: Value::array(item),
             end: self.parser.index,
             atom: false,
             unknown: false,
@@ -1025,31 +1102,67 @@ impl<'a> Walker<'a> {
     }
 
     fn mark_arr(&mut self, arr: &Arr) {
-        self.err_path = with_index(&arr.path, arr.index);
+        self.err_path = path_index(arr);
     }
 
     /// `keyed` is the key whose value is being read. Otherwise the slot is null.
     fn mark_obj(&mut self, obj: &Obj, keyed: bool) {
-        let mut path = obj.path.clone();
-        if keyed {
-            path.push(Value::String(obj.key.clone()));
+        self.err_path = if keyed {
+            with_key(&obj.path, &obj.key)
         } else {
+            let mut path = crate::value::scratch_vec(obj.path.len() + 1);
+            path.extend_from_slice(&obj.path);
             path.push(Value::Null);
-        }
-        self.err_path = path;
+            path
+        };
     }
 }
 
-fn with_index(path: &[Value], index: usize) -> Vec<Value> {
-    let mut child = path.to_vec();
-    child.push(Value::Number(index.to_string()));
+fn path_index(arr: &Arr) -> Vec<Value> {
+    let mut child = crate::value::scratch_vec(arr.path.len() + 1);
+    child.extend_from_slice(&arr.path);
+    child.push(arr.index_value.clone());
     child
 }
 
-fn with_key(path: &[Value], key: &str) -> Vec<Value> {
-    let mut child = path.to_vec();
-    child.push(Value::String(key.to_string()));
+fn with_index(path: &[Value], index: usize) -> Vec<Value> {
+    let mut child = crate::value::scratch_vec(path.len() + 1);
+    child.extend_from_slice(path);
+    child.push(Value::Number(index_text(index)));
     child
+}
+
+fn with_key(path: &[Value], key: &Text) -> Vec<Value> {
+    let mut child = crate::value::scratch_vec(path.len() + 1);
+    child.extend_from_slice(path);
+    child.push(Value::String(key.clone()));
+    child
+}
+
+fn clone_path(path: &[Value]) -> Vec<Value> {
+    let mut out = crate::value::scratch_vec(path.len());
+    out.extend_from_slice(path);
+    out
+}
+
+fn index_text(index: usize) -> Text {
+    thread_local! {
+        static SMALL: OnceCell<Vec<Text>> = OnceCell::new();
+    }
+    if index < 256 {
+        return SMALL.with(|cell| {
+            cell.get_or_init(|| (0..256).map(|n| Text::from(n.to_string())).collect())[index]
+                .clone()
+        });
+    }
+    Text::from(index.to_string())
+}
+
+fn empty_text() -> Text {
+    thread_local! {
+        static EMPTY: OnceCell<Text> = OnceCell::new();
+    }
+    EMPTY.with(|cell| cell.get_or_init(|| Text::from("")).clone())
 }
 
 fn is_atom_value(value: &Value) -> bool {

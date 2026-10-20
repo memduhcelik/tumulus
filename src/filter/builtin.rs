@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::date;
 use crate::math;
 use crate::number;
-use crate::value::Value;
+use crate::value::{Text, Value};
 
 use super::ast::*;
 use super::eval::*;
@@ -15,7 +15,7 @@ use super::value::*;
 /// string prints, and what `catch` receives when no value was recorded.
 pub(super) fn raise(value: Value) -> Failure {
     let message = match &value {
-        Value::String(text) => text.clone(),
+        Value::String(text) => text.to_string(),
         other => jq_text(other),
     };
     Failure {
@@ -27,7 +27,10 @@ pub(super) fn raise(value: Value) -> Failure {
 }
 
 pub(super) fn eval_debug(input: &Value) -> Result<Vec<Value>, Failure> {
-    let wrapped = Value::array(vec![Value::String("DEBUG:".to_string()), input.clone()]);
+    let wrapped = Value::array(vec![
+        Value::String(crate::value::Text::from("DEBUG:".to_string())),
+        input.clone(),
+    ]);
     let (ascii, sort_keys) = crate::feed::dump_flags();
     let style = crate::print::Style {
         layout: crate::print::Layout::Compact,
@@ -67,7 +70,7 @@ pub(super) fn builtins_value() -> Value {
     Value::array(
         super::names::BUILTINS
             .iter()
-            .map(|name| Value::String((*name).to_string()))
+            .map(|name| Value::String(crate::value::Text::from((*name).to_string())))
             .collect(),
     )
 }
@@ -200,7 +203,7 @@ pub(super) fn eval_try(
     };
     let caught = match failure.caught {
         Some(value) => value,
-        None => Value::String(failure.message),
+        None => Value::String(crate::value::Text::from(failure.message)),
     };
     match eval_in(handler, &caught, env) {
         Ok(more) => {
@@ -228,11 +231,13 @@ pub(super) fn number_required(value: &Value) -> Result<f64, String> {
 }
 
 pub(super) fn from_f64(n: f64) -> Value {
-    Value::Number(number::mark_f64(number::format_jq_f64(n)))
+    Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(n),
+    )))
 }
 
 pub(super) fn eval_abs(input: &Value) -> Result<Vec<Value>, Failure> {
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     if cmp_value(input, &zero) < 0 {
         one(negate_value(input))
     } else {
@@ -344,10 +349,18 @@ pub(super) fn eval_strptime(
 
 pub(super) fn eval_length(input: &Value) -> Result<Vec<Value>, Failure> {
     match input {
-        Value::Null => Ok(vec![Value::Number("0".to_string())]),
-        Value::String(text) => Ok(vec![Value::Number(text.chars().count().to_string())]),
-        Value::Array(items) => Ok(vec![Value::Number(items.len().to_string())]),
-        Value::Object(items) => Ok(vec![Value::Number(items.len().to_string())]),
+        Value::Null => Ok(vec![Value::Number(crate::value::Text::from(
+            "0".to_string(),
+        ))]),
+        Value::String(text) => Ok(vec![Value::Number(crate::value::Text::from(
+            text.chars().count().to_string(),
+        ))]),
+        Value::Array(items) => Ok(vec![Value::Number(crate::value::Text::from(
+            items.len().to_string(),
+        ))]),
+        Value::Object(items) => Ok(vec![Value::Number(crate::value::Text::from(
+            items.len().to_string(),
+        ))]),
         Value::Number(text) => Ok(vec![number_length(text)]),
         other => Err(fail(format!(
             "{} ({}) has no length",
@@ -364,7 +377,7 @@ pub(super) fn number_length(text: &str) -> Value {
         number::Real::Nan => number::nan_text(),
         number::Real::Num(n) => number::format_jq_f64(n.abs()),
     };
-    Value::Number(number::mark_f64(abs))
+    Value::Number(crate::value::Text::from(number::mark_f64(abs)))
 }
 
 pub(super) fn eval_keys(input: &Value) -> Result<Vec<Value>, Failure> {
@@ -380,7 +393,7 @@ fn key_list(input: &Value, sorted: bool) -> Result<Vec<Value>, Failure> {
     match input {
         Value::Array(items) => {
             let keys = (0..items.len())
-                .map(|index| Value::Number(index.to_string()))
+                .map(|index| Value::Number(crate::value::Text::from(index.to_string())))
                 .collect();
             Ok(vec![Value::array(keys)])
         }
@@ -396,7 +409,7 @@ fn key_list(input: &Value, sorted: bool) -> Result<Vec<Value>, Failure> {
             }
             let keys = names
                 .into_iter()
-                .map(|name| Value::String(name.to_string()))
+                .map(|name| Value::String(crate::value::Text::from(name.to_string())))
                 .collect();
             Ok(vec![Value::array(keys)])
         }
@@ -432,9 +445,9 @@ pub(super) fn has_key(input: &Value, key: &Value) -> Result<Value, String> {
         return Ok(Value::Bool(false));
     }
     match (input, key) {
-        (Value::Object(items), Value::String(name)) => {
-            Ok(Value::Bool(items.iter().any(|(key, _)| key == name)))
-        }
+        (Value::Object(items), Value::String(name)) => Ok(Value::Bool(
+            items.iter().any(|(key, _)| key == name.as_str()),
+        )),
         (Value::Array(items), Value::Number(text)) => Ok(Value::Bool(array_has(items.len(), text))),
         _ => Err(format!(
             "Cannot check whether {} has a {} key",
@@ -476,7 +489,9 @@ pub(super) fn eval_tojson(input: &Value) -> Result<Vec<Value>, Failure> {
         layout: crate::print::Layout::Compact,
         ..crate::print::Style::default()
     };
-    Ok(vec![Value::String(crate::print::render(input, style))])
+    Ok(vec![Value::String(crate::value::Text::from(
+        crate::print::render(input, style),
+    ))])
 }
 
 /// `reduce .[] as $x (null; . + $x)`. An empty walk is null.
@@ -494,11 +509,21 @@ pub(super) fn eval_to_entries(input: &Value) -> Result<Vec<Value>, Failure> {
         Value::Array(items) => items
             .iter()
             .enumerate()
-            .map(|(index, value)| entry(Value::Number(index.to_string()), value.clone()))
+            .map(|(index, value)| {
+                entry(
+                    Value::Number(crate::value::Text::from(index.to_string())),
+                    value.clone(),
+                )
+            })
             .collect::<Vec<_>>(),
         Value::Object(pairs) => pairs
             .iter()
-            .map(|(key, value)| entry(Value::String(key.clone()), value.clone()))
+            .map(|(key, value)| {
+                entry(
+                    Value::String(crate::value::Text::from(key.clone())),
+                    value.clone(),
+                )
+            })
             .collect::<Vec<_>>(),
         other => {
             return Err(fail(format!(
@@ -628,10 +653,10 @@ pub(super) fn parse_number_text(text: &str) -> Result<Value, String> {
     match parsed.values.as_slice() {
         [] => Err(format!("Expected JSON value{suffix}")),
         [only] => match &only.value {
-            Value::Number(raw) => Ok(Value::Number(raw.clone())),
+            Value::Number(raw) => Ok(Value::Number(crate::value::Text::from(raw.clone()))),
             _ => Err(format!(
                 "string ({}) cannot be parsed as a number",
-                shown(&Value::String(text.to_string()))
+                shown(&Value::String(crate::value::Text::from(text.to_string())))
             )),
         },
         _ => Err(format!("Unexpected extra JSON values{suffix}")),
@@ -663,9 +688,12 @@ pub(super) fn join_with(input: &Value, sep: &Value) -> Result<Value, String> {
         Err(failure) => return Err(failure.message),
     };
     if items.is_empty() {
-        return Ok(Value::String(String::new()));
+        return Ok(Value::String(crate::value::Text::from(String::new())));
     }
-    let mut acc = add_values(&Value::String(String::new()), &join_piece(&items[0]))?;
+    let mut acc = add_values(
+        &Value::String(crate::value::Text::from(String::new())),
+        &join_piece(&items[0]),
+    )?;
     for item in &items[1..] {
         let with_sep = add_values(&acc, sep)?;
         acc = add_values(&with_sep, &join_piece(item))?;
@@ -675,8 +703,8 @@ pub(super) fn join_with(input: &Value, sep: &Value) -> Result<Value, String> {
 
 pub(super) fn join_piece(item: &Value) -> Value {
     match item {
-        Value::Null => Value::String(String::new()),
-        Value::Bool(_) | Value::Number(_) => Value::String(jq_text(item)),
+        Value::Null => Value::String(crate::value::Text::from(String::new())),
+        Value::Bool(_) | Value::Number(_) => Value::String(crate::value::Text::from(jq_text(item))),
         other => other.clone(),
     }
 }
@@ -706,7 +734,9 @@ pub(super) fn trim_once(input: &Value, affix: &Value, left: bool) -> Value {
     } else {
         text.strip_suffix(edge.as_str())
     };
-    Value::String(trimmed.unwrap_or(text).to_string())
+    Value::String(crate::value::Text::from(
+        trimmed.unwrap_or(text).to_string(),
+    ))
 }
 
 /// Which occurrence `index`, `rindex`, or `indices` keeps.
@@ -731,7 +761,7 @@ pub(super) fn eval_ascii_case(input: &Value, up: bool) -> Result<Vec<Value>, Fai
             }
         })
         .collect();
-    Ok(vec![Value::String(mapped)])
+    Ok(vec![Value::String(Text::from(mapped))])
 }
 
 pub(super) fn eval_explode(input: &Value) -> Result<Vec<Value>, Failure> {
@@ -740,7 +770,7 @@ pub(super) fn eval_explode(input: &Value) -> Result<Vec<Value>, Failure> {
     };
     let points = text
         .chars()
-        .map(|ch| Value::Number((ch as u32).to_string()))
+        .map(|ch| Value::Number(crate::value::Text::from((ch as u32).to_string())))
         .collect();
     Ok(vec![Value::array(points)])
 }
@@ -753,7 +783,7 @@ pub(super) fn eval_implode(input: &Value) -> Result<Vec<Value>, Failure> {
     for item in items {
         text.push(implode_point(item)?);
     }
-    Ok(vec![Value::String(text)])
+    Ok(vec![Value::String(Text::from(text))])
 }
 
 fn implode_point(item: &Value) -> Result<char, Failure> {
@@ -794,7 +824,9 @@ pub(super) fn eval_utf8_byte_length(input: &Value) -> Result<Vec<Value>, Failure
             shown(input)
         )));
     };
-    Ok(vec![Value::Number(text.len().to_string())])
+    Ok(vec![Value::Number(crate::value::Text::from(
+        text.len().to_string(),
+    ))])
 }
 
 /// `end` chooses `endswith`. Both values have to be strings.
@@ -863,7 +895,7 @@ fn locate(input: &Value, needle: &Value) -> Result<Vec<Value>, Failure> {
 fn positions(hits: Vec<usize>) -> Value {
     Value::array(
         hits.into_iter()
-            .map(|hit| Value::Number(hit.to_string()))
+            .map(|hit| Value::Number(crate::value::Text::from(hit.to_string())))
             .collect(),
     )
 }
@@ -895,7 +927,7 @@ fn at_key(input: &Value, key: &Value) -> Result<Vec<Value>, Failure> {
         let found = items
             .iter()
             .rev()
-            .find(|(item, _)| item == name)
+            .find(|(item, _)| item == name.as_str())
             .map(|(_, value)| value.clone())
             .unwrap_or(Value::Null);
         return Ok(vec![found]);
@@ -964,7 +996,7 @@ pub(super) fn eval_format_by(
         env,
         &mut |value| match format_one(value, input) {
             Ok(text) => {
-                out.borrow_mut().push(Value::String(text));
+                out.borrow_mut().push(Value::String(Text::from(text)));
                 false
             }
             Err(err) => {
@@ -983,7 +1015,7 @@ pub(super) fn eval_format_by(
             let pending = std::mem::take(&mut failure.partial);
             for value in pending {
                 match format_one(&value, input) {
-                    Ok(text) => produced.push(Value::String(text)),
+                    Ok(text) => produced.push(Value::String(Text::from(text))),
                     Err(err) => return Err(with_partial(produced, err)),
                 }
             }
@@ -1004,7 +1036,9 @@ fn format_one(value: &Value, input: &Value) -> Result<String, Failure> {
 }
 
 pub(super) fn eval_named_format(name: &str, input: &Value) -> Result<Vec<Value>, Failure> {
-    Ok(vec![Value::String(apply_format(name, input)?)])
+    Ok(vec![Value::String(crate::value::Text::from(apply_format(
+        name, input,
+    )?))])
 }
 
 /// `@name "..."`. The rightmost piece is the outer loop, and everything to
@@ -1030,7 +1064,8 @@ fn walk_format(
     out: &RefCell<Vec<Value>>,
 ) -> Result<(), Failure> {
     if pieces.is_empty() {
-        out.borrow_mut().push(Value::String(String::new()));
+        out.borrow_mut()
+            .push(Value::String(crate::value::Text::from(String::new())));
         return Ok(());
     }
     let last = pieces.len() - 1;
@@ -1098,7 +1133,9 @@ fn append_format(
         let mut buf = out.borrow_mut();
         for item in &mut buf[mark..] {
             if let Value::String(text) = item {
-                text.push_str(right);
+                let mut owned = text.to_string();
+                owned.push_str(right);
+                *text = Text::from(owned);
             }
         }
     }
@@ -1343,14 +1380,14 @@ fn base64_digit(ch: char) -> Option<u32> {
 fn base64_invalid(text: &str) -> Failure {
     fail(format!(
         "string ({}) is not valid base64 data",
-        shown(&Value::String(text.to_string()))
+        shown(&Value::String(crate::value::Text::from(text.to_string())))
     ))
 }
 
 fn base64_trailing(text: &str) -> Failure {
     fail(format!(
         "string ({}) trailing base64 byte found",
-        shown(&Value::String(text.to_string()))
+        shown(&Value::String(crate::value::Text::from(text.to_string())))
     ))
 }
 
@@ -1458,7 +1495,9 @@ fn contains_top(hay: &Value, needle: &Value) -> Result<bool, String> {
 
 fn contains_rec(hay: &Value, needle: &Value) -> bool {
     match (hay, needle) {
-        (Value::String(hay), Value::String(needle)) => needle.is_empty() || hay.contains(needle),
+        (Value::String(hay), Value::String(needle)) => {
+            needle.is_empty() || hay.contains(needle.as_str())
+        }
         (Value::Array(hay), Value::Array(needle)) => needle
             .iter()
             .all(|item| hay.iter().any(|element| contains_rec(element, item))),
@@ -1506,7 +1545,7 @@ fn flatten_one(input: &Value, depth: Option<&Value>) -> Result<Value, String> {
     let (mode, depth) = match depth {
         None => (Flat::Full, Value::Null),
         Some(depth) => {
-            let zero = Value::Number("0".to_string());
+            let zero = Value::Number(crate::value::Text::from("0".to_string()));
             if cmp_value(depth, &zero) < 0 {
                 return Err("flatten depth must not be negative".to_string());
             }
@@ -1550,7 +1589,7 @@ fn flatten_one(input: &Value, depth: Option<&Value>) -> Result<Value, String> {
                 depth,
             }),
             Flat::Down => {
-                let one = Value::Number("1".to_string());
+                let one = Value::Number(crate::value::Text::from("1".to_string()));
                 let next = sub_values(&depth, &one)?;
                 stack.push(FlatFrame {
                     items: children(&item)?,
@@ -1579,7 +1618,7 @@ fn children(value: &Value) -> Result<Vec<Value>, String> {
 /// A string, array, or object is greater than 0, so entering an array
 /// subtracts and reports that those values cannot be subtracted.
 fn flat_mode(depth: &Value) -> Flat {
-    let zero = Value::Number("0".to_string());
+    let zero = Value::Number(crate::value::Text::from("0".to_string()));
     if let Value::Number(text) = depth {
         if cmp_value(depth, &zero) == 0 {
             return Flat::Keep;
@@ -1847,11 +1886,11 @@ pub(super) fn eval_index_by(
 
 fn index_key(value: &Value) -> String {
     if let Value::String(text) = value {
-        return text.clone();
+        return text.to_string();
     }
     match eval_tojson(value) {
         Ok(items) => match items.first() {
-            Some(Value::String(text)) => text.clone(),
+            Some(Value::String(text)) => text.to_string(),
             _ => String::new(),
         },
         Err(_) => String::new(),

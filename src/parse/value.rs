@@ -7,7 +7,9 @@ impl<'a> Parser<'a> {
     pub(in crate::parse) fn parse_value(&mut self) -> Result<Value, ParseErr> {
         match self.peek() {
             None => Err(self.fail("Unfinished JSON term", true)),
-            Some('"') => Ok(Value::String(self.parse_string()?)),
+            Some('"') => Ok(Value::String(crate::value::Text::from(
+                self.parse_string()?,
+            ))),
             Some('[') => self.parse_container(true),
             Some('{') => self.parse_container(false),
             Some(']') => Err(self.bump_fail("Unmatched ']'")),

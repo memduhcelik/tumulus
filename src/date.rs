@@ -80,7 +80,10 @@ extern "C" {
 }
 
 pub(crate) fn todate(input: &Value) -> Result<Value, String> {
-    format_time(input, &Value::String(ISO.to_string()))
+    format_time(
+        input,
+        &Value::String(crate::value::Text::from(ISO.to_string())),
+    )
 }
 
 pub(crate) fn fromdate(input: &Value) -> Result<Value, String> {
@@ -221,7 +224,7 @@ pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, Strin
     set_calendar(&mut tm);
     let mut items = civil_fields(&tm);
     if unsafe { *end } != 0 {
-        items.push(Value::String(c_str(end)));
+        items.push(Value::String(crate::value::Text::from(c_str(end))));
     }
     Ok(Value::array(items))
 }
@@ -315,7 +318,7 @@ fn render(tm: &Tm, format: &str, name: &str) -> Result<Value, String> {
         return Err(format!("{name}/1: unknown system failure"));
     }
     let text = String::from_utf8_lossy(&buf[..wrote]).into_owned();
-    Ok(Value::String(text))
+    Ok(Value::String(crate::value::Text::from(text)))
 }
 
 fn mismatch(text: &str, format: &str) -> String {
@@ -465,7 +468,9 @@ fn field(n: i32) -> Value {
 }
 
 fn computed(n: f64) -> Value {
-    Value::Number(number::mark_f64(number::format_jq_f64(n)))
+    Value::Number(crate::value::Text::from(number::mark_f64(
+        number::format_jq_f64(n),
+    )))
 }
 
 fn as_f64(text: &str) -> f64 {
