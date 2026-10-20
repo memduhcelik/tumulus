@@ -788,6 +788,39 @@ fn seq_record_cut_by_next_separator_matches_jq() {
     );
 }
 
+/// A string or other atom cut off by the next separator is not `Truncated
+/// value` under `--stream`. jq is asked for each one.
+#[test]
+fn seq_stream_cut_atom_matches_jq() {
+    require_jq();
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        (
+            "string",
+            &["--stream", "--seq", "-c", "."],
+            b"\x1e\"ab\x1e2\n",
+        ),
+        (
+            "string errors",
+            &["--stream-errors", "--seq", "-c", "."],
+            b"\x1e\"ab\x1e2\n",
+        ),
+        ("true", &["--stream", "--seq", "-c", "."], b"\x1etru\x1e1\n"),
+        (
+            "null prefix",
+            &["--stream", "--seq", "-c", "."],
+            b"\x1en\x1e1\n",
+        ),
+        (
+            "string inside an array stays truncated",
+            &["--stream-errors", "--seq", "-c", "."],
+            b"\x1e[\"ab\x1e1\n",
+        ),
+    ];
+    for (name, args, input) in cases {
+        compare_exact(name, args, input);
+    }
+}
+
 #[test]
 fn inputs_span_files_match_jq() {
     require_jq();

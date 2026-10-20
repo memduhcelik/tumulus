@@ -611,6 +611,45 @@ fn send_bind(
                 }));
                 return Ok(());
             }
+            // `. as [$a,$b]` is already an invalid path. The slice in the
+            // body must not replace the element that pattern names.
+            if bound_here && pattern_indexes(pat) {
+                let ident = Filter::Identity;
+                let probe = Tail {
+                    body: &ident,
+                    orig_input: input,
+                    orig_input_gen: input_gen,
+                    names: &names,
+                };
+                match exec_pattern(
+                    pat,
+                    value,
+                    path,
+                    line,
+                    true,
+                    input_gen,
+                    &[],
+                    Vec::new(),
+                    &probe,
+                    ctx,
+                ) {
+                    Err(err) if err.stop.is_none() && !last => {
+                        line.set(saved);
+                        continue;
+                    }
+                    Err(err) => {
+                        line.set(saved);
+                        *slot.borrow_mut() = Some(WalkErr::Path(Failure {
+                            partial: Vec::new(),
+                            message: err.message,
+                            caught: err.caught,
+                            stop: err.stop,
+                        }));
+                        return Ok(());
+                    }
+                    Ok(_) => line.set(saved),
+                }
+            }
             let mut body_err: Option<WalkErr> = None;
             let matched = super::eval::match_pat(pat, value, ctx.env, &[], &mut |frame| {
                 let owned;

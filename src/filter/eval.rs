@@ -1602,52 +1602,36 @@ pub(super) fn eval_at(
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
     let values = eval_in(base, input, env)?;
-    let keys = match eval_in(key, input, env) {
-        Ok(keys) => keys,
-        Err(failure) => {
-            let caught = failure.caught.clone();
-            let message = failure.message;
-            let mut partial = Vec::new();
-            for key in &failure.partial {
-                for value in &values {
-                    match index_by(value, key) {
-                        Ok(got) => partial.extend(got),
-                        Err(inner) => {
-                            partial.extend(inner.partial);
-                            // The key's error wins over an index error on a partial key.
-                            return Err(Failure {
-                                partial,
-                                message,
-                                caught,
-                                stop: failure.stop.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            return Err(Failure {
-                partial,
-                message,
-                caught,
-                stop: failure.stop,
-            });
-        }
-    };
+    // No base value still runs the key, so a later `input` there is read.
+    if values.is_empty() {
+        eval_in(key, input, env)?;
+        return Ok(Vec::new());
+    }
+    // One key at a time. `.[1,(input)]` on a number fails before `input`.
     let mut out = Vec::new();
-    for key in &keys {
+    let mut index_err: Option<Failure> = None;
+    let walked = super::stream::for_each_value(key, input, env, |key_value| {
         for value in &values {
-            match index_by(value, key) {
+            match index_by(value, key_value) {
                 Ok(got) => out.extend(got),
                 Err(mut failure) => {
                     out.extend(std::mem::take(&mut failure.partial));
                     if failure.stop.is_some() || !optional {
-                        return Err(with_partial(out, failure));
+                        index_err = Some(failure);
+                        return Ok(true);
                     }
                 }
             }
         }
+        Ok(false)
+    });
+    if let Some(failure) = index_err {
+        return Err(with_partial(out, failure));
     }
-    Ok(out)
+    match walked {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(with_partial(out, failure)),
+    }
 }
 
 pub(super) fn index_by(base: &Value, key: &Value) -> Result<Vec<Value>, Failure> {

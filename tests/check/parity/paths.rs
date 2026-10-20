@@ -1706,6 +1706,44 @@ fn later_reduce_step_optional_and_destructure_match_jq() {
     }
 }
 
+/// `paths` of an index piped into a constant fails on the value being
+/// indexed. Two destructured names before a slice name that element.
+/// jq is asked for each one.
+#[test]
+fn paths_break_and_two_name_destructure_match_jq() {
+    require_jq();
+    compare_exact(
+        "paths on a number with no newline",
+        &["-c", "--", r#"paths(.[1,(input)] | 9)"#],
+        b"7",
+    );
+    compare_exact(
+        "paths on a number",
+        &["-c", "--", r#"paths(.[1,(input)] | 9)"#],
+        b"7\n",
+    );
+    compare_exact(
+        "paths on two values",
+        &["-c", "--", r#"paths(.[1,(input)] | 9)"#],
+        b"1\n[0,1]\n",
+    );
+    compare_exact(
+        "two names before a slice",
+        &["-c", "--", r#"(. as [$a,$b] | .[1:3]) = ["q"]"#],
+        b"[0,1,2,3,4]\n",
+    );
+    compare_exact(
+        "three names before a slice",
+        &["-c", "--", r#"(. as [$a,$b,$c] | .[1:3]) = ["q"]"#],
+        b"[0,1,2,3,4]\n",
+    );
+    compare_exact(
+        "object fields before a slice",
+        &["-c", "--", r#"(. as {a:$a,b:$b,c:$c,d:$d} | .[1:3]) = 9"#],
+        br#"{"a":1,"b":2,"c":3,"d":4}"#,
+    );
+}
+
 /// Destructuring a value reached by an index is an invalid path. `.["a"]?`
 /// in a `reduce` step names that element. A `?//` pattern that recovers
 /// keeps the path. jq is asked for each one.

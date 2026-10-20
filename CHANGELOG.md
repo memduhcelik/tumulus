@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Under `--seq --stream`, a string cut off by the next separator is `Invalid numeric literal`. A `true`, `false`, or `null` prefix is `Invalid literal`. A container is still `Truncated value`.
+
+`paths(.[1,(input)] | 9)` on a number fails with `Cannot index number with number` before `input` is read. The error names that value's file and line.
+
+`(. as [$a,$b] | .[1:3]) = ["q"]` names element `0`. Three names name element `1`. An object pattern with two or more fields names the second field.
+
 A `--seq` value cut off by the next record separator is reported, including after a record that was already complete. The main loop prints `Truncated value`, or `Potentially truncated top-level numeric value` for a number, and keeps the values around the cut. That warning is printed when the separator is the first byte of the next file. `input` and `inputs` raise it. `--stream` keeps items read before the cut, and keeps the cut-off number. `--stream-errors` gives the program `[message, path]`.
 
 `input_filename` under `--seq` is the file that holds the value's last byte. Standard input is named `<stdin>`.

@@ -223,11 +223,24 @@ pub(crate) fn scan_seq_record(
             break;
         }
         let unfinished = error.ran_out();
+        // A container cut off by the next separator is `Truncated value`.
+        // A string or other atom is `Invalid numeric literal`, and a
+        // `true` / `false` / `null` prefix is `Invalid literal`. A record
+        // that is only `"` is dropped.
+        if ended_by_rs && unfinished && scanned.path.is_empty() && chunk == b"\"" {
+            break;
+        }
         let message = if ended_by_rs && unfinished {
-            format!(
-                "Truncated value at line {end_line}, column {}",
-                end_column + 1
-            )
+            let column = end_column + 1;
+            let text = error.text();
+            let phrase = if !scanned.path.is_empty() || text.starts_with("Unfinished JSON term") {
+                "Truncated value"
+            } else if text.starts_with("Invalid literal") {
+                "Invalid literal"
+            } else {
+                "Invalid numeric literal"
+            };
+            format!("{phrase} at line {end_line}, column {column}")
         } else {
             let text = error.text();
             if text.contains(" at EOF ") || text.contains("need RS to resync") {
