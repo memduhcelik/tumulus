@@ -120,7 +120,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Until(left, right)
             | Filter::While(left, right)
             | Filter::SetPath(left, right) => walk(left, seen) || walk(right, seen),
-            Filter::Slice { base, start, end } => {
+            Filter::Slice { base, start, end, .. } => {
                 base.as_deref().is_some_and(|base| walk(base, seen))
                     || start.as_deref().is_some_and(|start| walk(start, seen))
                     || end.as_deref().is_some_and(|end| walk(end, seen))
@@ -391,7 +391,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             Some(by) => check_vars(by, scope),
             None => Ok(()),
         },
-        Filter::Slice { base, start, end } => {
+        Filter::Slice { base, start, end, .. } => {
             if let Some(base) = base {
                 check_vars(base, scope)?;
             }
@@ -765,7 +765,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Param(_)
         | Filter::Paths(None)
         | Filter::Flatten(None) => {}
-        Filter::Slice { base, start, end } => {
+        Filter::Slice { base, start, end, .. } => {
             if let Some(base) = base {
                 walk_defs(base, seen, errors);
             }
@@ -2314,18 +2314,23 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Filter, ProgramError> {
         let mut filter = self.parse_primary()?;
+        // `?` just after `]` skips a failed index. `?` after `)` catches the
+        // whole expression, including an error in a bound.
+        let mut bracket = false;
         loop {
             self.skip_ws();
             if self.eat('?') {
-                filter = if self.suffix_question {
+                filter = if self.suffix_question || bracket {
                     optional_last(filter)
                 } else {
                     Filter::Optional(Box::new(filter))
                 };
+                bracket = false;
                 continue;
             }
             if self.peek() == Some('[') {
                 filter = self.parse_index(Some(filter))?;
+                bracket = true;
                 continue;
             }
             if self.peek() == Some('.') {
@@ -2335,6 +2340,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.bump();
+                bracket = false;
                 if self.peek() == Some('"') || self.spaced_quote() {
                     let key = self.parse_quoted_key()?;
                     filter = at_key(Some(filter), key);
@@ -2347,6 +2353,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.peek() == Some('[') {
                     filter = self.parse_index(Some(filter))?;
+                    bracket = true;
                     continue;
                 }
                 return Err(ProgramError::Syntax);
@@ -3329,6 +3336,7 @@ impl<'a> Parser<'a> {
             base: None,
             start,
             end,
+            optional: false,
         })
     }
 
@@ -3777,14 +3785,36 @@ pub(super) fn chain(left: Option<Filter>, right: Filter) -> Filter {
 
 pub(super) fn optional_last(filter: Filter) -> Filter {
     match filter {
-        Filter::Pipe(left, right) => Filter::Pipe(left, Box::new(Filter::Optional(right))),
-        // The outer Optional still swallows an error in the base or the key.
-        // Only the index step itself keeps going.
-        Filter::At { base, key, .. } => Filter::Optional(Box::new(Filter::At {
+        Filter::Pipe(left, right) => Filter::Pipe(left, Box::new(question(*right))),
+        other => question(other),
+    }
+}
+
+/// `?` written on a bracket skips a failed index. It does not catch an error
+/// raised while the key or a slice bound is computed. A second `?`, or `?`
+/// after parentheses, does catch that error.
+fn question(filter: Filter) -> Filter {
+    match filter {
+        Filter::Slice {
+            optional: false,
+            base,
+            start,
+            end,
+        } => Filter::Slice {
+            base,
+            start,
+            end,
+            optional: true,
+        },
+        Filter::At {
+            optional: false,
+            base,
+            key,
+        } => Filter::At {
             base,
             key,
             optional: true,
-        })),
+        },
         other => Filter::Optional(Box::new(other)),
     }
 }

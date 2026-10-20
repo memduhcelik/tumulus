@@ -62,10 +62,16 @@ pub(super) fn produce(
         Filter::Identity => Ok(vec![input.clone()]),
         Filter::Field(key) => index_string(input, key),
         Filter::Index { at, .. } => index_number(input, at),
-        Filter::Slice { base, start, end } => eval_slice(
+        Filter::Slice {
+            base,
+            start,
+            end,
+            optional,
+        } => eval_slice(
             base.as_deref(),
             start.as_deref(),
             end.as_deref(),
+            *optional,
             input,
             env,
         ),
@@ -386,6 +392,7 @@ fn eval_slice(
     base: Option<&Filter>,
     start: Option<&Filter>,
     end: Option<&Filter>,
+    optional: bool,
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
@@ -400,8 +407,15 @@ fn eval_slice(
             match base_value {
                 Value::Null => out.push(Value::Null),
                 Value::Array(_) | Value::String(_) => {
-                    require_slice_index(start_value)?;
-                    require_slice_index(end_value)?;
+                    if require_slice_index(start_value).is_err()
+                        || require_slice_index(end_value).is_err()
+                    {
+                        if optional {
+                            continue;
+                        }
+                        require_slice_index(start_value)?;
+                        require_slice_index(end_value)?;
+                    }
                     let start_text = number_text(start_value);
                     let end_text = number_text(end_value);
                     out.extend(slice(
@@ -411,6 +425,9 @@ fn eval_slice(
                     )?);
                 }
                 other => {
+                    if optional {
+                        continue;
+                    }
                     return Err(fail(format!(
                         "Cannot index {} with object",
                         other.type_name()

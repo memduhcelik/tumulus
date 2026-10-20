@@ -33,10 +33,14 @@ pub enum Filter {
     /// `.[start:end]`, or `base[start:end]`. `None` means that side was left off.
     /// Bounds run on the value the brackets were applied to, and `base` runs
     /// again for every pair of bounds. A missing `base` is that value itself.
+    /// `optional` is set when `?` is written on this `]`. A failed index is
+    /// skipped. An error raised while computing a bound is not. `?` after
+    /// parentheses leaves the flag off and catches that error.
     Slice {
         base: Option<Box<Filter>>,
         start: Option<Box<Filter>>,
         end: Option<Box<Filter>>,
+        optional: bool,
     },
     Iterate,
     /// `..` and `recurse` with no arguments. The value, then every value inside it.

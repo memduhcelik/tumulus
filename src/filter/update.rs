@@ -1136,9 +1136,22 @@ fn run(
         Filter::Field(key) => run_field(key, input, path, line, input_gen, ctx),
         Filter::Index { at, text } => run_fixed_index(at, text, input, path, line, input_gen, ctx),
         Filter::GetPath(arg) => run_getpath(arg, input, path, line, input_gen, ctx),
-        Filter::Slice { base, start, end } => {
-            run_slice(base, start, end, input, path, line, input_gen, ctx)
-        }
+        Filter::Slice {
+            base,
+            start,
+            end,
+            optional,
+        } => run_slice(
+            base,
+            start,
+            end,
+            *optional,
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+        ),
         Filter::Iterate => run_iterate(input, path, line, input_gen, ctx),
         Filter::Recurse => run_recurse(input, path, line, input_gen, ctx),
         Filter::RecurseDown { step, cond } => {
@@ -2115,6 +2128,7 @@ fn run_slice(
     base: &Option<Box<Filter>>,
     start: &Option<Box<Filter>>,
     end: &Option<Box<Filter>>,
+    optional: bool,
     input: &Value,
     path: &[Step],
     line: &Cell<u64>,
@@ -2147,11 +2161,21 @@ fn run_slice(
                 }
                 match &base_out.value {
                     Value::Array(_) | Value::String(_) => {
-                        require_slice_index(start_value)?;
-                        require_slice_index(end_value)?;
+                        if require_slice_index(start_value).is_err()
+                            || require_slice_index(end_value).is_err()
+                        {
+                            if optional {
+                                continue;
+                            }
+                            require_slice_index(start_value)?;
+                            require_slice_index(end_value)?;
+                        }
                     }
                     Value::Null => {}
                     other => {
+                        if optional {
+                            continue;
+                        }
                         return Err(fail(format!(
                             "Cannot index {} with object",
                             other.type_name()
@@ -2379,9 +2403,12 @@ fn run_optional(
     input_gen: u64,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
-    // `.[expr]?` keeps the inner flag, so a key or base error still fails.
-    // `(expr)?` swallows the error and keeps outputs from before it.
-    if matches!(inner, Filter::At { optional: true, .. }) {
+    // `.[expr]?` keeps the inner flag, so a key, bound, or base error still
+    // fails. `(expr)?` swallows the error and keeps outputs from before it.
+    if matches!(
+        inner,
+        Filter::At { optional: true, .. } | Filter::Slice { optional: true, .. }
+    ) {
         return run(inner, input, path, line, input_gen, ctx);
     }
     match run(inner, input, path, line, input_gen, ctx) {

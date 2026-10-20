@@ -1271,3 +1271,35 @@ fn expression_slices_match_jq() {
         compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
+
+/// `?` written on `]` does not catch an error raised while computing a bound.
+/// `(...)?` does. jq is asked for each one.
+#[test]
+fn optional_slice_reports_bound_errors() {
+    require_jq();
+    let programs = [
+        r#"[1,2,3] | .[1,error("z"):]?"#,
+        r#""abcd" | .[1,error("z"):]?"#,
+        r#"[1,2,3] | .[1,error("z"):2]?"#,
+        r#"[1,2,3] | .[1:error("z")]?"#,
+        r#"[1,2,3] | .[error("z"):]?"#,
+        r#"[1,2,3] | .[1,error("z")]?"#,
+        r#"[1,2,3] | (.[1,error("z"):])?"#,
+        r#"[1,2,3] | .[1,error("z"):]??"#,
+        r#"[1,2,3] | try (.[1,error("z"):]?) catch ."#,
+        r#"[1,2,3] | first(.[1,error("z"):]?)"#,
+        r#"[1,2,3] | [.[1,error("z"):]?]"#,
+        r#"[1,2,3] | .[1, "a":]?"#,
+        r#"[1,2,3] | .[1, error("no"):2, error("z")]?"#,
+        r#"{"a":[1,2,3]} | .a[1,error("z"):]?"#,
+        r#"null | .[error("z"):]?"#,
+        r#"null | (.[error("z"):])?"#,
+        r#"[1,2,3] | path(.[1,error("z"):]?)"#,
+        r#"[1,2,3] | path(.[1, "a":]?)"#,
+        r#"1 | .[1:2]?"#,
+        r#"[1,2,3] | .[1,error("z"):]? // 9"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
