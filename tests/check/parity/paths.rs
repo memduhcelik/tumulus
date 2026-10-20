@@ -1705,3 +1705,35 @@ fn later_reduce_step_optional_and_destructure_match_jq() {
         compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
+
+/// Destructuring a value reached by an index is an invalid path. `.["a"]?`
+/// in a `reduce` step names that element. A `?//` pattern that recovers
+/// keeps the path. jq is asked for each one.
+#[test]
+fn indexed_destructure_optional_field_and_alt_match_jq() {
+    require_jq();
+    let programs = [
+        r#"[[0,1,2,3,4]] | (.[0] as [$a] | .[1:3]) = ["q"]"#,
+        r#"[1,2,3,4] | (.[0] as [$a] | .[1:3]) = ["q"]"#,
+        r#"[1,2,3,4] | (.[] as [$a] | .[1:3]) = ["q"]"#,
+        r#"[[0,1,2,3,4]] | (.[] as [$a] | .[1:3]) = ["q"]"#,
+        r#"[[1,2]] | (.[0] as [$a,$b] | .[0]) = 9"#,
+        r#"[1,2,3,4] | (foreach .[] as [$a] (.; .)) = 9"#,
+        r#"1 | (foreach (0) as [$a] (.; .)) = 9"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .["a"]?))"#,
+        r#"[0,1,2] | (reduce .[] as $x (.; .["a"]?)) = 9"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .a?))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; (.["a"])?))"#,
+        r#"[0] | (reduce (1) as [$a] ?// $v (.; .)) = 9"#,
+        r#"[0] | path(reduce (1) as [$a] ?// $v (.; .))"#,
+        r#"[0] | (reduce ([1]) as [$a] ?// $v (.; .)) = 9"#,
+        r#"{"a":1} | .b?"#,
+        r#"[0,1,2] | .["a"]?"#,
+        r#"{"a":1} | path(.b?)"#,
+        r#"[0,1,2] | path(.["a"]?)"#,
+        r#"[0,1,2,3,4] | (. as [$a] | .[1:3]) = ["q"]"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}

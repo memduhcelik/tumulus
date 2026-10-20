@@ -594,6 +594,23 @@ fn send_bind(
         for (index, pat) in pats.iter().enumerate() {
             line.set(saved);
             let last = index + 1 == pats.len();
+            // `. as [$a]` takes the input apart. `.[0] as [$a]` does not:
+            // the value was already reached by an index, so the pattern is
+            // an invalid path.
+            let bound_here = matches!(expr, Filter::Identity) && carrier_now(line, input_gen);
+            if !bound_here && pattern_indexes(pat) {
+                let err = destructure_near(pat, value, ctx);
+                if err.stop.is_none() && !last {
+                    continue;
+                }
+                *slot.borrow_mut() = Some(WalkErr::Path(Failure {
+                    partial: Vec::new(),
+                    message: err.message,
+                    caught: err.caught,
+                    stop: err.stop,
+                }));
+                return Ok(());
+            }
             let mut body_err: Option<WalkErr> = None;
             let matched = super::eval::match_pat(pat, value, ctx.env, &[], &mut |frame| {
                 let owned;
@@ -2069,6 +2086,7 @@ fn run_foreach(
                 match foreach_yield(
                     &mut state,
                     &item.value,
+                    item.carrier,
                     breaks,
                     pattern,
                     update,
@@ -2097,6 +2115,7 @@ fn run_foreach(
 fn foreach_yield(
     state: &mut POut,
     item: &Value,
+    item_carrier: bool,
     breaks: bool,
     pattern: &Pattern,
     update: &Filter,
@@ -2104,6 +2123,11 @@ fn foreach_yield(
     ctx: &Ctx,
     outputs: &mut Vec<POut>,
 ) -> Result<(), PathErr> {
+    // `.[] as [$a]` indexes a value reached through the input. `foreach (0)`
+    // does not, so taking that number apart is an invalid path.
+    if !item_carrier && pattern_indexes(pattern) {
+        return Err(destructure_near(pattern, item, ctx));
+    }
     let mut step_err: Option<PathErr> = None;
     let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
         if step_err.is_some() {
@@ -2803,7 +2827,7 @@ fn run_reduce_path(
         match reduce_off_path(
             &init_out, &items, start_line, pattern, alts, update, path, ctx,
         ) {
-            Ok(value) => out.push(constant(value, path, line.get(), ctx.root)),
+            Ok(place) => out.push(place),
             Err(err) => return Err(err),
         }
     }
@@ -2833,7 +2857,7 @@ fn reduce_off_path(
     update: &Filter,
     path: &[Step],
     ctx: &Ctx,
-) -> Result<Value, PathErr> {
+) -> Result<POut, PathErr> {
     let mut names = Vec::new();
     super::parse::bind_names(pattern, alts, &mut names);
     let mut pats = Vec::with_capacity(1 + alts.len());
@@ -2911,7 +2935,7 @@ fn reduce_off_path(
             break;
         }
     }
-    Ok(acc.value)
+    Ok(acc)
 }
 
 fn pattern_indexes(pat: &Pattern) -> bool {
