@@ -8,15 +8,21 @@ impl<'a> Parser<'a> {
     pub(in crate::parse) fn scan_atom(&mut self) -> Result<Value, ParseErr> {
         let start = self.index;
         if !self.nul_in_token() {
-            while self.peek().is_some_and(|c| !is_delimiter(c)) {
-                self.bump();
-            }
-            let end = self.index;
+            let end = self.token_end();
             // `2` at the end of this file is not finished while another file
             // can still supply `3`.
-            if self.open_ended && self.eof() && end > start {
+            if self.open_ended && end == self.src.len() && end > start {
+                self.consume_token(end);
                 return Err(self.fail("Unfinished JSON term", true));
             }
+            // Coordinates and other plain decimals are already in the form
+            // jq prints. Copy those bytes. An exponent still goes through
+            // the full normalization below.
+            if let Some(text) = plain_number(&self.src[start..end]) {
+                self.advance_ascii(end);
+                return Ok(Value::Number(text));
+            }
+            self.consume_token(end);
             if let Some(value) = interpret_atom(&self.src[start..end]) {
                 return Ok(value);
             }
@@ -71,6 +77,22 @@ impl<'a> Parser<'a> {
         } else {
             self.bump();
             Err(self.fail(phrase, false))
+        }
+    }
+
+    /// Index of the delimiter that ends this token, or the end of the buffer.
+    fn token_end(&self) -> usize {
+        let bytes = self.src;
+        let mut index = self.index;
+        while index < bytes.len() && !is_delim_byte(bytes[index]) {
+            index += 1;
+        }
+        index
+    }
+
+    fn consume_token(&mut self, end: usize) {
+        while self.index < end {
+            self.bump();
         }
     }
 
@@ -281,6 +303,67 @@ fn invalid_phrase(token: &[u8]) -> &'static str {
     } else {
         "Invalid numeric literal"
     }
+}
+
+/// A number whose bytes are already what jq prints.
+///
+/// `0.0000001` and anything with an exponent are left out. Six leading
+/// zeros in the fraction of `0.…` is where jq switches to an exponent.
+fn plain_number(token: &[u8]) -> Option<String> {
+    if token.is_empty() || token[0] == b'+' || token[0] == b'.' {
+        return None;
+    }
+    let mut index = 0;
+    if token[0] == b'-' {
+        index = 1;
+        if index >= token.len() {
+            return None;
+        }
+    }
+    if !token[index].is_ascii_digit() {
+        return None;
+    }
+    let int_is_zero = token[index] == b'0';
+    if int_is_zero {
+        index += 1;
+        if index < token.len() && token[index].is_ascii_digit() {
+            return None;
+        }
+    } else {
+        while index < token.len() && token[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    if index < token.len() && token[index] == b'.' {
+        index += 1;
+        let frac = index;
+        if index >= token.len() || !token[index].is_ascii_digit() {
+            return None;
+        }
+        while index < token.len() && token[index].is_ascii_digit() {
+            index += 1;
+        }
+        if int_is_zero {
+            let mut zeros = 0;
+            while frac + zeros < index && token[frac + zeros] == b'0' {
+                zeros += 1;
+            }
+            if zeros >= 6 {
+                return None;
+            }
+        }
+    }
+    if index != token.len() {
+        return None;
+    }
+    std::str::from_utf8(token).ok().map(str::to_owned)
+}
+
+fn is_delim_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
+    )
 }
 
 fn interpret_atom(token: &[u8]) -> Option<Value> {

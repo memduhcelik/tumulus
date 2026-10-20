@@ -99,6 +99,12 @@ impl<'a> Parser<'a> {
         decode_at(self.src, index).map(|(c, _)| c)
     }
 
+    /// Move to `end` when the span has no newline. Columns count bytes.
+    pub(in crate::parse) fn advance_ascii(&mut self, end: usize) {
+        self.column += end - self.index;
+        self.index = end;
+    }
+
     pub(in crate::parse) fn bump(&mut self) -> Option<char> {
         let (c, width) = decode_at(self.src, self.index)?;
         self.index += width;

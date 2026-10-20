@@ -259,9 +259,9 @@ The same five commands were timed on that file. Stdout and stderr matched. `--st
 
 | run | `jq -c` | `tumulus -c` |
 | --- | ---: | ---: |
-| 1 | 1.73 | 2.24 |
-| 2 | 1.74 | 2.27 |
-| 3 | 1.77 | 2.26 |
+| 1 | 1.68 | 1.33 |
+| 2 | 1.69 | 1.32 |
+| 3 | 1.71 | 1.32 |
 
 Times are seconds.
 
