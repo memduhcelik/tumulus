@@ -2,7 +2,7 @@
 //! in that order. Array indexes keep their original slots until the update
 //! finishes, so a later index is not shifted by an earlier deletion.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::number::array_index;
@@ -82,105 +82,705 @@ pub fn eval_update(
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
     if op == UpdateOp::Modify {
-        let found = gather(path, input, env)?;
-        if let Some(failure) = found.failure {
-            return prefer_modify(&found.paths, expr, input, env, failure);
-        }
-        if found.paths.is_empty() {
-            // Nothing was reached, so the filter is not run.
-            return Ok(vec![input.clone()]);
-        }
-        return modify(&found.paths, expr, input, env);
+        return update_modify(path, expr, input, env);
     }
-    // `=` and the arithmetic updates run the right-hand side first. An empty
-    // stream yields nothing and does not look at the path. A failure while
-    // producing a value is reported before a bad path is.
-    let (rhs, rhs_err) = parts(eval_in(expr, input, env));
-    if rhs.is_empty() {
-        return finish(Vec::new(), rhs_err);
-    }
-    let found = gather(path, input, env)?;
-    if let Some(failure) = found.failure {
-        if let Some(value) = rhs.first() {
-            if let Err(message) = apply_update(op, &found.paths, input, value.clone()) {
-                // The first value cannot be written through the slices found
-                // so far. That failure wins over a later bound error.
-                return Err(fail(message));
-            }
-        }
-        return Err(failure);
-    }
-    if found.paths.is_empty() {
-        let outs = vec![input.clone(); rhs.len()];
-        return finish(outs, rhs_err);
-    }
-    let mut outs = Vec::new();
-    for value in rhs {
-        match apply_update(op, &found.paths, input, value) {
-            Ok(value) => outs.push(value),
-            Err(message) => return Err(fresh(outs, message)),
-        }
-    }
-    finish(outs, rhs_err)
+    // One right-hand value is applied to every place, then the next value
+    // starts again from the input. An empty stream yields nothing and does
+    // not look at the path. A failure while producing a value, before any
+    // value has been written, is reported before a bad path is.
+    update_values(op, path, expr, input, env)
 }
 
-struct Gathered {
-    paths: Vec<Vec<Step>>,
-    failure: Option<Failure>,
-}
-
-fn gather(path: &Filter, input: &Value, env: &[(String, Value)]) -> Result<Gathered, Failure> {
-    let (outs, failure) = locate_outs(path, input, env)?;
-    let mut paths = Vec::new();
-    for out in outs {
-        match classify_one(input, out) {
-            Found::Broken(value) => {
-                return Err(fail(format!(
-                    "Invalid path expression with result {}",
-                    clipped(&value, 29)
-                )));
-            }
-            Found::NanIndex => {
-                return Err(fail("Cannot set array element at NaN index".to_string()));
-            }
-            Found::Path(steps) => paths.push(steps),
-        }
-    }
-    Ok(Gathered { paths, failure })
-}
-
-/// `|=` and `del` run on the slices found before a bound failed. Deleting
-/// from a string reports the bound error. Any other failure of the update
-/// is reported instead.
-fn prefer_modify(
-    paths: &[Vec<Step>],
+/// `=` and the arithmetic updates. Each value is written from the original
+/// input. A write that cannot be done does not pull another value.
+fn update_values(
+    op: UpdateOp,
+    path: &Filter,
     expr: &Filter,
     input: &Value,
     env: &[(String, Value)],
-    failure: Failure,
 ) -> Result<Vec<Value>, Failure> {
-    if paths.is_empty() {
-        return Err(failure);
-    }
-    match modify(paths, expr, input, env) {
-        Err(err) if err.message == "Cannot delete fields from string" && err.caught.is_none() => {
-            Err(failure)
+    let mut outs = Vec::new();
+    let write_err: RefCell<Option<Failure>> = RefCell::new(None);
+    let fed = stream::feed(expr, input, env, &mut |value| match apply_rhs(
+        op, path, input, env, value,
+    ) {
+        Ok(produced) => {
+            outs.push(produced);
+            false
         }
-        Err(err) => Err(err),
-        Ok(_) => Err(failure),
+        Err(failure) => {
+            *write_err.borrow_mut() = Some(failure);
+            true
+        }
+    });
+    if let Some(failure) = write_err.into_inner() {
+        return Err(with_partial(outs, failure));
+    }
+    match fed {
+        Ok(_) => Ok(outs),
+        Err(mut failure) => {
+            // Values the stream produced beside the error, and did not hand
+            // over, are still right-hand values.
+            let extra = std::mem::take(&mut failure.partial);
+            for value in extra {
+                match apply_rhs(op, path, input, env, &value) {
+                    Ok(produced) => outs.push(produced),
+                    Err(err) => return Err(with_partial(outs, err)),
+                }
+            }
+            Err(with_partial(outs, failure))
+        }
     }
 }
 
-fn apply_update(
+fn apply_rhs(
     op: UpdateOp,
-    paths: &[Vec<Step>],
+    path: &Filter,
     input: &Value,
-    value: Value,
-) -> Result<Value, String> {
-    match op {
-        UpdateOp::Assign => assign_one(paths, input, value),
+    env: &[(String, Value)],
+    rhs: &Value,
+) -> Result<Value, Failure> {
+    let mut edit = Edit::Pure(input.clone());
+    let mut saw = false;
+    let result = drive_paths(path, input, env, &mut |out| {
+        saw = true;
+        apply_write(op, &mut edit, input, out, rhs)
+    });
+    match result {
+        Err(WalkErr::Path(err) | WalkErr::Write(err)) => Err(err),
+        Ok(()) if !saw => Ok(input.clone()),
+        Ok(()) => Ok(freeze(&edit)),
+    }
+}
+
+fn apply_write(
+    op: UpdateOp,
+    edit: &mut Edit,
+    root: &Value,
+    out: POut,
+    rhs: &Value,
+) -> Result<(), WalkErr> {
+    let steps = steps_of(root, out)?;
+    let value = match op {
+        UpdateOp::Assign => rhs.clone(),
+        UpdateOp::Add => combine(edit, &steps, rhs, add_values)?,
+        UpdateOp::Sub => combine(edit, &steps, rhs, sub_values)?,
+        UpdateOp::Mul => combine(edit, &steps, rhs, mul_values)?,
+        UpdateOp::Div => combine(edit, &steps, rhs, div_values)?,
+        UpdateOp::Rem => combine(edit, &steps, rhs, rem_values)?,
+        UpdateOp::Alt => {
+            let left = read_edit(edit, &steps).map_err(|message| WalkErr::Write(fail(message)))?;
+            if truthy(&left) {
+                left
+            } else {
+                rhs.clone()
+            }
+        }
         UpdateOp::Modify => unreachable!("modify"),
-        _ => combine_one(op, paths, input, value),
+    };
+    write_path(edit, &steps, &Write::Put(value))
+        .map_err(|message| WalkErr::Write(fail(message)))?;
+    Ok(())
+}
+
+fn combine(
+    edit: &Edit,
+    steps: &[Step],
+    rhs: &Value,
+    join: fn(&Value, &Value) -> Result<Value, String>,
+) -> Result<Value, WalkErr> {
+    let left = read_edit(edit, steps).map_err(|message| WalkErr::Write(fail(message)))?;
+    join(&left, rhs).map_err(|message| WalkErr::Write(fail(message)))
+}
+
+/// `|=` and `del`. The filter runs at one place before the next bound.
+/// Deleting from a string does not stop the walk: a later bound error is
+/// the one reported, and with no later error the string error is.
+fn update_modify(
+    path: &Filter,
+    expr: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+) -> Result<Vec<Value>, Failure> {
+    let mut edit = Edit::Pure(input.clone());
+    let mut saw = false;
+    let mut string_del: Option<Failure> = None;
+    let result = drive_paths(path, input, env, &mut |out| {
+        saw = true;
+        apply_modify(&mut edit, input, out, expr, env, &mut string_del)
+    });
+    match result {
+        Err(WalkErr::Path(err) | WalkErr::Write(err)) => Err(err),
+        Ok(()) => {
+            if let Some(err) = string_del {
+                return Err(err);
+            }
+            if !saw {
+                Ok(vec![input.clone()])
+            } else {
+                Ok(vec![freeze(&edit)])
+            }
+        }
+    }
+}
+
+fn apply_modify(
+    edit: &mut Edit,
+    root: &Value,
+    out: POut,
+    expr: &Filter,
+    env: &[(String, Value)],
+    string_del: &mut Option<Failure>,
+) -> Result<(), WalkErr> {
+    let steps = steps_of(root, out)?;
+    let current = read_edit(edit, &steps).map_err(|message| WalkErr::Write(fail(message)))?;
+    let write = match eval_first(expr, &current, env) {
+        Ok(None) => Write::Remove,
+        Ok(Some(value)) => Write::Put(value),
+        Err(err) => return Err(WalkErr::Write(err)),
+    };
+    if let Err(message) = write_path(edit, &steps, &write) {
+        if message == "Cannot delete fields from string" {
+            *string_del = Some(fail(message));
+            return Ok(());
+        }
+        return Err(WalkErr::Write(fail(message)));
+    }
+    Ok(())
+}
+
+fn steps_of(root: &Value, out: POut) -> Result<Vec<Step>, WalkErr> {
+    match classify_one(root, out) {
+        Found::Path(steps) => Ok(steps),
+        Found::Broken(value) => Err(WalkErr::Path(fail(format!(
+            "Invalid path expression with result {}",
+            clipped(&value, 29)
+        )))),
+        Found::NanIndex => Err(WalkErr::Path(fail(
+            "Cannot set array element at NaN index".to_string(),
+        ))),
+    }
+}
+
+/// A path failure can be swallowed by `(expr)?`. A write failure cannot,
+/// and it stops the walk before the next slice bound.
+enum WalkErr {
+    Path(Failure),
+    Write(Failure),
+}
+
+fn drive_paths(
+    path: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let next = Cell::new(2);
+    let line = Cell::new(1);
+    let ctx = Ctx {
+        root: input,
+        next: &next,
+        env,
+        pbinds: &[],
+    };
+    send(path, input, &[], &line, 1, &ctx, emit)
+}
+
+/// Hand each place to `emit` as soon as it is known. A slice bound is not
+/// pulled until `emit` has returned for the pair before it.
+fn send(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    match filter {
+        Filter::Slice {
+            base,
+            start,
+            end,
+            optional,
+        } => send_slice(
+            base.as_deref(),
+            start.as_deref(),
+            end.as_deref(),
+            *optional,
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+            emit,
+        ),
+        Filter::At {
+            base,
+            key,
+            optional,
+        } => send_at(
+            base, key, *optional, input, path, line, input_gen, ctx, emit,
+        ),
+        Filter::Comma(left, right) => {
+            // Each side starts from the lineage the comma was reached at.
+            // An index on the left must not make the right look computed.
+            let saved = line.get();
+            let left_cell = Cell::new(saved);
+            send(left, input, path, &left_cell, input_gen, ctx, emit)?;
+            let right_cell = Cell::new(saved);
+            send(right, input, path, &right_cell, input_gen, ctx, emit)
+        }
+        Filter::Pipe(left, right) if !matches!(left.as_ref(), Filter::MatchImpl { .. }) => {
+            send_pipe(left, right, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::Alt(left, right) => send_alt(left, right, input, path, line, input_gen, ctx, emit),
+        Filter::If { cond, yes, no } => {
+            send_if(cond, yes, no, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::Bind {
+            expr,
+            pattern,
+            alts,
+            body,
+        } if alts.is_empty() && has_slice(body) => {
+            send_bind(expr, pattern, body, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::Optional(inner) => send_optional(inner, input, path, line, input_gen, ctx, emit),
+        Filter::Call { func, args } => {
+            send_call(func, args, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::Param(name) => send_param(name, input, path, line, input_gen, ctx, emit),
+        Filter::Define { rest, .. } => send(rest, input, path, line, input_gen, ctx, emit),
+        _ => emit_run(filter, input, path, line, input_gen, ctx, emit),
+    }
+}
+
+fn send_slice(
+    base: Option<&Filter>,
+    start: Option<&Filter>,
+    end: Option<&Filter>,
+    optional: bool,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let identity = Filter::Identity;
+    let base = base.unwrap_or(&identity);
+    let saved = line.get();
+    let slot: RefCell<Option<WalkErr>> = RefCell::new(None);
+    let walked = walk_slice_pairs(start, end, input, ctx.env, |start_value, end_value| {
+        line.set(saved);
+        let sent = send(base, input, path, line, input_gen, ctx, &mut |base_out| {
+            finish_slice(base_out, start_value, end_value, optional, line, ctx, emit)
+        });
+        keep_walk(sent, &slot)
+    });
+    if let Some(err) = slot.into_inner() {
+        return Err(err);
+    }
+    match walked {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(WalkErr::Path(failure)),
+    }
+}
+
+fn finish_slice(
+    base_out: POut,
+    start_value: &Value,
+    end_value: &Value,
+    optional: bool,
+    line: &Cell<u64>,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    if !base_out.carrier {
+        let elem = shown_slice(start_value, end_value);
+        return Err(WalkErr::Path(fail(near_access(&elem, &base_out.value))));
+    }
+    match &base_out.value {
+        Value::Array(_) | Value::String(_) => {
+            if require_slice_index(start_value).is_err() || require_slice_index(end_value).is_err()
+            {
+                if optional {
+                    return Ok(());
+                }
+                require_slice_index(start_value).map_err(WalkErr::Path)?;
+                require_slice_index(end_value).map_err(WalkErr::Path)?;
+            }
+        }
+        Value::Null => {}
+        other => {
+            if optional {
+                return Ok(());
+            }
+            return Err(WalkErr::Path(fail(format!(
+                "Cannot index {} with object",
+                other.type_name()
+            ))));
+        }
+    }
+    let step = Step::Slice {
+        start: start_value.clone(),
+        end: end_value.clone(),
+    };
+    let child = child_at(&base_out.value, &step).map_err(|message| WalkErr::Path(fail(message)))?;
+    let mut full = base_out.path;
+    full.push(step);
+    emit(taken(child, full, line, ctx.next))
+}
+
+fn send_at(
+    base: &Filter,
+    key: &Filter,
+    optional: bool,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let saved = line.get();
+    let slot: RefCell<Option<WalkErr>> = RefCell::new(None);
+    let result = stream::for_each_value(key, input, ctx.env, |key_value| {
+        line.set(saved);
+        let sent = send(
+            base,
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+            &mut |base_out| match index_out(&base_out, key_value, ctx) {
+                Ok(hit) => emit(hit),
+                Err(message) if optional => {
+                    let _ = message;
+                    Ok(())
+                }
+                Err(message) => Err(WalkErr::Path(fail(message))),
+            },
+        );
+        // `true` stops the key stream. The walk error is kept aside so a
+        // write failure is not turned into a plain stream error.
+        match sent {
+            Ok(()) => Ok(false),
+            Err(err) => {
+                *slot.borrow_mut() = Some(err);
+                Ok(true)
+            }
+        }
+    });
+    if let Some(err) = slot.into_inner() {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(WalkErr::Path(failure)),
+    }
+}
+
+fn send_alt(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let saved_line = line.get();
+    let saved_path = path.to_vec();
+    let saw = Cell::new(false);
+    let left_result = send(left, input, path, line, input_gen, ctx, &mut |out| {
+        if !truthy(&out.value) {
+            return Ok(());
+        }
+        saw.set(true);
+        emit(out)
+    });
+    match left_result {
+        Err(err) => Err(err),
+        Ok(()) if saw.get() => Ok(()),
+        Ok(()) => {
+            line.set(saved_line);
+            send(right, input, &saved_path, line, input_gen, ctx, emit)
+        }
+    }
+}
+
+fn send_if(
+    cond: &Filter,
+    yes: &Filter,
+    no: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let saved = line.get();
+    let (conds, err) = parts(eval_in(cond, input, ctx.env));
+    line.set(saved);
+    for cond_value in &conds {
+        line.set(saved);
+        let branch = if truthy(cond_value) { yes } else { no };
+        send(branch, input, path, line, input_gen, ctx, emit)?;
+    }
+    match err {
+        Some(failure) => Err(WalkErr::Path(failure)),
+        None => Ok(()),
+    }
+}
+
+/// True when a later slice bound can sit inside `filter`, so the update has
+/// to write each place before the next bound runs.
+fn has_slice(filter: &Filter) -> bool {
+    match filter {
+        Filter::Slice { .. } | Filter::Call { .. } | Filter::Param(_) => true,
+        Filter::At { base, .. } => has_slice(base),
+        Filter::Comma(left, right)
+        | Filter::Pipe(left, right)
+        | Filter::Alt(left, right)
+        | Filter::And(left, right)
+        | Filter::Or(left, right) => has_slice(left) || has_slice(right),
+        Filter::Optional(inner) | Filter::Define { rest: inner, .. } => has_slice(inner),
+        Filter::If { yes, no, .. } => has_slice(yes) || has_slice(no),
+        Filter::Bind { body, .. } => has_slice(body),
+        _ => false,
+    }
+}
+
+fn send_bind(
+    expr: &Filter,
+    pattern: &Pattern,
+    body: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let saved = line.get();
+    let slot: RefCell<Option<WalkErr>> = RefCell::new(None);
+    let mut bind_one = |value: &Value| -> Result<(), Failure> {
+        line.set(saved);
+        let matched = super::eval::match_pat(pattern, value, ctx.env, &[], &mut |frame| {
+            let child_env = child_scope(frame, ctx.env);
+            let child = Ctx {
+                root: ctx.root,
+                next: ctx.next,
+                env: &child_env,
+                pbinds: ctx.pbinds,
+            };
+            match send(body, input, path, line, input_gen, &child, emit) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    *slot.borrow_mut() = Some(err);
+                    Err(fail(String::new()))
+                }
+            }
+        });
+        if slot.borrow().is_some() {
+            return Ok(());
+        }
+        matched
+    };
+    let result = if matches!(expr, Filter::Identity) {
+        bind_one(input)
+    } else {
+        stream::for_each_value(expr, input, ctx.env, |value| {
+            bind_one(value)?;
+            Ok(slot.borrow().is_some())
+        })
+        .map(|_| ())
+    };
+    if let Some(err) = slot.into_inner() {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(WalkErr::Path(failure)),
+    }
+}
+
+fn send_pipe(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let left_cell = Cell::new(line.get());
+    send(
+        left,
+        input,
+        path,
+        &left_cell,
+        input_gen,
+        ctx,
+        &mut |left_out| {
+            let (gen, next_gen) = if left_out.carrier {
+                (left_out.value_gen, left_out.value_gen)
+            } else {
+                (left_out.line, 0)
+            };
+            let cell = Cell::new(gen);
+            send(
+                right,
+                &left_out.value,
+                &left_out.path,
+                &cell,
+                next_gen,
+                ctx,
+                emit,
+            )
+        },
+    )
+}
+
+/// `(expr)?` swallows a path failure and keeps places already written.
+/// `expr?` directly on `]` does not: the flag is on the index or the slice.
+fn send_optional(
+    inner: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    if matches!(
+        inner,
+        Filter::At { optional: true, .. } | Filter::Slice { optional: true, .. }
+    ) {
+        return send(inner, input, path, line, input_gen, ctx, emit);
+    }
+    match send(inner, input, path, line, input_gen, ctx, emit) {
+        Ok(()) => Ok(()),
+        Err(WalkErr::Write(err)) => Err(WalkErr::Write(err)),
+        Err(WalkErr::Path(_)) => Ok(()),
+    }
+}
+
+fn send_call(
+    func: &std::rc::Weak<super::FnCell>,
+    args: &[Filter],
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let Some(cell) = func.upgrade() else {
+        return Err(WalkErr::Path(fail("function is not defined".to_string())));
+    };
+    let body = std::rc::Rc::clone(&cell.body.borrow());
+    let saved = line.get();
+    let slot: RefCell<Option<WalkErr>> = RefCell::new(None);
+    let result = stream::each_binding(func, args, input, ctx.env, &mut |frame| {
+        let _guard = super::func::set_scope(std::rc::Rc::clone(&frame.scope));
+        let child = Ctx {
+            root: ctx.root,
+            next: ctx.next,
+            env: &frame.env,
+            pbinds: ctx.pbinds,
+        };
+        let branch = Cell::new(saved);
+        match send(&body, input, path, &branch, input_gen, &child, emit) {
+            Ok(()) => Ok(false),
+            Err(err) => {
+                *slot.borrow_mut() = Some(err);
+                Ok(true)
+            }
+        }
+    });
+    if let Some(err) = slot.into_inner() {
+        return Err(err);
+    }
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(WalkErr::Path(failure)),
+    }
+}
+
+fn send_param(
+    name: &str,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let Some(closure) = super::func::lookup(name) else {
+        return Err(WalkErr::Path(fail(format!("{name} is not defined"))));
+    };
+    let _guard = super::func::set_scope(std::rc::Rc::clone(&closure.scope));
+    let env = closure.env.flatten();
+    let child = Ctx {
+        root: ctx.root,
+        next: ctx.next,
+        env: &env,
+        pbinds: ctx.pbinds,
+    };
+    send(&closure.expr, input, path, line, input_gen, &child, emit)
+}
+
+/// Places found by the ordinary path walk. Used when the filter is not a
+/// slice or something wrapped around one. The whole filter still runs
+/// before the first place is written.
+fn emit_run(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    match run(filter, input, path, line, input_gen, ctx) {
+        Ok(outs) => {
+            for out in outs {
+                emit(out)?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            for out in err.partial {
+                emit(out)?;
+            }
+            Err(WalkErr::Path(Failure {
+                partial: Vec::new(),
+                message: err.message,
+                caught: err.caught,
+                stop: err.stop,
+            }))
+        }
+    }
+}
+
+fn keep_walk(sent: Result<(), WalkErr>, slot: &RefCell<Option<WalkErr>>) -> Result<(), Failure> {
+    match sent {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let failure = match &err {
+                WalkErr::Path(failure) | WalkErr::Write(failure) => failure.clone(),
+            };
+            *slot.borrow_mut() = Some(err);
+            Err(failure)
+        }
     }
 }
 
@@ -911,35 +1511,6 @@ fn modify(
     Ok(vec![freeze(&edit)])
 }
 
-fn combine_one(
-    op: UpdateOp,
-    paths: &[Vec<Step>],
-    input: &Value,
-    right: Value,
-) -> Result<Value, String> {
-    let mut edit = Edit::Pure(input.clone());
-    for path in paths {
-        let left = read_edit(&edit, path)?;
-        let value = match op {
-            UpdateOp::Add => add_values(&left, &right)?,
-            UpdateOp::Sub => sub_values(&left, &right)?,
-            UpdateOp::Mul => mul_values(&left, &right)?,
-            UpdateOp::Div => div_values(&left, &right)?,
-            UpdateOp::Rem => rem_values(&left, &right)?,
-            UpdateOp::Alt => {
-                if truthy(&left) {
-                    left
-                } else {
-                    right.clone()
-                }
-            }
-            UpdateOp::Assign | UpdateOp::Modify => unreachable!("arithmetic update"),
-        };
-        write_path(&mut edit, path, &Write::Put(value))?;
-    }
-    Ok(freeze(&edit))
-}
-
 fn write_all(edit: &mut Edit, paths: &[Vec<Step>], write: &Write) -> Result<(), String> {
     for path in paths {
         write_path(edit, path, write)?;
@@ -1070,28 +1641,6 @@ enum Real {
     Huge(String),
 }
 
-fn locate_outs(
-    filter: &Filter,
-    input: &Value,
-    env: &[(String, Value)],
-) -> Result<(Vec<POut>, Option<Failure>), Failure> {
-    let next = Cell::new(2);
-    let line = Cell::new(1);
-    let ctx = Ctx {
-        root: input,
-        next: &next,
-        env,
-        pbinds: &[],
-    };
-    match run(filter, input, &[], &line, 1, &ctx) {
-        Ok(outs) => Ok((outs, None)),
-        Err(err) => {
-            let (partial, failure) = split_err(err);
-            Ok((partial, Some(failure)))
-        }
-    }
-}
-
 fn classify_one(root: &Value, out: POut) -> Found {
     if out.force_broken {
         if out.path.iter().any(|step| match step {
@@ -1142,15 +1691,7 @@ fn run(
             end,
             optional,
         } => run_slice(
-            base,
-            start,
-            end,
-            *optional,
-            input,
-            path,
-            line,
-            input_gen,
-            ctx,
+            base, start, end, *optional, input, path, line, input_gen, ctx,
         ),
         Filter::Iterate => run_iterate(input, path, line, input_gen, ctx),
         Filter::Recurse => run_recurse(input, path, line, input_gen, ctx),
@@ -2923,12 +3464,14 @@ fn real_step(container: &Value, key: &Value) -> Result<Real, String> {
         Value::Object(fields) => match container {
             Value::Null | Value::Array(_) | Value::String(_) => {
                 let (start, end) = slice_from_object(fields)?;
-                let step = Step::Slice {
+                let probe = Step::Slice {
                     start: as_bound(start),
                     end: as_bound(end),
                 };
-                let child = child_at(container, &step)?;
-                Ok(Real::Done(step, child))
+                let child = child_at(container, &probe)?;
+                // `path` prints this object as it was written, extra keys
+                // included. A colon slice is still start then end.
+                Ok(Real::Done(Step::Raw(key.clone()), child))
             }
             other => Err(format!("Cannot index {} with object", other.type_name())),
         },

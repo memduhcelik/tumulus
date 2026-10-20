@@ -1303,3 +1303,131 @@ fn optional_slice_reports_bound_errors() {
         compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
+
+/// `path` prints an object in the brackets in the order it was written.
+/// jq is asked for each one.
+#[test]
+fn object_slice_path_keeps_written_order() {
+    require_jq();
+    let programs = [
+        r#"[0,1,2,3,4] | path(.[ {end:3, start:1} ])"#,
+        r#"[0,1,2,3,4] | path(.[ {start:1, end:3} ])"#,
+        r#"[0,1,2,3,4] | path(.[ {start:1, end:3, x:9} ])"#,
+        r#"[0,1,2,3,4] | path(.[ {end:3, start:1, end:4} ])"#,
+        r#"[0,1,2,3,4] | path(.[ {start:1, end:3, start:0, y:1} ])"#,
+        r#"[0,1,2,3,4] | path(.[ {end:3, start:1} ][0])"#,
+        r#"null | path(.[ {end:3, start:1} ])"#,
+        r#""abcdef" | path(.[ {end:3, start:1} ])"#,
+        r#"{"a":[0,1,2,3,4]} | path(.a[ {end:3, start:1} ])"#,
+        r#"[0,1,2,3,4] | path(.[1:3])"#,
+        r#"[0,1,2,3,4] | path(.[1:])"#,
+        r#"[0,1,2,3,4] | path(.[:3])"#,
+        r#"[0,1,2,3,4] | .[{end:3, start:1}] = [9]"#,
+        r#"[0,1,2,3,4] | .[{start:1, end:3, x:9}]"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
+
+/// A slice update writes one bound before the next one runs. A write that
+/// cannot be done does not run a later bound. jq is asked for each one.
+#[test]
+fn slice_update_stops_before_a_later_bound() {
+    require_jq();
+    let cases: &[(&str, &str, &[u8])] = &[
+        (
+            "assign does not read a later bound",
+            r#"try (.[1,(input):] = 9) catch input"#,
+            b"[0,1,2,3,4]\n[7,8]\n",
+        ),
+        (
+            "assign reads a later bound after a write",
+            r#"try (.[1,(input):] = [9]) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "modify does not read a later bound",
+            r#"try (.[1,(input):] |= 9) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "modify reads a later bound after a write",
+            r#"try (.[1,(input):] |= [9]) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "append reads a later bound after a write",
+            r#"try (.[1,(input):] += [9]) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "string assign does not read a later bound",
+            r#"try (.[0,(input):] = "Z") catch input"#,
+            b"\"ab\"\n1\n",
+        ),
+        (
+            "nested assign does not read a later bound",
+            r#"try (.a[1,(input):] = 9) catch input"#,
+            b"{\"a\":[0,1,2,3]}\n[7]\n",
+        ),
+        (
+            "index after a slice does not read a later bound",
+            r#"try (.[0,(input):][0] = "Z") catch input"#,
+            b"\"abcd\"\n1\n",
+        ),
+        (
+            "a later index is written when the slice write works",
+            r#".[1,(input):][0] = 9"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "comma does not read a later bound",
+            r#"try ((.[1,(input):], .[0]) = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "a call does not read a later bound",
+            r#"def f: .[1,(input):]; try (f = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "a call reads a later bound after a write",
+            r#"def f: .[1,(input):]; f = [9]"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "delete on a string still reads a later bound",
+            r#"try del(.[0,(input):]) catch input"#,
+            b"\"ab\"\n1\n",
+        ),
+        (
+            "an error in a later bound is kept when the write worked",
+            r#"try (.[1,error("z"):] = [9]) catch ."#,
+            b"[0,1,2,3,4]\n",
+        ),
+        (
+            "an error in a later bound is not run when the write failed",
+            r#"try (.[1,error("z"):] = 9) catch ."#,
+            b"[0,1,2,3,4]\n",
+        ),
+        (
+            "if does not read a later bound",
+            r#"try (if true then .[1,(input):] else . end = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "alternative does not read a later bound",
+            r#"try ((.[1,(input):] // .[0]) = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "a binding does not read a later bound",
+            r#"try ((. as $x | .[1,(input):]) = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+    ];
+    for (name, program, input) in cases {
+        compare_exact(name, &["-c", "--", program], input);
+    }
+}

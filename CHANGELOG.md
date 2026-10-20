@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+`path(.[ {end:3, start:1} ])` prints that object with the keys in the order they were written. Extra keys stay. A colon slice still prints `start` before `end`.
+
+When a slice of an update cannot be written, a later bound is not run. `try (.[1,(input):] = 9) catch input` reads the next input in `catch`. `del` on a string still runs a later bound, and a bound error replaces `Cannot delete fields from string`.
+
 A plain decimal whose text is already the form jq prints is copied through. `[.features[] | select(.properties.STREET == "UNKNOWN")] | length` on the city lots file is faster than jq and still prints `2843`.
 
 `?` written immediately after `]` skips a failed index or slice and still reports an error raised while computing a bound. `[1,2,3] | .[1,error("z"):]?` prints `[2,3]` and then `z`, and the exit status is 5. `?` after parentheses still catches that error.
