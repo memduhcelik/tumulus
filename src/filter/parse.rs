@@ -120,7 +120,9 @@ pub fn reads_input(filter: &Filter) -> bool {
             | Filter::Until(left, right)
             | Filter::While(left, right)
             | Filter::SetPath(left, right) => walk(left, seen) || walk(right, seen),
-            Filter::Slice { base, start, end, .. } => {
+            Filter::Slice {
+                base, start, end, ..
+            } => {
                 base.as_deref().is_some_and(|base| walk(base, seen))
                     || start.as_deref().is_some_and(|start| walk(start, seen))
                     || end.as_deref().is_some_and(|end| walk(end, seen))
@@ -391,7 +393,9 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             Some(by) => check_vars(by, scope),
             None => Ok(()),
         },
-        Filter::Slice { base, start, end, .. } => {
+        Filter::Slice {
+            base, start, end, ..
+        } => {
             if let Some(base) = base {
                 check_vars(base, scope)?;
             }
@@ -765,7 +769,9 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
         | Filter::Param(_)
         | Filter::Paths(None)
         | Filter::Flatten(None) => {}
-        Filter::Slice { base, start, end, .. } => {
+        Filter::Slice {
+            base, start, end, ..
+        } => {
             if let Some(base) = base {
                 walk_defs(base, seen, errors);
             }
@@ -3813,6 +3819,13 @@ fn question(filter: Filter) -> Filter {
         } => Filter::At {
             base,
             key,
+            optional: true,
+        },
+        // `.a?` and `.["a"]?` skip a failed field. `( .a )?` is the
+        // general form and still catches an invalid path.
+        Filter::Field(name) => Filter::At {
+            base: Box::new(Filter::Identity),
+            key: Box::new(Filter::Literal(Value::String(name))),
             optional: true,
         },
         other => Filter::Optional(Box::new(other)),
