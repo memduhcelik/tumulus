@@ -155,6 +155,38 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 | 2 | 1.90 | 0.86 | 2.05 | 0.89 |
 | 3 | 1.91 | 0.87 | 2.08 | 0.91 |
 
+`--stream -c .`, `-sc .`, `-Rc .`, `-nc inputs`, and `--seq -c .` were timed the same way on that file. Stdout and stderr matched. `--stream -c .` wrote 90029174 bytes. `-sc .` wrote 72727818 bytes. `-Rc .` wrote 83184148 bytes. `-nc inputs` wrote 72727816 bytes. `--seq -c .` wrote no values. Both programs print `jq: ignoring parse error: Unfinished abandoned text at EOF at line 300001, column 0`.
+
+| run | `jq --stream -c .` | `tumulus --stream -c .` |
+| --- | ---: | ---: |
+| 1 | 2.76 | 3.74 |
+| 2 | 2.72 | 3.76 |
+| 3 | 2.78 | 3.76 |
+
+| run | `jq -sc .` | `tumulus -sc .` |
+| --- | ---: | ---: |
+| 1 | 2.00 | 1.36 |
+| 2 | 1.99 | 1.36 |
+| 3 | 1.99 | 1.34 |
+
+| run | `jq -Rc .` | `tumulus -Rc .` |
+| --- | ---: | ---: |
+| 1 | 1.70 | 0.29 |
+| 2 | 1.70 | 0.28 |
+| 3 | 1.71 | 0.28 |
+
+| run | `jq -nc inputs` | `tumulus -nc inputs` |
+| --- | ---: | ---: |
+| 1 | 2.00 | 0.87 |
+| 2 | 2.01 | 0.87 |
+| 3 | 1.96 | 0.88 |
+
+| run | `jq --seq -c .` | `tumulus --seq -c .` |
+| --- | ---: | ---: |
+| 1 | 0.16 | 0.03 |
+| 2 | 0.16 | 0.03 |
+| 3 | 0.17 | 0.03 |
+
 `citylots.json` is 189778220 bytes and 413125 lines. Compact output was 169215413 bytes. Pretty output was 395218854 bytes.
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
@@ -162,6 +194,38 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 | 1 | 3.59 | 2.33 | 7.18 | 2.47 |
 | 2 | 3.53 | 2.36 | 7.23 | 2.48 |
 | 3 | 3.59 | 2.35 | 7.24 | 2.49 |
+
+The same five commands were timed on that file. Stdout and stderr matched. `--stream -c .` wrote 837003618 bytes. `-sc .` wrote 169215415 bytes. `-Rc .` wrote 200823780 bytes. `-nc inputs` wrote 169215413 bytes. `--seq -c .` wrote no values. Both programs print `jq: ignoring parse error: Unfinished abandoned text at EOF at line 413126, column 0`.
+
+| run | `jq --stream -c .` | `tumulus --stream -c .` |
+| --- | ---: | ---: |
+| 1 | 18.94 | 37.57 |
+| 2 | 18.65 | 38.16 |
+| 3 | 18.95 | 38.40 |
+
+| run | `jq -sc .` | `tumulus -sc .` |
+| --- | ---: | ---: |
+| 1 | 3.73 | 4.48 |
+| 2 | 3.79 | 4.37 |
+| 3 | 3.85 | 4.37 |
+
+| run | `jq -Rc .` | `tumulus -Rc .` |
+| --- | ---: | ---: |
+| 1 | 4.16 | 0.60 |
+| 2 | 4.04 | 0.60 |
+| 3 | 3.99 | 0.62 |
+
+| run | `jq -nc inputs` | `tumulus -nc inputs` |
+| --- | ---: | ---: |
+| 1 | 3.82 | 2.41 |
+| 2 | 3.79 | 2.43 |
+| 3 | 3.75 | 2.42 |
+
+| run | `jq --seq -c .` | `tumulus --seq -c .` |
+| --- | ---: | ---: |
+| 1 | 0.43 | 0.06 |
+| 2 | 0.43 | 0.06 |
+| 3 | 0.43 | 0.09 |
 
 `[.features[] | select(.properties.STREET == "UNKNOWN")] | length` reads that same file and prints `2843`. Compact and pretty printing of that number are the same text, so these runs used `-c`.
 

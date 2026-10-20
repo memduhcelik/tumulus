@@ -64,14 +64,68 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
 pub(crate) fn nul_cut(bytes: &[u8]) -> usize {
     #[cfg(target_os = "macos")]
     {
-        match bytes.iter().rposition(|byte| *byte == 0) {
-            Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
-            _ => bytes.len(),
-        }
+        nul_cut_at(bytes)
     }
     #[cfg(not(target_os = "macos"))]
     {
         bytes.len()
+    }
+}
+
+/// Where a repeated NUL check can resume.
+///
+/// The bytes already searched stay a prefix. A later check looks only at
+/// the new tail, so a file with no NUL is not reread once per chunk.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NulScan {
+    checked: usize,
+    last_nul: Option<usize>,
+    /// A newline has been seen after `last_nul` in the checked prefix.
+    nl_after: bool,
+}
+
+impl NulScan {
+    /// The index [`nul_cut`] would return on macOS for this buffer.
+    pub(crate) fn at(&mut self, bytes: &[u8]) -> usize {
+        if self.checked > bytes.len() {
+            *self = Self::default();
+        }
+        if self.checked < bytes.len() {
+            let start = self.checked;
+            if let Some(rel) = bytes[start..].iter().rposition(|byte| *byte == 0) {
+                let index = start + rel;
+                self.last_nul = Some(index);
+                self.nl_after = bytes[index + 1..].contains(&b'\n');
+            } else if self.last_nul.is_some() && !self.nl_after {
+                self.nl_after = bytes[start..].contains(&b'\n');
+            }
+            self.checked = bytes.len();
+        }
+        match self.last_nul {
+            Some(index) if !self.nl_after => index,
+            _ => bytes.len(),
+        }
+    }
+
+    /// [`nul_cut`] for this buffer, continued from the previous call.
+    pub(crate) fn cut(&mut self, bytes: &[u8]) -> usize {
+        let at = self.at(bytes);
+        #[cfg(target_os = "macos")]
+        {
+            at
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = at;
+            bytes.len()
+        }
+    }
+}
+
+fn nul_cut_at(bytes: &[u8]) -> usize {
+    match bytes.iter().rposition(|byte| *byte == 0) {
+        Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
+        _ => bytes.len(),
     }
 }
 
@@ -655,7 +709,7 @@ fn is_atom(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{stream_line, EofCut, LineCursor};
+    use super::{nul_cut, stream_line, EofCut, LineCursor, NulScan};
 
     fn finished_on_eof_cut(bytes: &[u8], end: usize) -> bool {
         EofCut::default().at(bytes, end)
@@ -867,5 +921,66 @@ mod tests {
             started.elapsed().as_millis() < 3_000,
             "reread the file for every value"
         );
+    }
+
+    fn reference_nul(bytes: &[u8]) -> usize {
+        match bytes.iter().rposition(|byte| *byte == 0) {
+            Some(index) if !bytes[index + 1..].contains(&b'\n') => index,
+            _ => bytes.len(),
+        }
+    }
+
+    #[test]
+    fn nul_scan_matches_a_fresh_search() {
+        let patterns: &[&[u8]] = &[
+            b"",
+            b"\0",
+            b"a",
+            b"\0b",
+            b"a\0",
+            b"a\0b",
+            b"a\0\nb",
+            b"a\nb\0c",
+            b"\0\n",
+            b"a\0b\0c",
+            b"a\0b\nc\0d",
+            b"1\n2\n3\n",
+        ];
+        for pattern in patterns {
+            let mut scan = NulScan::default();
+            let mut buf = Vec::new();
+            for &byte in *pattern {
+                buf.push(byte);
+                assert_eq!(scan.at(&buf), reference_nul(&buf), "{buf:?}");
+                assert_eq!(scan.cut(&buf), nul_cut(&buf));
+            }
+            assert_eq!(scan.at(&buf), reference_nul(&buf));
+        }
+
+        let mut buf = Vec::new();
+        let mut scan = NulScan::default();
+        for _ in 0..2_000 {
+            buf.extend_from_slice(&[b'1', b'\n', b'{', b'}']);
+            assert_eq!(scan.at(&buf), reference_nul(&buf));
+        }
+        buf.extend_from_slice(b"\0tail");
+        assert_eq!(scan.at(&buf), reference_nul(&buf));
+        buf.push(b'\n');
+        assert_eq!(scan.at(&buf), reference_nul(&buf));
+        buf.extend_from_slice(b"more\0");
+        assert_eq!(scan.at(&buf), reference_nul(&buf));
+
+        let mut big = Vec::new();
+        let mut scan = NulScan::default();
+        let started = std::time::Instant::now();
+        for _ in 0..2_000 {
+            big.extend(std::iter::repeat(b'a').take(4096));
+            let _ = scan.at(&big);
+        }
+        assert!(
+            started.elapsed().as_millis() < 2_000,
+            "reread the file looking for a NUL"
+        );
+        assert_eq!(scan.at(&big), reference_nul(&big));
     }
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+On macOS, `--stream` reads a file in one pass again. A NUL with no newline after it still ends the input there. Items are unchanged, including an item printed before the input has ended.
+
 A file of many JSON values is read in one pass again. Finding the read that completed a value no longer walks the earlier bytes once per value. The values and the line numbers are unchanged.
 
 `(1`, `.[`, `1 2`, `{a:1+2}`, `if 1 then 2`, an operator left at the end such as `1 *`, `[1,`, `.a }`, `"\(1 +)"`, and `def f: 1 +; f` are syntax errors. Each prints jq's message, and the exit status is 3.

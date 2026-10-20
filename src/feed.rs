@@ -11,8 +11,8 @@ use std::io::{self, Read as IoRead};
 
 use crate::eprintln;
 use crate::parse::{
-    closer_is_detached, nul_cut, parse_seq, program_stream, program_stream_with, pull_stream,
-    scan_input, stream_line, EofCut, InputScan, LineCursor, SeqItem, StreamState,
+    closer_is_detached, parse_seq, program_stream, program_stream_with, pull_stream, scan_input,
+    stream_line, EofCut, InputScan, LineCursor, NulScan, SeqItem, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -346,6 +346,8 @@ struct Session {
     seq_queue: VecDeque<SeqQueued>,
     /// The last value was completed in an EOF read that did not end on a newline.
     cut_at_eof: bool,
+    /// NUL search already done over the prefix of `buf`.
+    nul: NulScan,
 }
 
 enum SeqQueued {
@@ -411,6 +413,7 @@ impl Session {
             seq_done: false,
             seq_queue: VecDeque::new(),
             cut_at_eof: false,
+            nul: NulScan::default(),
         }
     }
 
@@ -614,7 +617,7 @@ impl Session {
         if self.fault.is_some() {
             return;
         }
-        let end = nul_cut(&self.buf);
+        let end = self.nul.cut(&self.buf);
         if self.drive.index > end {
             self.drive.index = end;
         }
@@ -665,7 +668,7 @@ impl Session {
         } else {
             self.place(out.error_at.min(end), false)
         };
-        let visible = &self.buf[..nul_cut(&self.buf)];
+        let visible = &self.buf[..end];
         let prior = self.prev.is_some() || !self.pending.is_empty();
         let unknown = out.incomplete
             && prior
@@ -727,12 +730,12 @@ impl Session {
         closer.len() == 1
     }
 
-    fn pair_detach(&self, value: &Value) -> bool {
-        let Some(prev) = &self.prev else {
+    fn pair_detach(&mut self, value: &Value) -> bool {
+        let Some(prev) = self.prev.clone() else {
             return false;
         };
-        let end = nul_cut(&self.buf);
-        closer_is_detached(&[prev.clone(), value.clone()], &self.buf[..end])
+        let end = self.nul.cut(&self.buf);
+        closer_is_detached(&[prev, value.clone()], &self.buf[..end])
     }
 
     fn pull_raw(&mut self) -> Result<Pulled, String> {
