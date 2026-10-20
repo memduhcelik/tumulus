@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`(. as [$a] ?// $v | .[1:3]) = ["q"]` writes that slice. The alternative runs when a destructuring pattern's slice is not a path. `(foreach .[] as $x (.; .)) = 9` is an invalid path, and `path` of that `foreach` is too. `try (path(.[1,(input):] | 9)) catch input` reads the next input in `catch`, and a later slice bound is not run.
+
 `(. as [$a] | .[1:3]) = ["q"]` is an invalid path. `(. as $a | .[1:3])` still writes that slice. `first`, `limit`, and `label` on the left of an update do not run a later slice bound after the place they take. `(reduce .[] as $x (.; .)) = 9` replaces the input. A `reduce` whose steps leave that value in place is that path, and `path` of it is `[]`.
 
 `path(.[ {end:3, start:1} ])` prints that object with the keys in the order they were written. Extra keys stay. A colon slice still prints `start` before `end`.

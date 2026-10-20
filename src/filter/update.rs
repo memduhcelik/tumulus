@@ -346,9 +346,9 @@ fn send(
             pattern,
             alts,
             body,
-        } if alts.is_empty() && has_slice(body) => {
-            send_bind(expr, pattern, body, input, path, line, input_gen, ctx, emit)
-        }
+        } if has_slice(body) => send_bind(
+            expr, pattern, alts, body, input, path, line, input_gen, ctx, emit,
+        ),
         Filter::Optional(inner) => send_optional(inner, input, path, line, input_gen, ctx, emit),
         Filter::Call { func, args } => {
             send_call(func, args, input, path, line, input_gen, ctx, emit)
@@ -569,6 +569,7 @@ fn has_slice(filter: &Filter) -> bool {
 fn send_bind(
     expr: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     body: &Filter,
     input: &Value,
     path: &[Step],
@@ -577,37 +578,74 @@ fn send_bind(
     ctx: &Ctx,
     emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
 ) -> Result<(), WalkErr> {
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
+    // Every `?//` pattern's names are in scope. A name the successful
+    // pattern did not bind is null. A single pattern keeps the names
+    // `match_pat` stored and does not hide an outer binding.
+    let mut names = Vec::new();
+    if !alts.is_empty() {
+        super::parse::bind_names(pattern, alts, &mut names);
+    }
     let saved = line.get();
     let slot: RefCell<Option<WalkErr>> = RefCell::new(None);
     let mut bind_one = |value: &Value| -> Result<(), Failure> {
-        line.set(saved);
-        let matched = super::eval::match_pat(pattern, value, ctx.env, &[], &mut |frame| {
-            let child_env = child_scope(frame, ctx.env);
-            let child = Ctx {
-                root: ctx.root,
-                next: ctx.next,
-                env: &child_env,
-                pbinds: ctx.pbinds,
-            };
-            // A plain `$name` keeps `.` on the input. Destructuring indexes
-            // the value, so the body is no longer a path back to that input.
-            let body_gen = if matches!(pattern, Pattern::Var(_)) {
-                input_gen
-            } else {
-                0
-            };
-            match send(body, input, path, line, body_gen, &child, emit) {
-                Ok(()) => Ok(()),
-                Err(err) => {
-                    *slot.borrow_mut() = Some(err);
-                    Err(fail(String::new()))
+        for (index, pat) in pats.iter().enumerate() {
+            line.set(saved);
+            let last = index + 1 == pats.len();
+            let mut body_err: Option<WalkErr> = None;
+            let matched = super::eval::match_pat(pat, value, ctx.env, &[], &mut |frame| {
+                let owned;
+                let frame = if names.is_empty() {
+                    frame
+                } else {
+                    owned = null_names(frame, &names);
+                    &owned
+                };
+                let child_env = child_scope(frame, ctx.env);
+                let child = Ctx {
+                    root: ctx.root,
+                    next: ctx.next,
+                    env: &child_env,
+                    pbinds: ctx.pbinds,
+                };
+                // A plain `$name` keeps `.` on the input. Destructuring indexes
+                // the value, so the body is no longer a path back to that input.
+                let body_gen = if matches!(pat, Pattern::Var(_)) {
+                    input_gen
+                } else {
+                    0
+                };
+                match send(body, input, path, line, body_gen, &child, emit) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        body_err = Some(err);
+                        Err(fail(String::new()))
+                    }
                 }
+            });
+            if let Some(err) = body_err {
+                // A path failure tries the next pattern. A write, a full
+                // `first` or `limit`, and `halt` do not.
+                let retry =
+                    matches!(&err, WalkErr::Path(failure) if failure.stop.is_none()) && !last;
+                if retry {
+                    continue;
+                }
+                *slot.borrow_mut() = Some(err);
+                return Ok(());
             }
-        });
-        if slot.borrow().is_some() {
-            return Ok(());
+            match matched {
+                Ok(()) => return Ok(()),
+                Err(failure) if failure.stop.is_some() || last => {
+                    *slot.borrow_mut() = Some(WalkErr::Path(failure));
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
         }
-        matched
+        Ok(())
     };
     let result = if matches!(expr, Filter::Identity) {
         bind_one(input)
@@ -1959,9 +1997,10 @@ fn run(
     }
 }
 
-/// `foreach` in a path. The stream and the update run as values when they
-/// are not themselves paths. The extract runs on each state, and a state
-/// that was not reached through the input refuses an index.
+/// `foreach` in a path. A yield is never a path: the first extracted value
+/// is an invalid path, and later iterations do not run. An index in the
+/// init moves the lineage, so the stream is not a carrier. The update and
+/// the extract are not carriers either, so an index there is `near_access`.
 fn run_foreach(
     stream: &Filter,
     pattern: &Pattern,
@@ -1978,12 +2017,20 @@ fn run_foreach(
     let extract = extract.unwrap_or(&identity);
     let init_line = Cell::new(line.get());
     let inits = run(init, input, path, &init_line, input_gen, ctx)?;
-    let mut out = Vec::new();
+    // `.[1], .` indexes on one side. The stream then refuses to iterate,
+    // even though the other side is still the input. A constant init does
+    // not move the lineage.
+    if inits.iter().any(|out| !same_steps(&out.path, path)) {
+        line.set(alloc(ctx.next));
+    }
     for (index, init_state) in inits.into_iter().enumerate() {
         let null_input = Value::Null;
         let stream_input = if index == 0 { input } else { &null_input };
-        let (items, stream_err) = parts(eval_in(stream, stream_input, ctx.env));
-        let mut state = init_state;
+        let items = match run(stream, stream_input, path, line, input_gen, ctx) {
+            Ok(outs) => outs.into_iter().map(|out| out.value).collect::<Vec<_>>(),
+            Err(err) => return Err(err),
+        };
+        let mut state_value = init_state.value;
         for item in &items {
             let mut step_err: Option<PathErr> = None;
             let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
@@ -1997,34 +2044,35 @@ fn run_foreach(
                     env: &child_env,
                     pbinds: ctx.pbinds,
                 };
-                let gen = if state.carrier { state.value_gen } else { 0 };
-                let cell = Cell::new(gen);
-                let updates = match run(update, &state.value, &state.path, &cell, gen, &child) {
+                let cell = Cell::new(0);
+                let updates = match run(update, &state_value, path, &cell, 0, &child) {
                     Ok(updates) => updates,
                     Err(err) => {
-                        step_err = Some(attach(std::mem::take(&mut out), err));
+                        step_err = Some(err);
                         return Ok(());
                     }
                 };
                 if updates.is_empty() {
-                    let kept = state.path.clone();
-                    let lineage = state.line;
-                    state = constant(Value::Null, &kept, lineage, ctx.root);
+                    state_value = Value::Null;
                     return Ok(());
                 }
-                for (at, upd) in updates.iter().enumerate() {
-                    let ext_gen = if upd.carrier { upd.value_gen } else { 0 };
-                    let ext_line = Cell::new(ext_gen);
-                    match run(extract, &upd.value, &upd.path, &ext_line, ext_gen, &child) {
-                        Ok(more) => out.extend(more),
+                for upd in &updates {
+                    let ext_line = Cell::new(0);
+                    let extracted = match run(extract, &upd.value, path, &ext_line, 0, &child) {
+                        Ok(more) => more,
                         Err(err) => {
-                            step_err = Some(attach(std::mem::take(&mut out), err));
+                            step_err = Some(err);
                             return Ok(());
                         }
+                    };
+                    if let Some(one) = extracted.first() {
+                        step_err = Some(bare(format!(
+                            "Invalid path expression with result {}",
+                            clipped(&one.value, 29)
+                        )));
+                        return Ok(());
                     }
-                    if at + 1 == updates.len() {
-                        state = upd.clone();
-                    }
+                    state_value = upd.value.clone();
                 }
                 Ok(())
             });
@@ -2033,23 +2081,15 @@ fn run_foreach(
             }
             if let Err(failure) = matched {
                 return Err(PathErr {
-                    partial: out,
+                    partial: Vec::new(),
                     message: failure.message,
                     caught: failure.caught,
                     stop: failure.stop,
                 });
             }
         }
-        if let Some(failure) = stream_err {
-            return Err(PathErr {
-                partial: out,
-                message: failure.message,
-                caught: failure.caught,
-                stop: failure.stop,
-            });
-        }
     }
-    Ok(out)
+    Ok(Vec::new())
 }
 
 fn run_call(
@@ -3441,6 +3481,17 @@ fn run_bind(
     finish_outs(out, err)
 }
 
+/// Names the successful pattern did not bind are null.
+fn null_names(frame: &[(String, Value)], names: &[String]) -> Vec<(String, Value)> {
+    let mut out = frame.to_vec();
+    for name in names {
+        if !out.iter().any(|(bound, _)| bound == name) {
+            out.push((name.clone(), Value::Null));
+        }
+    }
+    out
+}
+
 /// Each pattern in order. A failure that is not `halt` tries the next pattern.
 fn bind_patterns(
     pats: &[&Pattern],
@@ -3452,8 +3503,13 @@ fn bind_patterns(
     tail: &Tail,
     ctx: &Ctx,
 ) -> Result<Vec<POut>, PathErr> {
+    // Indexing inside a pattern moves the lineage. Each `?//` pattern
+    // starts again from the lineage this binding was reached at, so a
+    // later `$name` is still a path back to the input.
+    let saved = line.get();
     let mut out = Vec::new();
     for (index, pat) in pats.iter().enumerate() {
+        line.set(saved);
         let last = index + 1 == pats.len();
         match exec_pattern(
             pat,
@@ -4653,32 +4709,255 @@ fn walk_paths(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Walk {
         env,
         pbinds: &[],
     };
-    let (outs, err) = match run(filter, input, &[], &line, 1, &ctx) {
-        Ok(outs) => (outs, None),
+    let mut steps = Vec::new();
+    let failure = stream_paths(
+        filter,
+        input,
+        &[],
+        &line,
+        1,
+        &ctx,
+        &mut |out| match path_steps(input, out) {
+            Ok(one) => {
+                steps.push(one);
+                Ok(())
+            }
+            Err(value) => Err(fail(format!(
+                "Invalid path expression with result {}",
+                clipped(&value, 29)
+            ))),
+        },
+    )
+    .err();
+    Walk { steps, failure }
+}
+
+/// `path` checks each output as it is produced. A value that is not a path
+/// stops the walk, so a later slice bound is not run. Value filters and
+/// updates do not use this.
+fn stream_paths(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    match filter {
+        Filter::Slice {
+            base,
+            start,
+            end,
+            optional,
+        } => stream_slice(
+            base.as_deref(),
+            start.as_deref(),
+            end.as_deref(),
+            *optional,
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+            emit,
+        ),
+        Filter::At {
+            base,
+            key,
+            optional,
+        } => stream_at(
+            base, key, *optional, input, path, line, input_gen, ctx, emit,
+        ),
+        Filter::Comma(left, right) => {
+            let saved = line.get();
+            let left_cell = Cell::new(saved);
+            stream_paths(left, input, path, &left_cell, input_gen, ctx, emit)?;
+            let right_cell = Cell::new(saved);
+            stream_paths(right, input, path, &right_cell, input_gen, ctx, emit)
+        }
+        // `match | .[]` reports the match array. The ordinary pipe walk
+        // would turn that into a later index error.
+        Filter::Pipe(left, right) if !matches!(left.as_ref(), Filter::MatchImpl { .. }) => {
+            stream_pipe(left, right, input, path, line, input_gen, ctx, emit)
+        }
+        _ => stream_run(filter, input, path, line, input_gen, ctx, emit),
+    }
+}
+
+fn stream_run(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    match run(filter, input, path, line, input_gen, ctx) {
+        Ok(outs) => {
+            for out in outs {
+                emit(out)?;
+            }
+            Ok(())
+        }
         Err(err) => {
             let (partial, failure) = split_err(err);
-            (partial, Some(failure))
+            for out in partial {
+                emit(out)?;
+            }
+            Err(failure)
         }
-    };
-    let mut steps = Vec::new();
-    for out in outs {
-        match path_steps(input, out) {
-            Ok(one) => steps.push(one),
-            Err(value) => {
-                return Walk {
-                    steps,
-                    failure: Some(fail(format!(
-                        "Invalid path expression with result {}",
-                        clipped(&value, 29)
-                    ))),
-                };
+    }
+}
+
+fn stream_pipe(
+    left: &Filter,
+    right: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let left_cell = Cell::new(line.get());
+    stream_paths(
+        left,
+        input,
+        path,
+        &left_cell,
+        input_gen,
+        ctx,
+        &mut |left_out| {
+            let (gen, next_gen) = if left_out.carrier {
+                (left_out.value_gen, left_out.value_gen)
+            } else {
+                (left_out.line, 0)
+            };
+            let cell = Cell::new(gen);
+            stream_paths(
+                right,
+                &left_out.value,
+                &left_out.path,
+                &cell,
+                next_gen,
+                ctx,
+                emit,
+            )
+        },
+    )
+}
+
+fn stream_at(
+    base: &Filter,
+    key: &Filter,
+    optional: bool,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let saved = line.get();
+    let (keys, key_err) = parts(eval_in(key, input, ctx.env));
+    line.set(saved);
+    for key_value in &keys {
+        line.set(saved);
+        stream_paths(
+            base,
+            input,
+            path,
+            line,
+            input_gen,
+            ctx,
+            &mut |base_out| match index_out(&base_out, key_value, ctx) {
+                Ok(hit) => emit(hit),
+                Err(message) if optional => {
+                    let _ = message;
+                    Ok(())
+                }
+                Err(message) => Err(match key_err.clone() {
+                    Some(failure) => failure,
+                    None => fail(message),
+                }),
+            },
+        )?;
+    }
+    match key_err {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
+fn stream_slice(
+    base: Option<&Filter>,
+    start: Option<&Filter>,
+    end: Option<&Filter>,
+    optional: bool,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let identity = Filter::Identity;
+    let base = base.unwrap_or(&identity);
+    let saved = line.get();
+    let slot: RefCell<Option<Failure>> = RefCell::new(None);
+    let walked = walk_slice_pairs(start, end, input, ctx.env, |start_value, end_value| {
+        line.set(saved);
+        let sent = stream_paths(base, input, path, line, input_gen, ctx, &mut |base_out| {
+            if !base_out.carrier {
+                let elem = shown_slice(start_value, end_value);
+                return Err(fail(near_access(&elem, &base_out.value)));
+            }
+            match &base_out.value {
+                Value::Array(_) | Value::String(_) => {
+                    if require_slice_index(start_value).is_err()
+                        || require_slice_index(end_value).is_err()
+                    {
+                        if optional {
+                            return Ok(());
+                        }
+                        require_slice_index(start_value)?;
+                        require_slice_index(end_value)?;
+                    }
+                }
+                Value::Null => {}
+                other => {
+                    if optional {
+                        return Ok(());
+                    }
+                    return Err(fail(format!(
+                        "Cannot index {} with object",
+                        other.type_name()
+                    )));
+                }
+            }
+            let step = Step::Slice {
+                start: start_value.clone(),
+                end: end_value.clone(),
+            };
+            let child = child_at(&base_out.value, &step).map_err(fail)?;
+            let mut full = base_out.path;
+            full.push(step);
+            emit(taken(child, full, line, ctx.next))
+        });
+        match sent {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                *slot.borrow_mut() = Some(failure);
+                Err(fail(String::new()))
             }
         }
+    });
+    if let Some(failure) = slot.into_inner() {
+        return Err(failure);
     }
-    Walk {
-        steps,
-        failure: err,
-    }
+    walked
 }
 
 /// A path jq will print. A broken value is the `Err` payload.
