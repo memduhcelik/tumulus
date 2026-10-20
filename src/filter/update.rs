@@ -467,7 +467,7 @@ fn send_at(
             ctx,
             &mut |base_out| match index_out(&base_out, key_value, ctx) {
                 Ok(hit) => emit(hit),
-                Err(message) if optional => {
+                Err(message) if optional && skips_failed_index(&message) => {
                     let _ = message;
                     Ok(())
                 }
@@ -2657,7 +2657,7 @@ fn run_collect(
 /// leaves that same path in place. Anything else is the reduced value.
 fn kept_place(
     init: &POut,
-    items: &[Value],
+    items: &[POut],
     pattern: &Pattern,
     alts: &[Pattern],
     update: &Filter,
@@ -2671,8 +2671,12 @@ fn kept_place(
     }
     let mut acc = init.clone();
     for item in items {
+        // A constant is not a path, so taking it apart is not this place.
+        if !item.carrier && pattern_indexes(pattern) {
+            return None;
+        }
         let mut step: Option<Vec<POut>> = None;
-        let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
+        let matched = super::eval::match_pat(pattern, &item.value, ctx.env, &[], &mut |frame| {
             let child_env = child_scope(frame, ctx.env);
             let child = Ctx {
                 root: ctx.root,
@@ -2785,18 +2789,20 @@ fn run_reduce_path(
     for (index, init_out) in inits.into_iter().enumerate() {
         let null_input = Value::Null;
         let stream_input = if index == 0 { input } else { &null_input };
+        let start_line = line.get();
         let items = match run(stream, stream_input, path, line, input_gen, ctx) {
-            Ok(outs) => outs.into_iter().map(|item| item.value).collect::<Vec<_>>(),
+            Ok(outs) => outs,
             Err(err) => return Err(bare_path(err)),
         };
         if let Some(kept) = kept_place(&init_out, &items, pattern, alts, update, ctx) {
             out.push(kept);
             continue;
         }
-        // The step is not that path. Run it as a value that was not reached
-        // by indexing, so an index names the element. A step that does
-        // produce a value is the reduced result.
-        match reduce_off_path(&init_out.value, &items, pattern, alts, update, path, ctx) {
+        // A plain stream leaves the init in place for the first step, so a
+        // later step names the element of the value that step was given.
+        match reduce_off_path(
+            &init_out, &items, start_line, pattern, alts, update, path, ctx,
+        ) {
             Ok(value) => out.push(constant(value, path, line.get(), ctx.root)),
             Err(err) => return Err(err),
         }
@@ -2814,11 +2820,14 @@ fn bare_path(err: PathErr) -> PathErr {
     }
 }
 
-/// One `reduce` whose steps leave the path. Each update runs as a non-carrier,
-/// so `.[0]` names that element instead of indexing and then failing later.
+/// One `reduce` whose steps leave the path. A stream value reached by
+/// indexing makes the step a non-carrier, so the index names the element.
+/// A plain value does not, so the first step reads the init and a later
+/// step reads the value that previous step produced.
 fn reduce_off_path(
-    init: &Value,
-    items: &[Value],
+    init: &POut,
+    items: &[POut],
+    start_line: u64,
     pattern: &Pattern,
     alts: &[Pattern],
     update: &Filter,
@@ -2832,12 +2841,20 @@ fn reduce_off_path(
     pats.extend(alts);
     let mut acc = init.clone();
     for item in items {
+        let breaks = item.line != start_line || !same_steps(&item.path, path);
         let mut stepped = false;
         for (index, pat) in pats.iter().enumerate() {
             let last = index + 1 == pats.len();
+            if !item.carrier && pattern_indexes(pat) {
+                let err = destructure_near(pat, &item.value, ctx);
+                if err.stop.is_none() && !last {
+                    continue;
+                }
+                return Err(err);
+            }
             let mut body_err: Option<PathErr> = None;
-            let mut produced: Option<Vec<Value>> = None;
-            let matched = super::eval::match_pat(pat, item, ctx.env, &[], &mut |frame| {
+            let mut produced: Option<Vec<POut>> = None;
+            let matched = super::eval::match_pat(pat, &item.value, ctx.env, &[], &mut |frame| {
                 let frame = null_names(frame, &names);
                 let child_env = child_scope(&frame, ctx.env);
                 let child = Ctx {
@@ -2846,10 +2863,15 @@ fn reduce_off_path(
                     env: &child_env,
                     pbinds: ctx.pbinds,
                 };
-                let cell = Cell::new(0);
-                match run(update, &acc, path, &cell, 0, &child) {
+                let gen = if !breaks && acc.carrier {
+                    acc.value_gen
+                } else {
+                    0
+                };
+                let cell = Cell::new(gen);
+                match run(update, &acc.value, &acc.path, &cell, gen, &child) {
                     Ok(outs) => {
-                        produced = Some(outs.into_iter().map(|out| out.value).collect());
+                        produced = Some(outs);
                         Ok(())
                     }
                     Err(err) => {
@@ -2866,8 +2888,11 @@ fn reduce_off_path(
             }
             match matched {
                 Ok(()) => {
-                    let values = produced.unwrap_or_default();
-                    acc = values.last().cloned().unwrap_or(Value::Null);
+                    acc = match produced.unwrap_or_default().pop() {
+                        Some(upd) if upd.carrier && same_steps(&upd.path, &acc.path) => upd,
+                        Some(upd) => constant(upd.value, &acc.path, acc.line, ctx.root),
+                        None => constant(Value::Null, &acc.path, acc.line, ctx.root),
+                    };
                     stepped = true;
                     break;
                 }
@@ -2886,7 +2911,40 @@ fn reduce_off_path(
             break;
         }
     }
-    Ok(acc)
+    Ok(acc.value)
+}
+
+fn pattern_indexes(pat: &Pattern) -> bool {
+    !matches!(pat, Pattern::Var(_))
+}
+
+/// Taking a constant apart is an invalid path. The element named is the
+/// first one jq tries: the last array slot, or the first object field.
+fn destructure_near(pat: &Pattern, value: &Value, ctx: &Ctx) -> PathErr {
+    let line = Cell::new(0);
+    let body = Filter::Identity;
+    let names = Vec::new();
+    let tail = Tail {
+        body: &body,
+        orig_input: value,
+        orig_input_gen: 0,
+        names: &names,
+    };
+    match exec_pattern(
+        pat,
+        value,
+        &[],
+        &line,
+        false,
+        0,
+        &[],
+        Vec::new(),
+        &tail,
+        ctx,
+    ) {
+        Ok(_) => bare(near_access(&Value::Null, value)),
+        Err(err) => err,
+    }
 }
 
 fn run_match_pipe(
@@ -3025,6 +3083,11 @@ fn near_access(elem: &Value, value: &Value) -> String {
         clipped(elem, 14),
         clipped(value, 29)
     )
+}
+
+/// `?` on `]` skips a failed index. It does not skip an invalid path.
+fn skips_failed_index(message: &str) -> bool {
+    !message.starts_with("Invalid path expression")
 }
 
 fn near_iter(value: &Value) -> String {
@@ -3761,7 +3824,7 @@ fn run_at(
         for base_out in bases {
             match index_out(&base_out, key_value, ctx) {
                 Ok(hit) => out.push(hit),
-                Err(message) if optional => {
+                Err(message) if optional && skips_failed_index(&message) => {
                     let _ = message;
                 }
                 Err(message) => {
@@ -5042,7 +5105,7 @@ fn stream_at(
             let sent = stream_paths(base, input, path, line, input_gen, ctx, &mut |base_out| {
                 match index_out(&base_out, key_value, ctx) {
                     Ok(hit) => emit(hit),
-                    Err(message) if optional => {
+                    Err(message) if optional && skips_failed_index(&message) => {
                         let _ = message;
                         Ok(())
                     }

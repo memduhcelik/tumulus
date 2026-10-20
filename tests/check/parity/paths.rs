@@ -1671,3 +1671,37 @@ fn plain_foreach_index_pipe_and_reduce_match_jq() {
         compare_exact(name, &["-n", "-c", "--", program], input);
     }
 }
+
+/// A later `reduce` step names the element of the value it was given.
+/// `?` on an index does not turn that into null. Destructuring a number
+/// that is not the input is an invalid path. jq is asked for each one.
+#[test]
+fn later_reduce_step_optional_and_destructure_match_jq() {
+    require_jq();
+    let programs = [
+        r#"[[1,2],[3]] | (reduce (0,1) as $i (.; .[$i])) = 9"#,
+        r#"[[1,2],[3]] | path(reduce (0,1) as $i (.; .[$i]))"#,
+        r#"[[1,2],[3]] | path(reduce (0,1) as $i (.; .[0]))"#,
+        r#"[0,1,2] | path(reduce (0,1) as $i (.; .[$i]))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .[0]))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .[0]?))"#,
+        r#"[0,1,2] | (reduce .[] as $x (.; .[0]?)) = 9"#,
+        r#"[0,1,2] | path(reduce (0) as $i (.; .[0]?))"#,
+        r#"1 | path(reduce (0) as $i (.; .[0]?))"#,
+        r#"[[1,2],[3]] | path(reduce (0,1) as $i (.; .[$i]?))"#,
+        r#"[0] | (reduce (1) as [$a] (.; .)) = 9"#,
+        r#"[0] | path(reduce (1) as [$a] (.; .))"#,
+        r#"[1,2] | (reduce .[] as [$a] (.; .)) = 9"#,
+        r#"[[1,2]] | path(reduce .[] as [$a] (.; .))"#,
+        r#"[0] | path(reduce ([1,2]) as [$a,$b] (.; .))"#,
+        r#"[0] | path(reduce (1) as {a:$a} (.; .))"#,
+        r#""ab" | path(reduce (0,1) as $i (.; .[$i]))"#,
+        r#"{"a":{"b":1}} | path(reduce ("a","b") as $k (.; .[$k]))"#,
+        r#"[0,1,2] | path(reduce (0) as $i (.; .[0]))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; getpath([0])))"#,
+        r#"[0,1,2] | (reduce .[] as $x (0; . + $x)) = 9"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
