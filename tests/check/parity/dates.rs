@@ -868,17 +868,10 @@ fn compare_date_locale(program: &str, vars: &[(&str, &str)], aliases: Option<&Pa
 }
 
 /// jq aborts when `strftime` is given a number and a format that is not a
-/// string. The message here is the one jq prints for an array. Letters
-/// other than the ones these filters accept are not compared with jq.
+/// string. The message here is the one jq prints for an array.
 #[test]
 fn strftime_letters_are_limited() {
     let cases = [
-        (r#"0 | strftime("%")"#, "strftime does not support %"),
-        (r#"0 | strftime("%Y%")"#, "strftime does not support %"),
-        (r#"0 | strftime("%EY")"#, "strftime does not support %E"),
-        (r#"0 | strftime("%-Y")"#, "strftime does not support %-"),
-        (r#"0 | strftime("%10Y")"#, "strftime does not support %1"),
-        (r#"0 | strftime("%Q%Y")"#, "strftime does not support %Q"),
         (r#"0 | strftime(1)"#, "strftime/1 requires a string format"),
         (
             r#"0 | strftime(null)"#,
@@ -907,35 +900,10 @@ fn strftime_letters_are_limited() {
 
 /// jq aborts when `strflocaltime` converts a number and the format is not a
 /// string, and when that conversion fails. The message is the one jq prints
-/// for an array, or the converting error. Letters other than the ones these
-/// filters accept are not compared with jq.
+/// for an array, or the converting error.
 #[test]
 fn strflocaltime_letters_are_limited() {
     let cases = [
-        (
-            r#"0 | strflocaltime("%")"#,
-            "strflocaltime does not support %",
-        ),
-        (
-            r#"0 | strflocaltime("%Y%")"#,
-            "strflocaltime does not support %",
-        ),
-        (
-            r#"0 | strflocaltime("%EY")"#,
-            "strflocaltime does not support %E",
-        ),
-        (
-            r#"0 | strflocaltime("%-Y")"#,
-            "strflocaltime does not support %-",
-        ),
-        (
-            r#"0 | strflocaltime("%10Y")"#,
-            "strflocaltime does not support %1",
-        ),
-        (
-            r#"0 | strflocaltime("%Q%Y")"#,
-            "strflocaltime does not support %Q",
-        ),
         (
             r#"0 | strflocaltime(1)"#,
             "strflocaltime/1 requires a string format",
@@ -981,36 +949,73 @@ fn strflocaltime_letters_are_limited() {
     }
 }
 
-/// `strptime` rejects the same letters `strftime` rejects. jq would hand
-/// those letters to the C library, so the message is not compared with jq.
+/// `%+`, `%v`, the `-` and `_` flags, the `E` and `O` modifiers, and a
+/// letter jq does not know are handed to the C library. An unknown letter
+/// is printed back. jq is asked for each one.
 #[test]
-fn strptime_letters_are_limited() {
-    let cases = [
-        (r#""1970" | strptime("%")"#, "strptime does not support %"),
-        (r#""1970" | strptime("%Y%")"#, "strptime does not support %"),
-        (
-            r#""1970" | strptime("%Ey")"#,
-            "strptime does not support %E",
-        ),
-        (
-            r#""1970" | strptime("%-y")"#,
-            "strptime does not support %-",
-        ),
-        (
-            r#""1970" | strptime("%3j")"#,
-            "strptime does not support %3",
-        ),
-        (r#""1970" | strptime("%Q")"#, "strptime does not support %Q"),
+fn format_extensions_match_jq() {
+    require_jq();
+    let programs = [
+        r#"0 | strftime("%+")"#,
+        r#"0 | strftime("%v")"#,
+        r#"0 | strftime("%-d")"#,
+        r#"0 | strftime("%_H")"#,
+        r#"0 | strftime("%Ey")"#,
+        r#"0 | strftime("%Od")"#,
+        r#"0 | strftime("%Q")"#,
+        r#"0 | strftime("%Q%Y")"#,
+        r#"0 | strftime("%Y%Q")"#,
+        r#"0 | strftime("%")"#,
+        r#"0 | strftime("%Y%")"#,
+        r#"0 | strftime("%-Y")"#,
+        r#"0 | strftime("%_d")"#,
+        r#"0 | strftime("%0d")"#,
+        r#"0 | strftime("%10Y")"#,
+        r#"0 | strftime("%E")"#,
+        r#"0 | strftime("%O")"#,
+        r#"0 | strftime("%E+")"#,
+        r#"0 | strftime("%EQ")"#,
+        r#"0 | strftime("%OQ")"#,
+        r#"0 | strftime("%v %Q %-d")"#,
+        r#"0 | strftime("pre%+post")"#,
+        r#"1593561600 | strftime("%+ %v %-d %_H %Ey %Od %Q")"#,
+        r#"[1970,0,1,0,0,0,4,0] | strftime("%+ %v %-d %_H %Ey %Od %Q")"#,
+        r#"[2020,8,13,15,4,0,0,256] | strftime("%-d %_H %Ey %Od %v %Q")"#,
+        r#"0 | strflocaltime("%+")"#,
+        r#"0 | strflocaltime("%v")"#,
+        r#"0 | strflocaltime("%-d")"#,
+        r#"0 | strflocaltime("%_H")"#,
+        r#"0 | strflocaltime("%Ey")"#,
+        r#"0 | strflocaltime("%Od")"#,
+        r#"0 | strflocaltime("%Q")"#,
+        r#"1593561600 | strflocaltime("%+ %v %-d %_H %Ey %Od %Q")"#,
+        r#"[1970,0,1,0,0,0,4,0] | strflocaltime("%+ %Q %-d")"#,
+        r#"0 | strftime("%EY")"#,
+        r#"0 | strflocaltime("%")"#,
+        r#"0 | strflocaltime("%Y%")"#,
+        r#"0 | strflocaltime("%EY")"#,
+        r#"0 | strflocaltime("%-Y")"#,
+        r#"0 | strflocaltime("%10Y")"#,
+        r#"0 | strflocaltime("%Q%Y")"#,
+        r#""1970" | strptime("%")"#,
+        r#""1970" | strptime("%Y%")"#,
+        r#""1970" | strptime("%-y")"#,
+        r#""1970" | strptime("%3j")"#,
+        r#"0 | strftime("%Ey") | strptime("%Ey")"#,
+        r#"0 | strftime("%Od") | strptime("%Od")"#,
+        r#"0 | strftime("%+") | strptime("%+")"#,
+        r#"0 | strftime("%v") | strptime("%v")"#,
+        r#"0 | strftime("%-d") | strptime("%-d")"#,
+        r#"0 | strftime("%_H") | strptime("%_H")"#,
+        r#"0 | strftime("%Q") | strptime("%Q")"#,
+        r#""1970" | strptime("%Q")"#,
+        r#""1970" | strptime("%Ey")"#,
+        r#"0 | strftime("%Ex") | strptime("%Ex")"#,
+        r#"0 | strftime("%EC") | strptime("%EC")"#,
+        r#"0 | gmtime | strftime("%+")"#,
     ];
-    for (program, message) in cases {
-        let stderr = format!("jq: error (at <unknown>): {message}\n");
-        assert_rejects(
-            program,
-            &["-n", "-c", "--", program],
-            b"",
-            stderr.as_bytes(),
-            5,
-        );
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
 

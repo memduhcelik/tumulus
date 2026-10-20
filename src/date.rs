@@ -3,10 +3,9 @@
 //!
 //! Broken-down times go through the C library, so each platform agrees
 //! with the jq it ships. Apple's jq then replaces the weekday and yearday
-//! `strptime` stored. `strftime`, `strflocaltime`, and `strptime` accept
-//! `%Y` `%m` `%d` `%H` `%M` `%S` `%Z` `%j` `%a` `%A` `%b` `%B` `%e` `%y`
-//! `%z` `%I` `%p` `%u` `%w` `%s` `%D` `%F` `%T` `%R` `%c` `%C` `%g` `%G`
-//! `%h` `%k` `%l` `%n` `%r` `%t` `%U` `%V` `%W` `%x` `%X` `%P` and `%%`.
+//! `strptime` stored. The format string is handed to that library as
+//! written, including `%+`, `%v`, a `-` or `_` flag, an `E` or `O`
+//! modifier, and a character the library does not know.
 
 use crate::number;
 use crate::value::Value;
@@ -195,7 +194,6 @@ pub(crate) fn strptime_fmt(input: &Value, format: &Value) -> Result<Value, Strin
         _ => return Err("strptime/1 requires string inputs and arguments".to_string()),
     };
     let visible = fmt.split('\0').next().unwrap_or("");
-    check_letters(visible, "strptime")?;
     let mut raw = text.as_bytes().to_vec();
     raw.push(0);
     let mut spec = Vec::with_capacity(visible.len() + 1);
@@ -298,7 +296,6 @@ fn stamp(tm: &mut Tm) -> Result<Value, String> {
 
 fn render(tm: &Tm, format: &str, name: &str) -> Result<Value, String> {
     let visible = format.split('\0').next().unwrap_or("");
-    check_letters(visible, name)?;
     let mut spec = Vec::with_capacity(visible.len() + 1);
     spec.extend_from_slice(visible.as_bytes());
     spec.push(0);
@@ -319,25 +316,6 @@ fn render(tm: &Tm, format: &str, name: &str) -> Result<Value, String> {
     }
     let text = String::from_utf8_lossy(&buf[..wrote]).into_owned();
     Ok(Value::String(text))
-}
-
-fn check_letters(format: &str, filter: &str) -> Result<(), String> {
-    let mut chars = format.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            continue;
-        }
-        match chars.next() {
-            Some(
-                'Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'Z' | 'j' | 'a' | 'A' | 'b' | 'B' | 'e' | 'y'
-                | 'z' | 'I' | 'p' | 'u' | 'w' | 's' | 'D' | 'F' | 'T' | 'R' | 'c' | 'C' | 'g' | 'G'
-                | 'h' | 'k' | 'l' | 'n' | 'r' | 't' | 'U' | 'V' | 'W' | 'x' | 'X' | 'P' | '%',
-            ) => {}
-            Some(other) => return Err(format!("{filter} does not support %{other}")),
-            None => return Err(format!("{filter} does not support %")),
-        }
-    }
-    Ok(())
 }
 
 fn mismatch(text: &str, format: &str) -> String {

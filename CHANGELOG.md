@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+`strftime`, `strflocaltime`, and `strptime` give `%+`, `%v`, a `-` or `_` flag, an `E` or `O` modifier, and any other character after `%` to the host C library. On macOS, `%+` is the date and time, `%v` is the day, abbreviated month, and year, and `%Q` is printed without the percent sign. A trailing `%` is a percent sign. Text that does not match `strptime` is an error and the exit status is 5.
+
 ## 0.11.0
 
 Released on 2026-10-20.
