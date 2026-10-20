@@ -2249,6 +2249,10 @@ fn foreach_one(
             *state = constant(Value::Null, &state.path, state.line, ctx.root);
             return Ok(());
         }
+        // Every update of this step was run on the accumulator as it stood.
+        // A later one must not be judged against an accumulator this loop
+        // already replaced.
+        let origin = state.clone();
         for upd in &updates {
             let ext_gen = if upd.carrier { upd.value_gen } else { 0 };
             let ext_cell = Cell::new(ext_gen);
@@ -2270,10 +2274,12 @@ fn foreach_one(
                     return Ok(());
                 }
             }
-            if upd.carrier && same_steps(&upd.path, &state.path) {
+            if upd.carrier && same_steps(&upd.path, &origin.path) {
                 *state = upd.clone();
+            } else if slice_kept_array(&origin, upd) {
+                *state = origin.clone();
             } else {
-                *state = constant(upd.value.clone(), &state.path, state.line, ctx.root);
+                *state = constant(upd.value.clone(), &origin.path, origin.line, ctx.root);
             }
         }
         Ok(())
@@ -2854,6 +2860,32 @@ fn keeps_place(filter: &Filter) -> bool {
     }
 }
 
+/// A slice of a non-empty array that still holds every element leaves the
+/// accumulator on `before`. `foreach` has already yielded `after`'s path.
+/// An empty array and a string stay results even when the slice spans them.
+fn slice_kept_array(before: &POut, after: &POut) -> bool {
+    let Value::Array(items) = &before.value else {
+        return false;
+    };
+    let len = items.len();
+    if len == 0 || after.path.len() <= before.path.len() {
+        return false;
+    }
+    if !same_steps(&before.path, &after.path[..before.path.len()]) {
+        return false;
+    }
+    after.path[before.path.len()..].iter().all(|step| {
+        let Step::Slice { start, end } = step else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (bound_text(start), bound_text(end)) else {
+            return false;
+        };
+        let (from, to) = slice_range(start.as_deref(), end.as_deref(), len);
+        from == 0 && to == len
+    })
+}
+
 fn same_steps(left: &[Step], right: &[Step]) -> bool {
     left.len() == right.len()
         && left
@@ -3009,6 +3041,7 @@ fn reduce_off_path(
                 Ok(()) => {
                     acc = match produced.unwrap_or_default().pop() {
                         Some(upd) if upd.carrier && same_steps(&upd.path, &acc.path) => upd,
+                        Some(upd) if slice_kept_array(&acc, &upd) => acc.clone(),
                         Some(upd) => constant(upd.value, &acc.path, acc.line, ctx.root),
                         None => constant(Value::Null, &acc.path, acc.line, ctx.root),
                     };

@@ -1830,3 +1830,53 @@ fn brace_after_value_and_reduce_slice_path_match_jq() {
         compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
+
+/// A slice from 0 with no end on a non-empty array leaves that array in
+/// place for the next `reduce` or `foreach` step. The slice is still the
+/// path `foreach` yields. A string and an empty array stay results.
+/// jq is asked for each one.
+#[test]
+fn open_slice_from_zero_in_reduce_and_foreach_matches_jq() {
+    require_jq();
+    let programs = [
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[0:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[0:length]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[0:length+1]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[-5:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[0:][0:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0,1) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0,0) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (0,1,2) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(foreach (0) as $i (.; .[0:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1) as $i (.; .[$i:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,0) as $i (.; .[0:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1) as $i (.; .[0:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1,2) as $i (.; .[$i:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1) as $i (.; .[0:][$i:]; .))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1) as $i (.; .[0:$i+5]; .))"#,
+        r#"[[0,1],[2]] | path(reduce (0) as $i (.; .[0:]))"#,
+        r#"[[0,1],[2]] | path(reduce (0,1) as $i (.; .[$i:]))"#,
+        r#""abcde" | path(reduce (0) as $i (.; .[0:]))"#,
+        r#""abcde" | path(reduce (0,1) as $i (.; .[$i:]))"#,
+        r#""abcde" | path(foreach (0,1) as $i (.; .[$i:]; .))"#,
+        r#"[] | path(reduce (0) as $i (.; .[0:]))"#,
+        r#"[] | path(reduce (0) as $i (.; .[$i:]))"#,
+        r#"[] | path(foreach (0,5) as $i (.; .[$i:]; .))"#,
+        r#"null | path(reduce (0) as $i (.; .[0:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (1) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(reduce (-4) as $i (.; .[$i:]))"#,
+        r#"[0,1,2,3,4] | path(foreach (0,1) as $i (.; .[$i:]; path(.)))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[0:] | .))"#,
+        r#"[nan] | path(reduce (0) as $i (.; .[0:]))"#,
+        r#"[nan] | path(foreach (0,1) as $i (.; .[$i:]; .))"#,
+        r#"[[0,1,2,3,4]] | path(reduce (0) as $i (.; .[0][0:]))"#,
+        r#"{"a":[0,1,2]} | path(reduce (0) as $i (.; .a[0:]))"#,
+        r#"[0,1,2,3,4] | (reduce (0) as $i (.; .[0:])) = 9"#,
+        r#"[0,1,2,3,4] | (reduce (0,1) as $i (.; .[$i:])) = 9"#,
+        r#"[0,1,2,3,4] | (foreach (0,1) as $i (.; .[$i:]; .)) = 9"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}

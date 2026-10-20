@@ -829,6 +829,28 @@ impl LineCursor {
         true
     }
 
+    /// `cut` bytes left the front of the buffer. `base_line` is the newline
+    /// count of the reads that left with them.
+    pub(crate) fn shift(&mut self, cut: usize, base_line: usize) {
+        if cut == 0 {
+            return;
+        }
+        if self.filled > cut {
+            self.filled -= cut;
+            if self.last_start >= cut {
+                self.last_start -= cut;
+            } else {
+                self.last_start = 0;
+            }
+            return;
+        }
+        *self = Self {
+            filled: 0,
+            line: base_line,
+            last_start: 0,
+        };
+    }
+
     pub(crate) fn line_at(&mut self, text: &[u8], end: usize, atom: bool) -> usize {
         let need = if atom && end < text.len() {
             end
@@ -909,6 +931,8 @@ pub(crate) struct Fgets {
     ends: Vec<usize>,
     lines: Vec<u32>,
     at: usize,
+    /// Newlines in reads already dropped from the front of the buffer.
+    base: u32,
 }
 
 impl Fgets {
@@ -917,7 +941,7 @@ impl Fgets {
     /// same read.
     pub(crate) fn push(&mut self, raw: &[u8], eof: bool) {
         let mut at = self.ends.last().copied().unwrap_or(0);
-        let mut line = self.lines.last().copied().unwrap_or(0);
+        let mut line = self.lines.last().copied().unwrap_or(self.base);
         while at < raw.len() {
             let next = read_chunk(raw, at);
             if next == at {
@@ -951,6 +975,47 @@ impl Fgets {
         } else {
             None
         }
+    }
+
+    /// The greatest finished read that ends at or before `limit`.
+    pub(crate) fn prefix_end(&self, limit: usize) -> usize {
+        self.ends
+            .iter()
+            .rposition(|end| *end <= limit)
+            .map(|index| self.ends[index])
+            .unwrap_or(0)
+    }
+
+    /// Forget finished reads at or before `cut`. Later reads stay, shifted.
+    pub(crate) fn discard_prefix(&mut self, cut: usize) {
+        if cut == 0 {
+            return;
+        }
+        let mut drop_n = 0;
+        while drop_n < self.ends.len() && self.ends[drop_n] <= cut {
+            drop_n += 1;
+        }
+        if drop_n > 0 {
+            self.base = self.lines[drop_n - 1];
+        }
+        let mut ends = self.ends.split_off(drop_n);
+        let lines = self.lines.split_off(drop_n);
+        for end in &mut ends {
+            *end -= cut;
+        }
+        self.ends = ends;
+        self.lines = lines;
+        self.at = 0;
+    }
+
+    /// Newlines in the dropped prefix.
+    pub(crate) fn base_line(&self) -> u32 {
+        self.base
+    }
+
+    /// Newlines once every finished read, including a sealed tail, is counted.
+    pub(crate) fn sealed_line(&self) -> u32 {
+        self.lines.last().copied().unwrap_or(self.base)
     }
 }
 
@@ -1054,6 +1119,36 @@ impl EofCut {
         }
         self.open = None;
         self.resume = at;
+    }
+}
+
+impl NulScan {
+    /// A NUL with no newline after it ends input on macOS.
+    pub(crate) fn truncates(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.last_nul.is_some() && !self.nl_after
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// `cut` bytes have left the front of the buffer.
+    pub(crate) fn shift(&mut self, cut: usize) {
+        if cut == 0 {
+            return;
+        }
+        self.checked = self.checked.saturating_sub(cut);
+        if let Some(index) = self.last_nul {
+            if index >= cut {
+                self.last_nul = Some(index - cut);
+            } else {
+                self.last_nul = None;
+                self.nl_after = false;
+            }
+        }
     }
 }
 

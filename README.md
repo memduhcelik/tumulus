@@ -111,7 +111,7 @@ An operator that is given values it cannot use fails the way jq fails, including
 
 `todate` writes a number of seconds since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`. `fromdate` reads that text back into seconds. `gmtime` breaks a number of seconds into `[year, month, day, hour, minute, second, weekday, yearday]` in UTC. `localtime` breaks a number of seconds into that array in local time. The month and the weekday start at 0. `mktime` turns that array back into seconds. `strftime(fmt)` formats a number of seconds in UTC, or that array as written. `strflocaltime(fmt)` formats a number of seconds in local time, or that array as written. `strptime(fmt)` reads text in that format back into the array. `now` is the current number of seconds since the epoch. The format letters are `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%Z`, `%j`, `%a`, `%A`, `%b`, `%B`, `%e`, `%y`, `%z`, `%I`, `%p`, `%u`, `%w`, `%s`, `%D`, `%F`, `%T`, `%R`, `%c`, `%C`, `%g`, `%G`, `%h`, `%k`, `%l`, `%n`, `%r`, `%t`, `%U`, `%V`, `%W`, `%x`, `%X`, `%P`, and `%%`. `%A` and `%B` are the full weekday and month. `%I` is the hour from 01 to 12 and `%p` is the morning or afternoon mark. `%u` counts Monday as 1 and `%w` counts Sunday as 0. `%s` is seconds since the epoch. `%D`, `%F`, `%T`, and `%R` are the short date, the calendar date, the time, and the hour and minute. `%c` is the locale's date and time. `%%` is a percent sign. `%C` is the century. `%g` is the week-based year without the century and `%G` is the week-based year. `%h` is the abbreviated month. `%k` is the hour from 0 to 23 and `%l` is the hour from 1 to 12, each padded with a space. `%n` is a newline and `%t` is a tab. `%r` is the 12-hour clock. `%U` is the week number with Sunday as the first day, `%W` uses Monday, and `%V` is the ISO week. `%x` is the locale's date and `%X` is the locale's time. `%P` follows the host C library. On macOS it is the letter `P`. `%+`, `%v`, a `-` or `_` flag, an `E` or `O` modifier, and any other character after `%` are given to that library too. On macOS, `%+` is the date and time, `%v` is the day, abbreviated month, and year, `%-d` has no padding, `%_H` is padded with a space, `%Ey` and `%Od` are the year in the century and the day, and `%Q` is printed without the percent sign. A trailing `%` is a percent sign. `strptime` reads those same formats. Text that does not match is an error and the exit status is 5. `strftime`, `strflocaltime`, and `strptime` take the locale from `LC_ALL` when that names a locale, otherwise from `LC_TIME`, otherwise from `LANG`. A name the system does not have leaves the C locale. A value of the wrong kind fails the way jq fails, and the exit status is 5.
 
-`=` writes a value through a path. `|=` runs a filter on the value there and writes the first result back. No result removes that place, which is also what `del(path)` does. `+=`, `-=`, `*=`, `/=`, `%=`, and `//=` combine the value already there with the right-hand side. A path is a field, an index, a slice, or iteration. It can go through `|`, `,`, `select`, `//`, `if`, and `as`. A destructuring `as`, such as `as [$a]` or `as {a:$a}`, is not a path back to the input. `.[0] as [$a]` and `.[] as [$a]` are an invalid path on the value that index reached. `(. as [$a,$b] | .[1:3])` names element `0`. Each further name names the next element, so three names name element `1`. An object pattern with two or more fields names the second field. A `?//` alternative is tried when that slice fails, so `(. as [$a] ?// $v | .[1:3]) = ["q"]` writes the slice. `foreach .[] as $x (.; .)` is not a path. `foreach (0,1) as $x (.; .)` is the input's path, once for each value. `first`, `limit`, and `label` on the left of an update take one place before a later slice bound runs. A `reduce` whose steps leave the value where it started is that path. `(reduce .[] as $x (.; .)) = 9` replaces the input. A step that indexes somewhere else fails at that element. `path(reduce .[] as $x (.; .[0]))` names element `0` of the input. A later step names the element of the value that step was given: `(reduce (0,1) as $i (.; .[$i]))` on `[[1,2],[3]]` names element `1` of `[1,2]`. `.[0]?` in that step still names the element. `reduce (1) as [$a]` names element `0` of `1`. `reduce (1) as [$a] ?// $v (.; .)` keeps that input path. `foreach (1) as [$a] ?// $v (.; .)` keeps it too, so the assignment writes `9`. `foreach (1) as [$a]` is an invalid path. `.["a"]?` in a step names element `"a"`. `(.["a"])?` does not. `and`, `or`, and a matching `null`, `true`, or `false` stay paths when they do in jq. An update that lands on the wrong kind of value fails the way jq fails, and the exit status is 5.
+`=` writes a value through a path. `|=` runs a filter on the value there and writes the first result back. No result removes that place, which is also what `del(path)` does. `+=`, `-=`, `*=`, `/=`, `%=`, and `//=` combine the value already there with the right-hand side. A path is a field, an index, a slice, or iteration. It can go through `|`, `,`, `select`, `//`, `if`, and `as`. A destructuring `as`, such as `as [$a]` or `as {a:$a}`, is not a path back to the input. `.[0] as [$a]` and `.[] as [$a]` are an invalid path on the value that index reached. `(. as [$a,$b] | .[1:3])` names element `0`. Each further name names the next element, so three names name element `1`. An object pattern with two or more fields names the second field. A `?//` alternative is tried when that slice fails, so `(. as [$a] ?// $v | .[1:3]) = ["q"]` writes the slice. `foreach .[] as $x (.; .)` is not a path. `foreach (0,1) as $x (.; .)` is the input's path, once for each value. `first`, `limit`, and `label` on the left of an update take one place before a later slice bound runs. A `reduce` whose steps leave the value where it started is that path. `(reduce .[] as $x (.; .)) = 9` replaces the input. A step that indexes somewhere else fails at that element. `path(reduce .[] as $x (.; .[0]))` names element `0` of the input. A later step names the element of the value that step was given: `(reduce (0,1) as $i (.; .[$i]))` on `[[1,2],[3]]` names element `1` of `[1,2]`. A slice from 0 with no end on a non-empty array leaves that array where it started. `path(reduce (0) as $i (.; .[$i:]))` on `[0,1,2,3,4]` is `[]`. `path(reduce (0,1) as $i (.; .[$i:]))` names the result `[1,2,3,4]`. `path(foreach (0,1) as $i (.; .[$i:]; .))` is a path for each step. A string and an empty array stay results. `.[0]?` in that step still names the element. `reduce (1) as [$a]` names element `0` of `1`. `reduce (1) as [$a] ?// $v (.; .)` keeps that input path. `foreach (1) as [$a] ?// $v (.; .)` keeps it too, so the assignment writes `9`. `foreach (1) as [$a]` is an invalid path. `.["a"]?` in a step names element `"a"`. `(.["a"])?` does not. `and`, `or`, and a matching `null`, `true`, or `false` stay paths when they do in jq. An update that lands on the wrong kind of value fails the way jq fails, and the exit status is 5.
 
 Each side of a slice is an expression, so a variable, arithmetic, or a call works there. `.[$i:]`, `.[:length-1]`, and `.[index("b"):]` read, assign, and delete the way a written number does. An object in the brackets, `.[ {start:1, end:3} ]`, is that same slice when both `start` and `end` are present. Null on either side is the omitted bound. A later repeated name wins. Any other object fails with `Array/string slice indices must be integers` on an array or a string. On null it is null. On any other value it fails with `Cannot index ... with object`. The bounds are run on the value the brackets were applied to, and the value before the brackets is sliced once for every combination. A comma on one side runs every combination, the start varying slowest. Reading yields one slice of the original value for each combination. Assignment applies those slices from left to right on the array as it changes. When one of them cannot be written, a later bound is not run. `try (.[1,(input):] = 9) catch input` reads the next input in `catch`. `del` on a string still runs a later bound, and a bound error replaces `Cannot delete fields from string`. `del` on an array removes slices from the original positions. A bound that is not a number or null fails with `Array/string slice indices must be integers` on an array or a string. On null, that check waits until the value is written.
 
@@ -119,7 +119,7 @@ Each side of a slice is an expression, so a variable, arithmetic, or a call work
 
 `tostream` writes the input as a stream of paths. A scalar, or an empty array or object, is one pair of the path and the value. Any other array or object is the stream of what is inside it, then one closer, the path of its last child. `nan` is still a number and prints as `null`. `fromstream(stream)` builds values back from that stream. The argument is the stream, and the filter's own input is ignored. A pair whose path is empty is emitted at once and replaces whatever was being built. A closer whose path has one component emits the value so far and the next item starts over. A closer with any other path does not emit. An item that is not a two-element array is a closer, and its first element is the path. A value with no closer and no empty path is not emitted. `truncate_stream(stream)` keeps each item whose path is longer than the input, and drops that many components from the front of the path. The argument runs on `null`, not on the input. The wrong kind of value fails the way jq fails, and the exit status is 5.
 
-`--stream` reads input as those path items, including items that were finished before a value was cut off. A finished item is printed while the rest of the input is still being read. A repeated object key is kept each time it appears. `-s` gathers the items into one array. It still runs the program on a cut-off input when that input ends on a comma and every item is a scalar pair. When the input does not end in whitespace and the last closer names a scalar, a runtime error for that closer is reported at `<unknown>`. With `-s`, that closer is its own value and the other items are the array. `-R` still reads lines. `-n` still starts from `null`, and `input` or `inputs` then reads the items. The first item is the main input unless `-n` is set. `--stream` does not stop at a nesting depth of 256. `--stream-errors` parses the same way and, where `--stream` would stop with a parse error, hands the program one more value, `[message, path]`, and keeps reading. With `--seq`, that value replaces the ignored parse error. A cut-off number stays the stream item for that number. The exit status is 0 unless the program itself fails. On macOS, a NUL with no newline after it ends the JSON input, and the bytes after it are ignored. On Linux, and on macOS when a newline does follow, a NUL ends the token before it and the bytes up to the next delimiter are not part of that value. A number keeps the text before the NUL. `true`, `false`, `null`, and a token that starts on a NUL do not. `-R` still keeps the byte.
+`--stream` reads input as those path items, including items that were finished before a value was cut off. Bytes already parsed are dropped, so a large file stays a few megabytes. A finished item is printed while the rest of the input is still being read. A repeated object key is kept each time it appears. `-s` gathers the items into one array. It still runs the program on a cut-off input when that input ends on a comma and every item is a scalar pair. When the input does not end in whitespace and the last closer names a scalar, a runtime error for that closer is reported at `<unknown>`. With `-s`, that closer is its own value and the other items are the array. `-R` still reads lines. `-n` still starts from `null`, and `input` or `inputs` then reads the items. The first item is the main input unless `-n` is set. `--stream` does not stop at a nesting depth of 256. `--stream-errors` parses the same way and, where `--stream` would stop with a parse error, hands the program one more value, `[message, path]`, and keeps reading. With `--seq`, that value replaces the ignored parse error. A cut-off number stays the stream item for that number. The exit status is 0 unless the program itself fails. On macOS, a NUL with no newline after it ends the JSON input, and the bytes after it are ignored. On Linux, and on macOS when a newline does follow, a NUL ends the token before it and the bytes up to the next delimiter are not part of that value. A number keeps the text before the NUL. `true`, `false`, `null`, and a token that starts on a NUL do not. `-R` still keeps the byte.
 
 `limit(n; expr)` keeps values from `expr`. A count of 0 keeps nothing and does not run `expr`. A negative count, `nan`, `null`, or a boolean keeps the whole stream. A positive finite count keeps the ceiling of that many and stops before a later value is run. A count that is not a number fails when it is subtracted from, unless the stream fails first. `first` is `.[0]` and `last` is `.[-1]`. `nth(n)` is `.[n]`. `first(expr)` is the first value of `expr` and does not run the rest. `last(expr)` is the last value, or `null` when there is none. `nth(n; expr)` picks one value. A negative `n`, `nan`, `null`, or a boolean fails with `nth doesn't support negative indices`. Past the end of the stream there is no value. `range(to)` counts from 0 up to but not including `to`. `range(from; to)` steps by 1. `range(from; to; step)` uses that step. A step of 0 yields nothing. A bound that is not a number fails with `Range bounds must be numeric`. With one or two arguments, an end of `nan` does not stop the count. `until(cond; next)` yields the value once `cond` is truthy. `while(cond; update)` yields the value while `cond` is truthy, then applies `update`. Each result of a condition or an update is its own branch. `repeat(expr)` runs `expr` on the original input, then repeats. `first`, `last`, `nth(n)`, `first(expr)`, `nth(n; expr)`, and `limit(n; expr)` are paths when the value they select was reached through the input. Setting a `nan` index fails with `Cannot set array element at NaN index`. The exit status is 5.
 
@@ -177,35 +177,35 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 2.03 | 0.75 | 2.05 | 0.89 |
-| 2 | 2.00 | 0.74 | 2.05 | 0.89 |
-| 3 | 1.98 | 0.75 | 2.08 | 0.91 |
+| 1 | 1.85 | 0.70 | 2.04 | 0.72 |
+| 2 | 1.89 | 0.71 | 2.03 | 0.72 |
+| 3 | 1.90 | 0.71 | 2.00 | 0.72 |
 
-`--stream -c .`, `-sc .`, `-Rc .`, `-nc inputs`, and `--seq -c .` were timed the same way on that file. Stdout and stderr matched. `--stream -c .` wrote 90029174 bytes. `-sc .` wrote 72727818 bytes. `-Rc .` wrote 83184148 bytes. `-nc inputs` wrote 72727816 bytes. `--seq -c .` wrote no values. Both programs print `jq: ignoring parse error: Unfinished abandoned text at EOF at line 300001, column 0`.
+`--stream -c .`, `-sc .`, `-Rc .`, `-nc inputs`, and `--seq -c .` were timed the same way on that file. Stdout and stderr matched. `--stream -c .` wrote 90029174 bytes. `-sc .` wrote 72727818 bytes. `-Rc .` wrote 83184148 bytes. `-nc inputs` wrote 72727816 bytes. `--seq -c .` wrote no values. It prints `jq: ignoring parse error: Unfinished abandoned text at EOF at line 300001, column 0`. The other four wrote nothing on stderr.
 
 | run | `jq --stream -c .` | `tumulus --stream -c .` |
 | --- | ---: | ---: |
-| 1 | 2.89 | 2.33 |
-| 2 | 2.87 | 2.36 |
-| 3 | 2.90 | 2.32 |
+| 1 | 2.71 | 2.27 |
+| 2 | 2.75 | 2.26 |
+| 3 | 2.76 | 2.26 |
 
 | run | `jq -sc .` | `tumulus -sc .` |
 | --- | ---: | ---: |
-| 1 | 2.00 | 1.36 |
-| 2 | 1.99 | 1.36 |
-| 3 | 1.99 | 1.34 |
+| 1 | 1.95 | 1.13 |
+| 2 | 1.94 | 1.15 |
+| 3 | 1.96 | 1.13 |
 
 | run | `jq -Rc .` | `tumulus -Rc .` |
 | --- | ---: | ---: |
-| 1 | 1.70 | 0.29 |
-| 2 | 1.70 | 0.28 |
-| 3 | 1.71 | 0.28 |
+| 1 | 1.67 | 0.28 |
+| 2 | 1.66 | 0.29 |
+| 3 | 1.67 | 0.28 |
 
 | run | `jq -nc inputs` | `tumulus -nc inputs` |
 | --- | ---: | ---: |
-| 1 | 2.00 | 0.87 |
-| 2 | 2.01 | 0.87 |
-| 3 | 1.96 | 0.88 |
+| 1 | 1.96 | 0.71 |
+| 2 | 1.97 | 0.71 |
+| 3 | 1.95 | 0.71 |
 
 | run | `jq --seq -c .` | `tumulus --seq -c .` |
 | --- | ---: | ---: |
@@ -217,49 +217,49 @@ These times are from one machine: an Apple M4 Pro, 12 CPUs, 25769803776 bytes of
 
 | run | `jq -c .` | `tumulus -c .` | `jq .` | `tumulus .` |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 3.71 | 1.23 | 7.45 | 1.33 |
-| 2 | 3.66 | 1.23 | 7.37 | 1.35 |
-| 3 | 3.68 | 1.24 | 7.44 | 1.34 |
+| 1 | 3.66 | 1.20 | 7.27 | 1.32 |
+| 2 | 3.66 | 1.20 | 7.22 | 1.33 |
+| 3 | 3.57 | 1.21 | 7.25 | 1.33 |
 
-The same five commands were timed on that file. Stdout and stderr matched. `--stream -c .` wrote 837003618 bytes. `-sc .` wrote 169215415 bytes. `-Rc .` wrote 200823780 bytes. `-nc inputs` wrote 169215413 bytes. `--seq -c .` wrote no values. `--stream -c .` wrote nothing on stderr.
+The same five commands were timed on that file. Stdout and stderr matched. `--stream -c .` wrote 837003618 bytes. `-sc .` wrote 169215415 bytes. `-Rc .` wrote 200823780 bytes. `-nc inputs` wrote 169215413 bytes. `--seq -c .` wrote no values. It prints `jq: ignoring parse error: Unfinished abandoned text at EOF at line 413126, column 0`. `--stream -c .` wrote nothing on stderr.
 
 | run | `jq --stream -c .` | `tumulus --stream -c .` |
 | --- | ---: | ---: |
-| 1 | 18.98 | 11.15 |
-| 2 | 19.05 | 11.30 |
-| 3 | 19.09 | 11.39 |
+| 1 | 18.83 | 11.31 |
+| 2 | 18.84 | 11.29 |
+| 3 | 18.66 | 11.35 |
 
 | run | `jq -sc .` | `tumulus -sc .` |
 | --- | ---: | ---: |
-| 1 | 3.64 | 2.13 |
-| 2 | 3.65 | 2.13 |
-| 3 | 3.64 | 2.14 |
+| 1 | 3.70 | 2.10 |
+| 2 | 3.65 | 2.12 |
+| 3 | 3.64 | 2.10 |
 
 | run | `jq -Rc .` | `tumulus -Rc .` |
 | --- | ---: | ---: |
-| 1 | 4.16 | 0.60 |
-| 2 | 4.04 | 0.60 |
-| 3 | 3.99 | 0.62 |
+| 1 | 3.97 | 0.59 |
+| 2 | 3.91 | 0.62 |
+| 3 | 4.01 | 0.58 |
 
 | run | `jq -nc inputs` | `tumulus -nc inputs` |
 | --- | ---: | ---: |
-| 1 | 3.65 | 1.23 |
-| 2 | 3.64 | 1.23 |
-| 3 | 3.68 | 1.23 |
+| 1 | 3.71 | 1.23 |
+| 2 | 3.73 | 1.23 |
+| 3 | 3.65 | 1.24 |
 
 | run | `jq --seq -c .` | `tumulus --seq -c .` |
 | --- | ---: | ---: |
-| 1 | 0.43 | 0.06 |
-| 2 | 0.43 | 0.06 |
-| 3 | 0.43 | 0.09 |
+| 1 | 0.42 | 0.09 |
+| 2 | 0.42 | 0.09 |
+| 3 | 0.42 | 0.09 |
 
 `[.features[] | select(.properties.STREET == "UNKNOWN")] | length` reads that same file and prints `2843`. Compact and pretty printing of that number are the same text, so these runs used `-c`.
 
 | run | `jq -c` | `tumulus -c` |
 | --- | ---: | ---: |
-| 1 | 1.68 | 1.33 |
-| 2 | 1.69 | 1.32 |
-| 3 | 1.71 | 1.32 |
+| 1 | 1.76 | 1.12 |
+| 2 | 1.77 | 1.10 |
+| 3 | 1.78 | 1.10 |
 
 Times are seconds.
 

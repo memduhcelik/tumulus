@@ -296,6 +296,10 @@ struct Chunk {
     fgets: Fgets,
     /// End-of-file read already passed in `raw`. Later values continue from here.
     cut: EofCut,
+    /// A byte of this file was read. Compaction may leave `raw` empty.
+    saw_byte: bool,
+    /// The last byte dropped from the front of `raw` was a newline.
+    boundary_nl: bool,
 }
 
 struct Item {
@@ -380,6 +384,8 @@ struct Session {
     last_end: Option<(usize, usize)>,
     /// NUL search already done over the prefix of `buf`.
     nul: NulScan,
+    /// A newline was in a prefix `--stream` has already dropped.
+    saw_nl: bool,
 }
 
 enum SeqQueued {
@@ -463,6 +469,7 @@ impl Session {
             cut_at_eof: false,
             last_end: None,
             nul: NulScan::default(),
+            saw_nl: false,
         }
     }
 
@@ -773,6 +780,7 @@ impl Session {
         loop {
             self.pull_available();
             self.release();
+            self.compact_stream();
             if !self.pending.is_empty() || self.fault.is_some() {
                 return Ok(true);
             }
@@ -819,7 +827,7 @@ impl Session {
         };
         if self.stream_errors {
             let unknown = message.starts_with("Unfinished JSON term at EOF")
-                && !self.buf[..end].contains(&b'\n')
+                && self.no_newline_yet(end)
                 && !matches!(self.buf[..end].last(), Some(b' ' | b'\t' | b'\n' | b'\r'))
                 && (self.prev.is_some() || !self.staging.is_empty() || !self.pending.is_empty());
             let path = Value::array(out.path);
@@ -848,7 +856,7 @@ impl Session {
         let unknown = out.incomplete
             && prior
             && message.starts_with("Unfinished JSON term at EOF")
-            && !visible.contains(&b'\n')
+            && self.no_newline_yet(end)
             && !matches!(visible.last(), Some(b' ' | b'\t' | b'\n' | b'\r'));
         self.fault = Some(Fault {
             message,
@@ -1119,9 +1127,7 @@ impl Session {
             let n = read.map_err(|err| format!("cannot read {name}: {err}"))?;
             if n == 0 {
                 if let Some(index) = self.live_chunk {
-                    let name = self.chunks[index].name.clone();
-                    let raw = self.chunks[index].raw.clone();
-                    self.remember(&name, &raw);
+                    self.remember_stream(index);
                 }
                 self.live = None;
                 self.live_chunk = None;
@@ -1175,15 +1181,125 @@ impl Session {
                 lines: LineCursor::default(),
                 fgets,
                 cut: EofCut::default(),
+                saw_byte: !bytes.is_empty(),
+                boundary_nl: false,
             });
             self.live_chunk = Some(self.chunks.len() - 1);
+            #[cfg(test)]
+            note_stream_hold(&self.buf, &self.chunks);
             return;
         }
         let index = self.live_chunk.expect("live chunk");
         self.chunks[index].raw.extend_from_slice(bytes);
+        if !bytes.is_empty() {
+            self.chunks[index].saw_byte = true;
+        }
         let chunk = &mut self.chunks[index];
         chunk.fgets.push(&chunk.raw, false);
         self.buf.extend_from_slice(bytes);
+        #[cfg(test)]
+        note_stream_hold(&self.buf, &self.chunks);
+    }
+
+    /// The whole input has no newline yet. A dropped prefix counts.
+    fn no_newline_yet(&self, end: usize) -> bool {
+        !self.saw_nl && !self.buf[..end].contains(&b'\n')
+    }
+
+    /// Drop parsed bytes once a finished read is well behind the window.
+    ///
+    /// The cut is a finished fgets read, so the next read starts on the same
+    /// boundary and line numbers keep counting. Slurp, raw input, `--seq`,
+    /// a second file, a BOM, and a NUL that ends the input keep the buffer.
+    fn compact_stream(&mut self) {
+        const WINDOW: usize = 64 * 1024;
+        if self.input_eof
+            || self.fault.is_some()
+            || !self.stream
+            || self.raw
+            || self.slurp
+            || self.seq
+        {
+            return;
+        }
+        if self.chunks.len() != 1 || self.nul.truncates() {
+            return;
+        }
+        let cut = {
+            let chunk = &self.chunks[0];
+            if chunk.bom != 0 || chunk.parse_start != 0 || chunk.raw.len() != self.buf.len() {
+                return;
+            }
+            let mut limit = self.drive.index.min(self.buf.len());
+            for item in &self.staging {
+                limit = limit.min(item.end);
+            }
+            // A staged item has not been given a line yet. Keep the read
+            // that contains its end.
+            if !self.staging.is_empty() {
+                limit = limit.saturating_sub(1);
+            }
+            chunk.fgets.prefix_end(limit)
+        };
+        if cut < WINDOW || cut > self.buf.len() || cut > self.drive.index {
+            return;
+        }
+        if self.staging.iter().any(|item| item.end < cut) {
+            return;
+        }
+        self.apply_stream_cut(cut);
+    }
+
+    fn apply_stream_cut(&mut self, cut: usize) {
+        let boundary_nl = self.chunks[0].raw.get(cut - 1) == Some(&b'\n');
+        self.chunks[0].fgets.discard_prefix(cut);
+        let base_line = self.chunks[0].fgets.base_line();
+        if base_line > 0 {
+            self.saw_nl = true;
+        }
+        self.chunks[0].boundary_nl = boundary_nl;
+        self.chunks[0].lines.shift(cut, base_line as usize);
+        self.chunks[0].cut = EofCut::default();
+        take_tail(&mut self.chunks[0].raw, cut);
+        if let Some((_, raw_end)) = self.last_end.as_mut() {
+            if *raw_end <= cut {
+                self.last_end = None;
+            } else {
+                *raw_end -= cut;
+            }
+        }
+        take_tail(&mut self.buf, cut);
+        self.nul.shift(cut);
+        self.drive.index -= cut;
+        for item in &mut self.staging {
+            item.end -= cut;
+        }
+        if let Some((at, _)) = self.staged.as_mut() {
+            if *at >= cut {
+                *at -= cut;
+            }
+        }
+        #[cfg(test)]
+        note_stream_hold(&self.buf, &self.chunks);
+    }
+
+    /// Line count for a file `--stream` may already have trimmed.
+    fn remember_stream(&mut self, index: usize) {
+        let chunk = &mut self.chunks[index];
+        chunk.fgets.push(&chunk.raw, true);
+        let line = chunk.fgets.sealed_line() as usize;
+        let ended_nl = match chunk.raw.last() {
+            Some(&byte) => byte == b'\n',
+            None => chunk.boundary_nl,
+        };
+        let any_byte = chunk.saw_byte;
+        let name = chunk.name.clone();
+        self.cur = Some(Cur {
+            name,
+            line,
+            any_byte,
+            ended_nl,
+        });
     }
 
     fn append_whole(&mut self) -> Result<More, String> {
@@ -1211,6 +1327,7 @@ impl Session {
                     let bom = if self.raw { 0 } else { bom };
                     let parse_start = self.buf.len();
                     self.buf.extend_from_slice(&bytes[bom..]);
+                    let saw_byte = !bytes.is_empty();
                     self.chunks.push(Chunk {
                         name,
                         parse_start,
@@ -1219,6 +1336,8 @@ impl Session {
                         lines: LineCursor::default(),
                         fgets: Fgets::default(),
                         cut: EofCut::default(),
+                        saw_byte,
+                        boundary_nl: false,
                     });
                     return Ok(More::Added);
                 }
@@ -1415,6 +1534,26 @@ impl Chunk {
 }
 
 #[cfg(test)]
+thread_local! {
+    static STREAM_HOLD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_stream_hold(buf: &Vec<u8>, chunks: &[Chunk]) {
+    let raw = chunks
+        .iter()
+        .map(|chunk| chunk.raw.capacity())
+        .max()
+        .unwrap_or(0);
+    let hold = buf.capacity().max(raw);
+    STREAM_HOLD.with(|cell| {
+        if hold > cell.get() {
+            cell.set(hold);
+        }
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -1468,6 +1607,58 @@ mod tests {
             body.len()
         );
     }
+
+    /// Parsed bytes are dropped, so a file larger than the window does not
+    /// stay in the buffer.
+    #[test]
+    fn stream_drops_a_parsed_prefix() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("stream-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wide.json");
+        let mut body = Vec::new();
+        while body.len() < 1024 * 1024 {
+            body.extend_from_slice(b"0\n");
+        }
+        std::fs::write(&path, &body).expect("temp file");
+        let path = path.to_str().expect("temp path").to_string();
+        super::STREAM_HOLD.with(|cell| cell.set(0));
+        let output = crate::execute(
+            &[
+                "tumulus".to_string(),
+                "-c".to_string(),
+                "--stream".to_string(),
+                "empty".to_string(),
+                path,
+            ],
+            b"",
+        );
+        let hold = super::STREAM_HOLD.with(|cell| cell.get());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            output.code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(
+            hold < 512 * 1024,
+            "stream kept {hold} bytes of a {} byte file",
+            body.len()
+        );
+    }
+}
+
+fn take_tail(buf: &mut Vec<u8>, cut: usize) {
+    if cut == 0 || cut > buf.len() {
+        return;
+    }
+    let mut tail = Vec::with_capacity(buf.len() - cut + 8192);
+    tail.extend_from_slice(&buf[cut..]);
+    *buf = tail;
 }
 
 fn with<T>(read: impl FnOnce(&Session) -> T) -> Option<T> {
