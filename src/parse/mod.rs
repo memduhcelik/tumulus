@@ -178,7 +178,9 @@ fn seq_fault(message: impl Into<String>, at: usize) -> SeqItem {
 }
 
 /// `application/json-seq`. Bytes before the first ASCII RS are skipped.
-/// A value cut off by RS is dropped. An input with no RS is abandoned text.
+/// A value cut off by the next separator is reported. An input with no RS
+/// is abandoned text. A final record with no newline, after one that had
+/// a newline, is dropped unless the caller is slurping.
 pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
     // A record with no newline is dropped once an earlier record had one,
     // unless the caller is slurping. `-s` reports that record instead.
@@ -219,8 +221,10 @@ pub(crate) fn parse_seq_keep(bytes: &[u8], keep_short: bool) -> Vec<SeqItem> {
         }
         let ended_by_rs = index < bytes.len() && bytes[index] == b'\x1e';
         let chunk = &bytes[start..index];
-        // A record with no newline, after an earlier newline, is discarded.
-        if saw_newline && !chunk_newline && !keep_short {
+        // A record with no newline is dropped only at the real end, after
+        // an earlier record that had one. One cut off by the next separator
+        // is reported.
+        if saw_newline && !chunk_newline && !keep_short && !ended_by_rs {
             continue;
         }
         saw_newline |= chunk_newline;
@@ -254,8 +258,8 @@ pub(crate) enum SeqLayout {
     Records(Vec<SeqRecord>),
 }
 
-/// The same record split `parse_seq` uses. A record with no newline, after
-/// one that had a newline, is left out.
+/// The same record split `parse_seq` uses. A final record with no newline,
+/// after one that had a newline, is left out unless `keep_short` is set.
 pub(crate) fn seq_layout_keep(bytes: &[u8], keep_short: bool) -> SeqLayout {
     let mut index = 0;
     let mut line = 1usize;
@@ -287,7 +291,7 @@ pub(crate) fn seq_layout_keep(bytes: &[u8], keep_short: bool) -> SeqLayout {
             index += 1;
         }
         let ended_by_rs = index < bytes.len() && bytes[index] == b'\x1e';
-        if saw_newline && !has_newline && !keep_short {
+        if saw_newline && !has_newline && !keep_short && !ended_by_rs {
             continue;
         }
         saw_newline |= has_newline;
@@ -477,7 +481,8 @@ fn push_chunk(
                         } else {
                             format!("Truncated value at line {end_line}, column {column}")
                         };
-                        items.push(seq_fault(phrase, origin + chunk.len()));
+                        // The separator that cut the value off is the noticed byte.
+                        items.push(seq_fault(phrase, origin + chunk.len() + 1));
                     } else if matches!(value, Value::Number(_)) {
                         items.push(seq_fault(
                             format!(
@@ -505,7 +510,7 @@ fn push_chunk(
             let column = end_column + 1;
             items.push(seq_fault(
                 format!("Truncated value at line {end_line}, column {column}"),
-                origin + chunk.len(),
+                origin + chunk.len() + 1,
             ));
             return;
         }

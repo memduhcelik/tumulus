@@ -186,7 +186,7 @@ pub(crate) enum RecEvent {
 
 /// Scan one record. `line` and `column` already count the record separator.
 /// A number at the end of the record is a value. An unfinished container
-/// cut off by RS is `Truncated value` unless the record contains a newline.
+/// cut off by RS is `Truncated value`, and items read before the cut stay.
 pub(crate) fn scan_seq_record(
     chunk: &[u8],
     line: usize,
@@ -223,9 +223,6 @@ pub(crate) fn scan_seq_record(
             break;
         }
         let unfinished = error.ran_out();
-        if ended_by_rs && unfinished && chunk.contains(&b'\n') {
-            break;
-        }
         let message = if ended_by_rs && unfinished {
             format!(
                 "Truncated value at line {end_line}, column {}",
@@ -240,18 +237,24 @@ pub(crate) fn scan_seq_record(
             }
         };
         let unknown = error_is_unknown(&message, chunk, prior);
+        // The separator is the byte that cut the value off.
+        let at = if ended_by_rs && unfinished {
+            chunk.len() + 1
+        } else {
+            scanned.error_at
+        };
         if errors {
             prior = true;
             out.push(RecEvent::Item {
                 value: error_value(&message, &scanned.path),
-                end: scanned.error_at,
+                end: at,
                 atom: false,
                 failure: true,
             });
         } else {
             out.push(RecEvent::Soft {
                 message,
-                at: scanned.error_at,
+                at,
                 unknown,
             });
         }

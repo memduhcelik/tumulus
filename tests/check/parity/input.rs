@@ -742,6 +742,52 @@ fn seq_names_inputs_and_stream_errors_match_jq() {
     );
 }
 
+/// A record cut off by the next separator is reported, even after a
+/// finished record. `--stream` keeps items read before the cut.
+#[test]
+fn seq_record_cut_by_next_separator_matches_jq() {
+    require_jq();
+    let cut = b"\x1e1\n\x1e{\"a\":\x1e2\n";
+    compare_exact("plain", &["--seq", "-c", "."], cut);
+    compare_exact("stream", &["--stream", "--seq", "-c", "."], cut);
+    compare_exact("errors", &["--stream-errors", "--seq", "-c", "."], cut);
+    compare_exact("inputs", &["-n", "--seq", "-c", "inputs"], cut);
+    let array = b"\x1e1\n\x1e[1,\x1e2\n";
+    compare_exact("array plain", &["--seq", "-c", "."], array);
+    compare_exact("array stream", &["--stream", "--seq", "-c", "."], array);
+    compare_exact(
+        "array errors",
+        &["--stream-errors", "--seq", "-c", "."],
+        array,
+    );
+    let with_nl = b"\x1e1\n\x1e[1,\n\x1e2\n";
+    compare_exact("newline plain", &["--seq", "-c", "."], with_nl);
+    compare_exact("newline stream", &["--stream", "--seq", "-c", "."], with_nl);
+    compare_exact(
+        "newline errors",
+        &["--stream-errors", "--seq", "-c", "."],
+        with_nl,
+    );
+    let (dir, _guard) = scratch("seq-next-record");
+    let head = write_bytes(&dir, "head.seq", b"\x1e1\n\x1e2");
+    let tail = write_bytes(&dir, "tail.seq", b"\x1e3\n");
+    compare_exact(
+        "number ended by the next file",
+        &["--seq", "-c", ".", &head, &tail],
+        b"",
+    );
+    compare_exact(
+        "number ended by the next file is an input error",
+        &["-n", "--seq", "-c", "inputs", &head, &tail],
+        b"",
+    );
+    compare_exact(
+        "stream keeps that number",
+        &["--stream", "--seq", "-c", ".", &head, &tail],
+        b"",
+    );
+}
+
 #[test]
 fn inputs_span_files_match_jq() {
     require_jq();

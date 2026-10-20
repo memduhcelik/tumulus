@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A `--seq` value cut off by the next record separator is reported, including after a record that was already complete. The main loop prints `Truncated value`, or `Potentially truncated top-level numeric value` for a number, and keeps the values around the cut. That warning is printed when the separator is the first byte of the next file. `input` and `inputs` raise it. `--stream` keeps items read before the cut, and keeps the cut-off number. `--stream-errors` gives the program `[message, path]`.
+
 `input_filename` under `--seq` is the file that holds the value's last byte. Standard input is named `<stdin>`.
 
 `input` and `inputs` raise a `--seq` parse error. A number cut off at the end of the last file is that error, and the exit status is 5. The main loop still prints `jq: ignoring parse error` and keeps reading.
