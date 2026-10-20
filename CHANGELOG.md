@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
+
+Released on 2026-10-20.
 
 On macOS, `--stream` reads a file in one pass again. A NUL with no newline after it still ends the input there. Items are unchanged, including an item printed before the input has ended.
 
