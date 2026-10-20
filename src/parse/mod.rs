@@ -161,12 +161,31 @@ fn nul_cut_at(bytes: &[u8]) -> usize {
 /// One JSON text from a `--seq` input, or an error jq ignores and keeps reading.
 pub enum SeqItem {
     Value(LocatedValue),
-    Error(String),
+    Error(SeqFault),
+}
+
+/// A `--seq` parse error. `at` is the byte in the buffer where it was noticed.
+pub struct SeqFault {
+    pub message: String,
+    pub at: usize,
+}
+
+fn seq_fault(message: impl Into<String>, at: usize) -> SeqItem {
+    SeqItem::Error(SeqFault {
+        message: message.into(),
+        at,
+    })
 }
 
 /// `application/json-seq`. Bytes before the first ASCII RS are skipped.
 /// A value cut off by RS is dropped. An input with no RS is abandoned text.
 pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
+    // A record with no newline is dropped once an earlier record had one,
+    // unless the caller is slurping. `-s` reports that record instead.
+    parse_seq_keep(bytes, false)
+}
+
+pub(crate) fn parse_seq_keep(bytes: &[u8], keep_short: bool) -> Vec<SeqItem> {
     let mut items = Vec::new();
     let mut index = 0;
     let mut line = 1usize;
@@ -176,9 +195,10 @@ pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
         index += 1;
     }
     if index == bytes.len() {
-        items.push(SeqItem::Error(format!(
-            "Unfinished abandoned text at EOF at line {line}, column {column}"
-        )));
+        items.push(seq_fault(
+            format!("Unfinished abandoned text at EOF at line {line}, column {column}"),
+            index,
+        ));
         return items;
     }
     let mut saw_newline = false;
@@ -200,7 +220,7 @@ pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
         let ended_by_rs = index < bytes.len() && bytes[index] == b'\x1e';
         let chunk = &bytes[start..index];
         // A record with no newline, after an earlier newline, is discarded.
-        if saw_newline && !chunk_newline {
+        if saw_newline && !chunk_newline && !keep_short {
             continue;
         }
         saw_newline |= chunk_newline;
@@ -216,6 +236,190 @@ pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
         );
     }
     items
+}
+
+/// One RS-separated record. `start` is the first byte after that RS.
+pub(crate) struct SeqRecord {
+    pub start: usize,
+    pub end: usize,
+    pub line: usize,
+    pub column: usize,
+    pub ended_by_rs: bool,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+pub(crate) enum SeqLayout {
+    Abandoned { message: String, at: usize },
+    Records(Vec<SeqRecord>),
+}
+
+/// The same record split `parse_seq` uses. A record with no newline, after
+/// one that had a newline, is left out.
+pub(crate) fn seq_layout_keep(bytes: &[u8], keep_short: bool) -> SeqLayout {
+    let mut index = 0;
+    let mut line = 1usize;
+    let mut column = 0usize;
+    while index < bytes.len() && bytes[index] != b'\x1e' {
+        step(&mut line, &mut column, bytes[index]);
+        index += 1;
+    }
+    if index == bytes.len() {
+        return SeqLayout::Abandoned {
+            message: format!("Unfinished abandoned text at EOF at line {line}, column {column}"),
+            at: index,
+        };
+    }
+    let mut records = Vec::new();
+    let mut saw_newline = false;
+    while index < bytes.len() {
+        step(&mut line, &mut column, bytes[index]);
+        index += 1;
+        let start = index;
+        let start_line = line;
+        let start_column = column;
+        let mut has_newline = false;
+        while index < bytes.len() && bytes[index] != b'\x1e' {
+            if bytes[index] == b'\n' {
+                has_newline = true;
+            }
+            step(&mut line, &mut column, bytes[index]);
+            index += 1;
+        }
+        let ended_by_rs = index < bytes.len() && bytes[index] == b'\x1e';
+        if saw_newline && !has_newline && !keep_short {
+            continue;
+        }
+        saw_newline |= has_newline;
+        records.push(SeqRecord {
+            start,
+            end: index,
+            line: start_line,
+            column: start_column,
+            ended_by_rs,
+            end_line: line,
+            end_column: column,
+        });
+    }
+    SeqLayout::Records(records)
+}
+
+/// One value `--stream` produced from a `--seq` record, or a warning.
+pub(crate) enum SeqBit {
+    Item(SeqStreamItem),
+    Soft {
+        message: String,
+        at: usize,
+        unknown: bool,
+    },
+}
+
+pub(crate) struct SeqStreamItem {
+    pub value: Value,
+    pub end: usize,
+    pub atom: bool,
+    pub failure: bool,
+}
+
+pub(crate) struct SeqStream {
+    pub events: Vec<SeqBit>,
+    /// The last failure is an unfinished value that ended on a comma, so
+    /// `-s` emits it after the array.
+    pub partial: bool,
+}
+
+/// `--stream` over application/json-seq. A cut-off number stays a value.
+/// Other failures are warnings, or `[message, path]` when `errors` is set.
+pub(crate) fn seq_stream_keep(bytes: &[u8], errors: bool, keep_short: bool) -> SeqStream {
+    let mut events = Vec::new();
+    let records = match seq_layout_keep(bytes, keep_short) {
+        SeqLayout::Abandoned { message, at } => {
+            if errors {
+                events.push(SeqBit::Item(SeqStreamItem {
+                    value: stream::error_value(&message, &[]),
+                    end: at,
+                    atom: false,
+                    failure: true,
+                }));
+            } else {
+                events.push(SeqBit::Soft {
+                    message,
+                    at,
+                    unknown: false,
+                });
+            }
+            return SeqStream {
+                events,
+                partial: false,
+            };
+        }
+        SeqLayout::Records(records) => records,
+    };
+    let mut partial = false;
+    for record in records {
+        let chunk = &bytes[record.start..record.end];
+        let bits = stream::scan_seq_record(
+            chunk,
+            record.line,
+            record.column,
+            record.ended_by_rs,
+            record.end_line,
+            record.end_column,
+            errors,
+        );
+        for bit in bits {
+            match bit {
+                stream::RecEvent::Item {
+                    value,
+                    end,
+                    atom,
+                    failure,
+                } => {
+                    partial = failure
+                        && chunk.ends_with(b",")
+                        && value_message(&value)
+                            .is_some_and(|text| text.starts_with("Unfinished JSON term at EOF"));
+                    events.push(SeqBit::Item(SeqStreamItem {
+                        value,
+                        end: record.start + end,
+                        atom,
+                        failure,
+                    }));
+                }
+                stream::RecEvent::Soft {
+                    message,
+                    at,
+                    unknown,
+                } => {
+                    partial = false;
+                    events.push(SeqBit::Soft {
+                        message,
+                        at: record.start + at,
+                        unknown,
+                    });
+                }
+            }
+        }
+    }
+    // Only a failure that is still the last event splits off under `-s`.
+    if partial {
+        if let Some(SeqBit::Item(item)) = events.last() {
+            partial = item.failure;
+        } else {
+            partial = false;
+        }
+    }
+    SeqStream { events, partial }
+}
+
+fn value_message(value: &Value) -> Option<&str> {
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let Some(Value::String(text)) = items.first() else {
+        return None;
+    };
+    Some(text)
 }
 
 fn step(line: &mut usize, column: &mut usize, byte: u8) {
@@ -273,11 +477,14 @@ fn push_chunk(
                         } else {
                             format!("Truncated value at line {end_line}, column {column}")
                         };
-                        items.push(SeqItem::Error(phrase));
+                        items.push(seq_fault(phrase, origin + chunk.len()));
                     } else if matches!(value, Value::Number(_)) {
-                        items.push(SeqItem::Error(format!(
-                            "Potentially truncated top-level numeric value at EOF at line {end_line}, column {end_column}"
-                        )));
+                        items.push(seq_fault(
+                            format!(
+                                "Potentially truncated top-level numeric value at EOF at line {end_line}, column {end_column}"
+                            ),
+                            origin + chunk.len(),
+                        ));
                     } else {
                         push_kept(items, &[(value, end)], &chunk[base..], line, origin + base);
                     }
@@ -296,23 +503,28 @@ fn push_chunk(
                 return;
             }
             let column = end_column + 1;
-            items.push(SeqItem::Error(format!(
-                "Truncated value at line {end_line}, column {column}"
-            )));
+            items.push(seq_fault(
+                format!("Truncated value at line {end_line}, column {column}"),
+                origin + chunk.len(),
+            ));
             return;
         }
+        let at = origin + base + scanned.error_at;
         if message.contains(" at EOF ") {
-            items.push(SeqItem::Error(message));
+            items.push(seq_fault(message, at));
             return;
         }
-        items.push(SeqItem::Error(format!("{message} (need RS to resync)")));
+        items.push(seq_fault(format!("{message} (need RS to resync)"), at));
         // jq names the following line as well when the bad token did not
         // already end there, then keeps parsing.
         if scanned.resume_line > error_line && base + scanned.resume < chunk.len() {
-            items.push(SeqItem::Error(format!(
-                "Invalid numeric literal at line {}, column 0 (need RS to resync)",
-                scanned.resume_line
-            )));
+            items.push(seq_fault(
+                format!(
+                    "Invalid numeric literal at line {}, column 0 (need RS to resync)",
+                    scanned.resume_line
+                ),
+                origin + base + scanned.resume,
+            ));
         }
         let resume = scanned.resume;
         if resume == 0 {

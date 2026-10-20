@@ -555,8 +555,8 @@ fn apply_seq_files(
 /// another file might still finish the value.
 fn seq_run_end(items: &[SeqItem], more: bool) -> usize {
     if more {
-        if let Some(SeqItem::Error(message)) = items.last() {
-            if message.contains(" at EOF ") {
+        if let Some(SeqItem::Error(fault)) = items.last() {
+            if fault.message.contains(" at EOF ") {
                 return items.len() - 1;
             }
         }
@@ -602,8 +602,8 @@ fn drive_seq(
     let mut any = false;
     for item in items {
         match item {
-            SeqItem::Error(message) => {
-                eprintln!("jq: ignoring parse error: {message}");
+            SeqItem::Error(fault) => {
+                eprintln!("jq: ignoring parse error: {}", fault.message);
             }
             SeqItem::Value(item) => {
                 any = true;
@@ -924,35 +924,53 @@ fn apply_slurp(
         return Ok(());
     }
     if seq {
+        if stream {
+            let scanned = crate::parse::seq_stream_keep(&buf, stream_errors, true);
+            let mut values = Vec::new();
+            let mut aside = None;
+            let mut events = scanned.events;
+            if scanned.partial {
+                if let Some(crate::parse::SeqBit::Item(item)) = events.pop() {
+                    aside = Some(item.value);
+                }
+            }
+            for event in events {
+                match event {
+                    crate::parse::SeqBit::Soft { message, .. } => {
+                        eprintln!("jq: ignoring parse error: {message}");
+                    }
+                    crate::parse::SeqBit::Item(item) => values.push(item.value),
+                }
+            }
+            let mut failed = emit(
+                program,
+                &Value::array(values),
+                env,
+                style,
+                &at.source,
+                at.line,
+                run,
+                out,
+            )?;
+            if let Some(value) = aside {
+                if !run.stopped {
+                    failed =
+                        emit(program, &value, env, style, &at.source, at.line, run, out)? || failed;
+                }
+            }
+            run.status = stopped_status(run, missing, failed);
+            return Ok(());
+        }
         let mut values = Vec::new();
-        for item in parse_seq(&buf) {
+        for item in crate::parse::parse_seq_keep(&buf, true) {
             match item {
-                SeqItem::Error(message) => {
-                    eprintln!("jq: ignoring parse error: {message}");
+                SeqItem::Error(fault) => {
+                    eprintln!("jq: ignoring parse error: {}", fault.message);
                 }
                 SeqItem::Value(item) => values.push(item.value),
             }
         }
-        let input = if stream {
-            let mut streamed = Vec::new();
-            for value in values {
-                let bytes = render(
-                    &value,
-                    Style {
-                        layout: Layout::Compact,
-                        ..Style::default()
-                    },
-                )
-                .into_bytes();
-                let fed = program_stream(&bytes, false);
-                for item in fed.values {
-                    streamed.push(item.value);
-                }
-            }
-            Value::array(streamed)
-        } else {
-            Value::array(values)
-        };
+        let input = Value::array(values);
         set_input_line(at.line);
         let failed = emit(program, &input, env, style, &at.source, at.line, run, out)?;
         run.status = stopped_status(run, missing, failed);

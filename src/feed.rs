@@ -11,8 +11,8 @@ use std::io::{self, Read as IoRead};
 
 use crate::eprintln;
 use crate::parse::{
-    closer_is_detached, parse_seq, program_stream, program_stream_with, pull_stream, scan_input,
-    stream_line, EofCut, InputScan, LineCursor, NulScan, SeqItem, StreamState,
+    closer_is_detached, parse_seq, program_stream_with, pull_stream, scan_input, stream_line,
+    EofCut, InputScan, LineCursor, NulScan, SeqItem, StreamState,
 };
 use crate::value::Value;
 use crate::Error;
@@ -351,8 +351,20 @@ struct Session {
 }
 
 enum SeqQueued {
-    Value(Value),
-    Soft(String),
+    Value {
+        value: Value,
+        /// Byte just after the value. Absent when a slurped array held nothing.
+        end: Option<usize>,
+        atom: bool,
+        /// A `--stream-errors` array. `input_filename` is null for it.
+        failure: bool,
+    },
+    Fault {
+        message: String,
+        at: usize,
+        /// The parse error is reported at `<unknown>`.
+        unknown: bool,
+    },
 }
 
 struct Staged {
@@ -425,7 +437,7 @@ impl Session {
             return Ok(Pulled::End);
         }
         if self.seq && !self.raw {
-            return self.pull_seq();
+            return self.pull_seq(from_input);
         }
         if self.slurp {
             return self.pull_slurp(from_input);
@@ -436,53 +448,171 @@ impl Session {
         self.pull_json(from_input)
     }
 
-    /// `--seq` is one pass over the whole input. Errors are kept, and reading goes on.
-    fn pull_seq(&mut self) -> Result<Pulled, String> {
+    /// `--seq` is one pass over the whole input. The main loop warns and
+    /// keeps reading. `input` and `inputs` raise the same message.
+    fn pull_seq(&mut self, from_input: bool) -> Result<Pulled, String> {
         if !self.seq_done {
             loop {
                 if self.append()? == More::Eof {
                     break;
                 }
             }
-            let mut slurped = Vec::new();
-            for item in parse_seq(&self.buf) {
-                match item {
-                    SeqItem::Error(message) => self.seq_queue.push_back(SeqQueued::Soft(message)),
-                    SeqItem::Value(located) if self.slurp => slurped.push(located.value),
-                    SeqItem::Value(located) if self.stream => self.queue_stream(&located.value),
-                    SeqItem::Value(located) => {
-                        self.seq_queue.push_back(SeqQueued::Value(located.value))
-                    }
-                }
-            }
-            if self.slurp {
-                self.seq_queue
-                    .push_back(SeqQueued::Value(Value::array(slurped)));
+            if self.stream {
+                self.queue_seq_stream();
+            } else {
+                self.queue_seq_values();
             }
             self.seq_done = true;
         }
         Ok(match self.seq_queue.pop_front() {
-            Some(SeqQueued::Value(value)) => Pulled::Value(value),
-            Some(SeqQueued::Soft(message)) => Pulled::Soft(message),
+            Some(SeqQueued::Value {
+                value,
+                end,
+                atom,
+                failure,
+            }) => {
+                if failure {
+                    self.yielded = None;
+                    self.at = "<unknown>".to_string();
+                    set_input_line(0);
+                } else if let Some(end) = end {
+                    let (name, line) = self.place(end, atom);
+                    self.note(&name, line);
+                }
+                Pulled::Value(value)
+            }
+            Some(SeqQueued::Fault {
+                message,
+                at,
+                unknown,
+            }) => {
+                if from_input {
+                    let (name, line) = self.place(at, false);
+                    if unknown {
+                        self.yielded = Some(name);
+                        self.at = "<unknown>".to_string();
+                        set_input_line(0);
+                    } else {
+                        self.note(&name, line);
+                    }
+                    Pulled::Parse(message)
+                } else {
+                    Pulled::Soft(message)
+                }
+            }
             None => Pulled::End,
         })
     }
 
-    fn queue_stream(&mut self, value: &Value) {
-        let bytes = crate::print::render(
-            value,
-            crate::print::Style {
-                layout: crate::print::Layout::Compact,
-                ..crate::print::Style::default()
-            },
-        )
-        .into_bytes();
-        let fed = program_stream(&bytes, false);
-        for item in fed.values {
-            self.seq_queue.push_back(SeqQueued::Value(item.value));
+    fn queue_seq_values(&mut self) {
+        let mut slurped = Vec::new();
+        let mut last: Option<(usize, bool)> = None;
+        let parsed = if self.slurp {
+            crate::parse::parse_seq_keep(&self.buf, true)
+        } else {
+            parse_seq(&self.buf)
+        };
+        for item in parsed {
+            match item {
+                SeqItem::Error(fault) => self.seq_queue.push_back(SeqQueued::Fault {
+                    message: fault.message,
+                    at: fault.at,
+                    unknown: false,
+                }),
+                SeqItem::Value(located) if self.slurp => {
+                    last = Some((located.end, is_atom(&located.value)));
+                    slurped.push(located.value);
+                }
+                SeqItem::Value(located) => {
+                    let atom = is_atom(&located.value);
+                    self.seq_queue.push_back(SeqQueued::Value {
+                        value: located.value,
+                        end: Some(located.end),
+                        atom,
+                        failure: false,
+                    });
+                }
+            }
         }
-        if let Some(message) = fed.error {
-            self.seq_queue.push_back(SeqQueued::Soft(message));
+        if self.slurp {
+            let (end, atom) = match last {
+                Some((end, atom)) => (Some(end), atom),
+                None => (None, false),
+            };
+            self.seq_queue.push_back(SeqQueued::Value {
+                value: Value::array(slurped),
+                end,
+                atom,
+                failure: false,
+            });
+        }
+    }
+
+    fn queue_seq_stream(&mut self) {
+        let scanned = crate::parse::seq_stream_keep(&self.buf, self.stream_errors, self.slurp);
+        if !self.slurp {
+            for event in scanned.events {
+                self.queue_seq_bit(event);
+            }
+            return;
+        }
+        let mut values = Vec::new();
+        let mut last: Option<(usize, bool)> = None;
+        let mut aside = None;
+        let mut events = scanned.events;
+        if scanned.partial {
+            if let Some(crate::parse::SeqBit::Item(item)) = events.pop() {
+                aside = Some(item);
+            }
+        }
+        for event in events {
+            match event {
+                crate::parse::SeqBit::Item(item) => {
+                    if !item.failure {
+                        last = Some((item.end, item.atom));
+                    }
+                    values.push(item.value);
+                }
+                other => self.queue_seq_bit(other),
+            }
+        }
+        let (end, atom) = match last {
+            Some((end, atom)) => (Some(end), atom),
+            None => (None, false),
+        };
+        self.seq_queue.push_back(SeqQueued::Value {
+            value: Value::array(values),
+            end,
+            atom,
+            failure: false,
+        });
+        if let Some(item) = aside {
+            self.seq_queue.push_back(SeqQueued::Value {
+                value: item.value,
+                end: Some(item.end),
+                atom: item.atom,
+                failure: true,
+            });
+        }
+    }
+
+    fn queue_seq_bit(&mut self, event: crate::parse::SeqBit) {
+        match event {
+            crate::parse::SeqBit::Item(item) => self.seq_queue.push_back(SeqQueued::Value {
+                value: item.value,
+                end: Some(item.end),
+                atom: item.atom,
+                failure: item.failure,
+            }),
+            crate::parse::SeqBit::Soft {
+                message,
+                at,
+                unknown,
+            } => self.seq_queue.push_back(SeqQueued::Fault {
+                message,
+                at,
+                unknown,
+            }),
         }
     }
 
@@ -1188,7 +1318,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
-            output.code, 0,
+            output.code,
+            0,
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );

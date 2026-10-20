@@ -672,6 +672,76 @@ fn seq_number_cut_across_files_warns_once() {
     );
 }
 
+/// `input_filename` names the file under `--seq`. `inputs` raises a cut-off
+/// number instead of warning. `--stream-errors` hands that failure to the
+/// program as an array.
+#[test]
+fn seq_names_inputs_and_stream_errors_match_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("seq-gap");
+    let one = write_bytes(&dir, "one.seq", b"\x1e1\n");
+    let two = write_bytes(&dir, "two.seq", b"\x1e2\n");
+    let cut = write_bytes(&dir, "cut.seq", b"\x1e12");
+    compare_exact(
+        "filename of each value",
+        &[
+            "--seq",
+            "-c",
+            "[.,input_filename,input_line_number]",
+            &one,
+            &two,
+        ],
+        b"",
+    );
+    compare_exact(
+        "filename of inputs",
+        &[
+            "-n",
+            "--seq",
+            "-c",
+            "inputs|[.,input_filename,input_line_number]",
+            &one,
+            &two,
+        ],
+        b"",
+    );
+    compare_exact(
+        "filename on standard input",
+        &[
+            "-n",
+            "--seq",
+            "-c",
+            "inputs|[.,input_filename,input_line_number]",
+        ],
+        b"\x1e1\n\x1e2\n",
+    );
+    compare_exact(
+        "inputs raises a cut-off number",
+        &["-n", "--seq", "-c", "inputs", &cut],
+        b"",
+    );
+    compare_exact(
+        "inputs can catch that error",
+        &["-n", "--seq", "-c", "try inputs catch ."],
+        b"\x1e1",
+    );
+    compare_exact(
+        "stream errors keep a cut-off array",
+        &["--stream-errors", "--seq", "-c", "."],
+        b"\x1e[1,",
+    );
+    compare_exact(
+        "stream errors keep a bad record",
+        &["--stream-errors", "--seq", "-c", "."],
+        b"\x1ebad\n\x1e3\n",
+    );
+    compare_exact(
+        "stream errors keep a cut-off number",
+        &["--stream-errors", "--seq", "-c", "."],
+        b"\x1e1",
+    );
+}
+
 #[test]
 fn inputs_span_files_match_jq() {
     require_jq();

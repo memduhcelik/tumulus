@@ -169,6 +169,99 @@ fn new_obj(path: Vec<Value>) -> Frame {
     })
 }
 
+/// One piece of a `--seq` record scanned as `--stream`.
+pub(crate) enum RecEvent {
+    Item {
+        value: Value,
+        end: usize,
+        atom: bool,
+        failure: bool,
+    },
+    Soft {
+        message: String,
+        at: usize,
+        unknown: bool,
+    },
+}
+
+/// Scan one record. `line` and `column` already count the record separator.
+/// A number at the end of the record is a value. An unfinished container
+/// cut off by RS is `Truncated value` unless the record contains a newline.
+pub(crate) fn scan_seq_record(
+    chunk: &[u8],
+    line: usize,
+    column: usize,
+    ended_by_rs: bool,
+    end_line: usize,
+    end_column: usize,
+    errors: bool,
+) -> Vec<RecEvent> {
+    let mut state = StreamState {
+        index: 0,
+        line,
+        column,
+        stack: Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut prior = false;
+    for _ in 0..=chunk.len() {
+        let before = state.index;
+        let scanned = drive(chunk, &mut state, true, &[]);
+        for item in scanned.items {
+            prior = true;
+            out.push(RecEvent::Item {
+                value: item.value,
+                end: item.end,
+                atom: item.atom,
+                failure: false,
+            });
+        }
+        let Some(error) = scanned.error else {
+            break;
+        };
+        if scanned.blocked {
+            break;
+        }
+        let unfinished = error.ran_out();
+        if ended_by_rs && unfinished && chunk.contains(&b'\n') {
+            break;
+        }
+        let message = if ended_by_rs && unfinished {
+            format!(
+                "Truncated value at line {end_line}, column {}",
+                end_column + 1
+            )
+        } else {
+            let text = error.text();
+            if text.contains(" at EOF ") || text.contains("need RS to resync") {
+                text
+            } else {
+                format!("{text} (need RS to resync)")
+            }
+        };
+        let unknown = error_is_unknown(&message, chunk, prior);
+        if errors {
+            prior = true;
+            out.push(RecEvent::Item {
+                value: error_value(&message, &scanned.path),
+                end: scanned.error_at,
+                atom: false,
+                failure: true,
+            });
+        } else {
+            out.push(RecEvent::Soft {
+                message,
+                at: scanned.error_at,
+                unknown,
+            });
+        }
+        if unfinished || state.index == before {
+            break;
+        }
+    }
+    out
+}
+
 /// One whole input. `slurp` packs the items the way `--stream -s` does.
 pub fn program_stream(bytes: &[u8], slurp: bool) -> StreamFeed {
     program_stream_with(bytes, slurp, false, &[])
@@ -325,7 +418,7 @@ fn walk_all(text: &[u8], errors: bool, bounds: &[usize]) -> RawScan {
     }
 }
 
-fn error_value(message: &str, path: &[Value]) -> Value {
+pub(crate) fn error_value(message: &str, path: &[Value]) -> Value {
     Value::array(vec![
         Value::String(message.to_string()),
         Value::array(path.to_vec()),
@@ -334,7 +427,7 @@ fn error_value(message: &str, path: &[Value]) -> Value {
 
 /// jq names this error `<unknown>` when the whole input is one line and does
 /// not end in whitespace, and a value was already emitted.
-fn error_is_unknown(message: &str, bytes: &[u8], prior: bool) -> bool {
+pub(crate) fn error_is_unknown(message: &str, bytes: &[u8], prior: bool) -> bool {
     prior
         && message.starts_with("Unfinished JSON term at EOF")
         && !bytes.contains(&b'\n')

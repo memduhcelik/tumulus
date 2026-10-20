@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+`input_filename` under `--seq` is the file that holds the value's last byte. Standard input is named `<stdin>`.
+
+`input` and `inputs` raise a `--seq` parse error. A number cut off at the end of the last file is that error, and the exit status is 5. The main loop still prints `jq: ignoring parse error` and keeps reading.
+
+`--stream-errors` with `--seq` gives the program `[message, path]` and keeps the items already parsed. A cut-off number is the stream item for that number.
+
 ## 0.12.0
 
 Released on 2026-10-20.
