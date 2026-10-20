@@ -1997,10 +1997,31 @@ fn run(
     }
 }
 
-/// `foreach` in a path. A yield is never a path: the first extracted value
-/// is an invalid path, and later iterations do not run. An index in the
-/// init moves the lineage, so the stream is not a carrier. The update and
-/// the extract are not carriers either, so an index there is `near_access`.
+/// `path` rejected a value, or a filter raised an error. `(expr)?` swallows
+/// the filter error and leaves the rejection, so a later slice bound still
+/// does not run.
+enum PathStop {
+    Filter(Failure),
+    Rejected(Failure),
+}
+
+fn stop_err(stop: PathStop) -> PathErr {
+    let failure = match stop {
+        PathStop::Filter(failure) | PathStop::Rejected(failure) => failure,
+    };
+    PathErr {
+        partial: Vec::new(),
+        message: failure.message,
+        caught: failure.caught,
+        stop: failure.stop,
+    }
+}
+
+/// `foreach` in a path. A stream of plain values leaves the init's path in
+/// place, so `foreach (0,1)` yields it. Iterating the input, as in `.[]`,
+/// does not. An index in the init moves the lineage, and a later `.[]`
+/// cannot iterate. The value after an update stays a path only when that
+/// update put it back on the same path.
 fn run_foreach(
     stream: &Filter,
     pattern: &Pattern,
@@ -2023,73 +2044,136 @@ fn run_foreach(
     if inits.iter().any(|out| !same_steps(&out.path, path)) {
         line.set(alloc(ctx.next));
     }
+    let mut outputs = Vec::new();
     for (index, init_state) in inits.into_iter().enumerate() {
+        let mut state = init_state;
         let null_input = Value::Null;
         let stream_input = if index == 0 { input } else { &null_input };
-        let items = match run(stream, stream_input, path, line, input_gen, ctx) {
-            Ok(outs) => outs.into_iter().map(|out| out.value).collect::<Vec<_>>(),
-            Err(err) => return Err(err),
-        };
-        let mut state_value = init_state.value;
-        for item in &items {
-            let mut step_err: Option<PathErr> = None;
-            let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
-                if step_err.is_some() {
+        let start_line = line.get();
+        let slot: RefCell<Option<PathErr>> = RefCell::new(None);
+        let streamed = stream_paths(
+            stream,
+            stream_input,
+            path,
+            line,
+            input_gen,
+            ctx,
+            &mut |item| {
+                if slot.borrow().is_some() {
                     return Ok(());
                 }
-                let child_env = child_scope(frame, ctx.env);
-                let child = Ctx {
-                    root: ctx.root,
-                    next: ctx.next,
-                    env: &child_env,
-                    pbinds: ctx.pbinds,
-                };
-                let cell = Cell::new(0);
-                let updates = match run(update, &state_value, path, &cell, 0, &child) {
-                    Ok(updates) => updates,
+                // A plain value keeps this path. An index moves the line or
+                // the path, including `.[0] | 0`, and the update is no longer
+                // a path back to the input. Later stream values are not run.
+                let breaks = item.line != start_line || !same_steps(&item.path, path);
+                match foreach_yield(
+                    &mut state,
+                    &item.value,
+                    breaks,
+                    pattern,
+                    update,
+                    extract,
+                    ctx,
+                    &mut outputs,
+                ) {
+                    Ok(()) => Ok(()),
                     Err(err) => {
-                        step_err = Some(err);
-                        return Ok(());
+                        *slot.borrow_mut() = Some(err);
+                        Err(PathStop::Filter(fail(String::new())))
                     }
-                };
-                if updates.is_empty() {
-                    state_value = Value::Null;
-                    return Ok(());
                 }
-                for upd in &updates {
-                    let ext_line = Cell::new(0);
-                    let extracted = match run(extract, &upd.value, path, &ext_line, 0, &child) {
-                        Ok(more) => more,
-                        Err(err) => {
-                            step_err = Some(err);
-                            return Ok(());
-                        }
-                    };
-                    if let Some(one) = extracted.first() {
-                        step_err = Some(bare(format!(
-                            "Invalid path expression with result {}",
-                            clipped(&one.value, 29)
-                        )));
-                        return Ok(());
-                    }
-                    state_value = upd.value.clone();
-                }
-                Ok(())
-            });
-            if let Some(err) = step_err {
-                return Err(err);
-            }
-            if let Err(failure) = matched {
-                return Err(PathErr {
-                    partial: Vec::new(),
-                    message: failure.message,
-                    caught: failure.caught,
-                    stop: failure.stop,
-                });
-            }
+            },
+        );
+        if let Some(err) = slot.into_inner() {
+            return Err(attach(outputs, err));
+        }
+        if let Err(stop) = streamed {
+            return Err(attach(outputs, stop_err(stop)));
         }
     }
-    Ok(Vec::new())
+    Ok(outputs)
+}
+
+fn foreach_yield(
+    state: &mut POut,
+    item: &Value,
+    breaks: bool,
+    pattern: &Pattern,
+    update: &Filter,
+    extract: &Filter,
+    ctx: &Ctx,
+    outputs: &mut Vec<POut>,
+) -> Result<(), PathErr> {
+    let mut step_err: Option<PathErr> = None;
+    let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
+        if step_err.is_some() {
+            return Ok(());
+        }
+        let child_env = child_scope(frame, ctx.env);
+        let child = Ctx {
+            root: ctx.root,
+            next: ctx.next,
+            env: &child_env,
+            pbinds: ctx.pbinds,
+        };
+        let gen = if !breaks && state.carrier {
+            state.value_gen
+        } else {
+            0
+        };
+        let cell = Cell::new(gen);
+        let updates = match run(update, &state.value, &state.path, &cell, gen, &child) {
+            Ok(updates) => updates,
+            Err(err) => {
+                step_err = Some(err);
+                return Ok(());
+            }
+        };
+        if updates.is_empty() {
+            *state = constant(Value::Null, &state.path, state.line, ctx.root);
+            return Ok(());
+        }
+        for upd in &updates {
+            let ext_gen = if upd.carrier { upd.value_gen } else { 0 };
+            let ext_cell = Cell::new(ext_gen);
+            let extracted = match run(extract, &upd.value, &upd.path, &ext_cell, ext_gen, &child) {
+                Ok(more) => more,
+                Err(err) => {
+                    step_err = Some(err);
+                    return Ok(());
+                }
+            };
+            for one in extracted {
+                if one.carrier {
+                    outputs.push(one);
+                } else {
+                    step_err = Some(bare(format!(
+                        "Invalid path expression with result {}",
+                        clipped(&one.value, 29)
+                    )));
+                    return Ok(());
+                }
+            }
+            if upd.carrier && same_steps(&upd.path, &state.path) {
+                *state = upd.clone();
+            } else {
+                *state = constant(upd.value.clone(), &state.path, state.line, ctx.root);
+            }
+        }
+        Ok(())
+    });
+    if let Some(err) = step_err {
+        return Err(err);
+    }
+    match matched {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(PathErr {
+            partial: Vec::new(),
+            message: failure.message,
+            caught: failure.caught,
+            stop: failure.stop,
+        }),
+    }
 }
 
 fn run_call(
@@ -2709,17 +2793,12 @@ fn run_reduce_path(
             out.push(kept);
             continue;
         }
-        match super::eval::reduce_finished(&init_out.value, &items, pattern, alts, update, ctx.env)
-        {
+        // The step is not that path. Run it as a value that was not reached
+        // by indexing, so an index names the element. A step that does
+        // produce a value is the reduced result.
+        match reduce_off_path(&init_out.value, &items, pattern, alts, update, path, ctx) {
             Ok(value) => out.push(constant(value, path, line.get(), ctx.root)),
-            Err(failure) => {
-                return Err(PathErr {
-                    partial: Vec::new(),
-                    message: failure.message,
-                    caught: failure.caught,
-                    stop: failure.stop,
-                });
-            }
+            Err(err) => return Err(err),
         }
     }
     Ok(out)
@@ -2733,6 +2812,81 @@ fn bare_path(err: PathErr) -> PathErr {
         caught: err.caught,
         stop: err.stop,
     }
+}
+
+/// One `reduce` whose steps leave the path. Each update runs as a non-carrier,
+/// so `.[0]` names that element instead of indexing and then failing later.
+fn reduce_off_path(
+    init: &Value,
+    items: &[Value],
+    pattern: &Pattern,
+    alts: &[Pattern],
+    update: &Filter,
+    path: &[Step],
+    ctx: &Ctx,
+) -> Result<Value, PathErr> {
+    let mut names = Vec::new();
+    super::parse::bind_names(pattern, alts, &mut names);
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
+    let mut acc = init.clone();
+    for item in items {
+        let mut stepped = false;
+        for (index, pat) in pats.iter().enumerate() {
+            let last = index + 1 == pats.len();
+            let mut body_err: Option<PathErr> = None;
+            let mut produced: Option<Vec<Value>> = None;
+            let matched = super::eval::match_pat(pat, item, ctx.env, &[], &mut |frame| {
+                let frame = null_names(frame, &names);
+                let child_env = child_scope(&frame, ctx.env);
+                let child = Ctx {
+                    root: ctx.root,
+                    next: ctx.next,
+                    env: &child_env,
+                    pbinds: ctx.pbinds,
+                };
+                let cell = Cell::new(0);
+                match run(update, &acc, path, &cell, 0, &child) {
+                    Ok(outs) => {
+                        produced = Some(outs.into_iter().map(|out| out.value).collect());
+                        Ok(())
+                    }
+                    Err(err) => {
+                        body_err = Some(err);
+                        Err(fail(String::new()))
+                    }
+                }
+            });
+            if let Some(err) = body_err {
+                if err.stop.is_none() && !last {
+                    continue;
+                }
+                return Err(err);
+            }
+            match matched {
+                Ok(()) => {
+                    let values = produced.unwrap_or_default();
+                    acc = values.last().cloned().unwrap_or(Value::Null);
+                    stepped = true;
+                    break;
+                }
+                Err(failure) if failure.stop.is_some() || last => {
+                    return Err(PathErr {
+                        partial: Vec::new(),
+                        message: failure.message,
+                        caught: failure.caught,
+                        stop: failure.stop,
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        if !stepped {
+            break;
+        }
+    }
+    Ok(acc)
 }
 
 fn run_match_pipe(
@@ -4710,7 +4864,7 @@ fn walk_paths(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Walk {
         pbinds: &[],
     };
     let mut steps = Vec::new();
-    let failure = stream_paths(
+    let failure = match stream_paths(
         filter,
         input,
         &[],
@@ -4722,13 +4876,15 @@ fn walk_paths(filter: &Filter, input: &Value, env: &[(String, Value)]) -> Walk {
                 steps.push(one);
                 Ok(())
             }
-            Err(value) => Err(fail(format!(
+            Err(value) => Err(PathStop::Rejected(fail(format!(
                 "Invalid path expression with result {}",
                 clipped(&value, 29)
-            ))),
+            )))),
         },
-    )
-    .err();
+    ) {
+        Ok(()) => None,
+        Err(PathStop::Filter(failure) | PathStop::Rejected(failure)) => Some(failure),
+    };
     Walk { steps, failure }
 }
 
@@ -4742,8 +4898,8 @@ fn stream_paths(
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
-    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+    emit: &mut dyn FnMut(POut) -> Result<(), PathStop>,
+) -> Result<(), PathStop> {
     match filter {
         Filter::Slice {
             base,
@@ -4781,6 +4937,22 @@ fn stream_paths(
         Filter::Pipe(left, right) if !matches!(left.as_ref(), Filter::MatchImpl { .. }) => {
             stream_pipe(left, right, input, path, line, input_gen, ctx, emit)
         }
+        // `(expr)?` swallows a filter error. It does not swallow `path`
+        // rejecting a value, and it does not run a later bound after that.
+        Filter::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                Filter::At { optional: true, .. } | Filter::Slice { optional: true, .. }
+            ) =>
+        {
+            stream_paths(inner, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::Optional(inner) => {
+            match stream_paths(inner, input, path, line, input_gen, ctx, emit) {
+                Err(PathStop::Filter(_)) => Ok(()),
+                other => other,
+            }
+        }
         _ => stream_run(filter, input, path, line, input_gen, ctx, emit),
     }
 }
@@ -4792,8 +4964,8 @@ fn stream_run(
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
-    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+    emit: &mut dyn FnMut(POut) -> Result<(), PathStop>,
+) -> Result<(), PathStop> {
     match run(filter, input, path, line, input_gen, ctx) {
         Ok(outs) => {
             for out in outs {
@@ -4806,7 +4978,7 @@ fn stream_run(
             for out in partial {
                 emit(out)?;
             }
-            Err(failure)
+            Err(PathStop::Filter(failure))
         }
     }
 }
@@ -4819,8 +4991,8 @@ fn stream_pipe(
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
-    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+    emit: &mut dyn FnMut(POut) -> Result<(), PathStop>,
+) -> Result<(), PathStop> {
     let left_cell = Cell::new(line.get());
     stream_paths(
         left,
@@ -4858,36 +5030,39 @@ fn stream_at(
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
-    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+    emit: &mut dyn FnMut(POut) -> Result<(), PathStop>,
+) -> Result<(), PathStop> {
     let saved = line.get();
-    let (keys, key_err) = parts(eval_in(key, input, ctx.env));
-    line.set(saved);
-    for key_value in &keys {
-        line.set(saved);
-        stream_paths(
-            base,
-            input,
-            path,
-            line,
-            input_gen,
-            ctx,
-            &mut |base_out| match index_out(&base_out, key_value, ctx) {
-                Ok(hit) => emit(hit),
-                Err(message) if optional => {
-                    let _ = message;
-                    Ok(())
+    let slot: RefCell<Option<PathStop>> = RefCell::new(None);
+    // One key at a time. A value that is not a path stops before a later key,
+    // so `.[1,(input)] | 9` does not read `input`.
+    let result =
+        stream::for_each_value(key, input, ctx.env, |key_value| {
+            line.set(saved);
+            let sent = stream_paths(base, input, path, line, input_gen, ctx, &mut |base_out| {
+                match index_out(&base_out, key_value, ctx) {
+                    Ok(hit) => emit(hit),
+                    Err(message) if optional => {
+                        let _ = message;
+                        Ok(())
+                    }
+                    Err(message) => Err(PathStop::Filter(fail(message))),
                 }
-                Err(message) => Err(match key_err.clone() {
-                    Some(failure) => failure,
-                    None => fail(message),
-                }),
-            },
-        )?;
+            });
+            match sent {
+                Ok(()) => Ok(false),
+                Err(err) => {
+                    *slot.borrow_mut() = Some(err);
+                    Ok(true)
+                }
+            }
+        });
+    if let Some(err) = slot.into_inner() {
+        return Err(err);
     }
-    match key_err {
-        Some(failure) => Err(failure),
-        None => Ok(()),
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(PathStop::Filter(failure)),
     }
 }
 
@@ -4901,18 +5076,18 @@ fn stream_slice(
     line: &Cell<u64>,
     input_gen: u64,
     ctx: &Ctx,
-    emit: &mut dyn FnMut(POut) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+    emit: &mut dyn FnMut(POut) -> Result<(), PathStop>,
+) -> Result<(), PathStop> {
     let identity = Filter::Identity;
     let base = base.unwrap_or(&identity);
     let saved = line.get();
-    let slot: RefCell<Option<Failure>> = RefCell::new(None);
+    let slot: RefCell<Option<PathStop>> = RefCell::new(None);
     let walked = walk_slice_pairs(start, end, input, ctx.env, |start_value, end_value| {
         line.set(saved);
         let sent = stream_paths(base, input, path, line, input_gen, ctx, &mut |base_out| {
             if !base_out.carrier {
                 let elem = shown_slice(start_value, end_value);
-                return Err(fail(near_access(&elem, &base_out.value)));
+                return Err(PathStop::Filter(fail(near_access(&elem, &base_out.value))));
             }
             match &base_out.value {
                 Value::Array(_) | Value::String(_) => {
@@ -4922,8 +5097,8 @@ fn stream_slice(
                         if optional {
                             return Ok(());
                         }
-                        require_slice_index(start_value)?;
-                        require_slice_index(end_value)?;
+                        require_slice_index(start_value).map_err(PathStop::Filter)?;
+                        require_slice_index(end_value).map_err(PathStop::Filter)?;
                     }
                 }
                 Value::Null => {}
@@ -4931,17 +5106,18 @@ fn stream_slice(
                     if optional {
                         return Ok(());
                     }
-                    return Err(fail(format!(
+                    return Err(PathStop::Filter(fail(format!(
                         "Cannot index {} with object",
                         other.type_name()
-                    )));
+                    ))));
                 }
             }
             let step = Step::Slice {
                 start: start_value.clone(),
                 end: end_value.clone(),
             };
-            let child = child_at(&base_out.value, &step).map_err(fail)?;
+            let child = child_at(&base_out.value, &step)
+                .map_err(|message| PathStop::Filter(fail(message)))?;
             let mut full = base_out.path;
             full.push(step);
             emit(taken(child, full, line, ctx.next))
@@ -4957,7 +5133,10 @@ fn stream_slice(
     if let Some(failure) = slot.into_inner() {
         return Err(failure);
     }
-    walked
+    match walked {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(PathStop::Filter(failure)),
+    }
 }
 
 /// A path jq will print. A broken value is the `Err` payload.

@@ -1039,34 +1039,6 @@ fn fold_pattern(
     Ok(stop)
 }
 
-/// `reduce` once the initial value and the stream values are already known.
-pub(super) fn reduce_finished(
-    init: &Value,
-    items: &[Value],
-    pattern: &Pattern,
-    alts: &[Pattern],
-    update: &Filter,
-    env: &[(String, Value)],
-) -> Result<Value, Failure> {
-    let mut acc = init.clone();
-    let mut lookup = None;
-    for item in items {
-        fold_one(
-            item,
-            pattern,
-            alts,
-            update,
-            None,
-            false,
-            env,
-            &mut acc,
-            &mut lookup,
-            &mut |_| false,
-        )?;
-    }
-    Ok(acc)
-}
-
 /// `true` means a consumer asked to stop. Values already handed to `sink`
 /// are not repeated in an error. `sink` returns `true` to stop.
 pub(super) fn fold_into(

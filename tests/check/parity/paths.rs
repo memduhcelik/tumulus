@@ -1481,7 +1481,7 @@ fn bound_update_forms_match_jq() {
 }
 
 /// A `?//` alternative after a destructuring pattern can still be a slice
-/// path. `foreach` is not a path. `path` of a slice piped into a constant
+/// path. `foreach .[]` is not a path. `path` of a slice piped into a constant
 /// stops before a later bound. jq is asked for each one.
 #[test]
 fn alt_foreach_and_piped_path_match_jq() {
@@ -1601,6 +1601,70 @@ fn alt_foreach_and_piped_path_match_jq() {
             "a failed destructuring still reads its own bound",
             r#"[0,1,2,3,4] | (. as [$a] ?// $v | .[(input):2]) = ["q"], input"#,
             b"1\n8\n9\n",
+        ),
+    ];
+    for (name, program, input) in cases {
+        compare_exact(name, &["-n", "-c", "--", program], input);
+    }
+}
+
+/// `foreach` over plain values stays a path. An index piped into a constant
+/// stops before a later key, including under `?`. A `reduce` step that
+/// indexes names that element. jq is asked for each one.
+#[test]
+fn plain_foreach_index_pipe_and_reduce_match_jq() {
+    require_jq();
+    let programs = [
+        r#"[0,1,2] | path(foreach (0,1) as $x (.; .))"#,
+        r#"[0,1,2] | (foreach (0,1) as $x (.; .)) = 9"#,
+        r#"[0,1,2] | path(foreach (0,1) as $x (.[1]; .))"#,
+        r#"[0,1,2] | path(foreach (0,1) as $x (.; .[0]))"#,
+        r#"[0,1,2] | path(foreach (0,1) as $x (.; .; .[0]))"#,
+        r#"[0,1,2] | path(foreach . as $x (.; .))"#,
+        r#"[0,1,2] | path(foreach (0, .[0]) as $x (.; .))"#,
+        r#"[0,1,2] | path(foreach (0,1) as $x (.; ., 1))"#,
+        r#"[[9],[8]] | path(foreach (0,1) as $x (.; .[0]))"#,
+        r#"[0,1,2] | path(foreach .[] as $x (.; .))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .))"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; .[0]))"#,
+        r#"[0,1,2] | (reduce .[] as $x (.; .[0])) = 9"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; if $x == 0 then . else .[0] end))"#,
+        r#"[0,1,2] | path(reduce empty as $x (.; .[0]))"#,
+        r#"[0,1,2] | (reduce .[] as $x (0; . + $x)) = 9"#,
+        r#"[0,1,2] | path(reduce .[] as $x (.; getpath([0])))"#,
+        r#"{"a":1} | path(reduce .[] as $x (.; .a))"#,
+        r#"try ([0,1,2,3,4] | path(.[1,error("z")] | 9)) catch ."#,
+        r#"try ([0,1,2] | path((.[0], error("z"))?)) catch ."#,
+        r#"try ([0,1,2] | path((.[1:2] | 9)?)) catch ."#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    let cases: &[(&str, &str, &[u8])] = &[
+        (
+            "an index piped into a constant",
+            r#"try ([0,1,2,3,4] | path(.[1,(input)] | 9)) catch input"#,
+            b"7\n",
+        ),
+        (
+            "an optional index piped into a constant",
+            r#"try ([0,1,2,3,4] | path(.[1,(input)]? | 9)) catch input"#,
+            b"2\n7\n",
+        ),
+        (
+            "a slice pipe wrapped in ?",
+            r#"try ([0,1,2,3,4] | path((.[1,(input):] | 9)?)) catch input"#,
+            b"2\n7\n",
+        ),
+        (
+            "a slice wrapped in ? and then piped",
+            r#"try ([0,1,2,3,4] | path((.[1,(input):])? | 9)) catch input"#,
+            b"2\n7\n",
+        ),
+        (
+            "an object index piped into a constant",
+            r#"try ({"a":1} | path(.["a",(input)] | 9)) catch input"#,
+            b"\"b\"\n",
         ),
     ];
     for (name, program, input) in cases {
