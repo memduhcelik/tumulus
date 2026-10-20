@@ -1431,3 +1431,51 @@ fn slice_update_stops_before_a_later_bound() {
         compare_exact(name, &["-c", "--", program], input);
     }
 }
+
+/// A destructuring binding is not a path back to the input. `first` and
+/// `label` stop before a later slice bound. `reduce` whose steps leave the
+/// value in place is that path. jq is asked for each one.
+#[test]
+fn bound_update_forms_match_jq() {
+    require_jq();
+    let programs = [
+        r#"[0,1,2,3,4] | (. as [$a] | .[1:3]) = ["q"]"#,
+        r#"[0,1,2,3,4] | (. as $a | .[1:3]) = ["q"]"#,
+        r#"{"a":[0,1,2,3]} | (. as {a:$a} | .a[1:3]) = ["q"]"#,
+        r#"[0,1,2,3,4] | (. as [$a,$b] | .[0]) = "q""#,
+        r#"[0,1,2,3,4] | (reduce .[] as $x (.; .)) = 9"#,
+        r#"[0,1,2,3,4] | path(reduce .[] as $x (.; .))"#,
+        r#"[0,1,2,3,4] | (reduce empty as $x (.; .)) = 9"#,
+        r#"[0,1,2,3,4] | (reduce .[] as $x (0; . + $x)) = 9"#,
+        r#"[0,1,2,3,4] | (reduce .[] as $x (.; .) | .[1]) = 9"#,
+        r#"[[0],[1]] | (reduce .[] as [$a] (.; .)) = 9"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    let cases: &[(&str, &str, &[u8])] = &[
+        (
+            "first does not read a later bound",
+            r#"try (first(.[1,(input):]) = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "first keeps only the first slice",
+            r#"try (first(.[1,(input):]) = [9]) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+        (
+            "label does not read a later bound",
+            r#"try ((label $x | .[1,(input):]) = 9) catch input"#,
+            b"[0,1,2,3,4]\n7\n",
+        ),
+        (
+            "label reads a later bound after a write",
+            r#"try ((label $x | .[1,(input):]) = [9]) catch input"#,
+            b"[0,1,2,3,4]\n2\n",
+        ),
+    ];
+    for (name, program, input) in cases {
+        compare_exact(name, &["-c", "--", program], input);
+    }
+}

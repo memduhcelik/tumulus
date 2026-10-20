@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`(. as [$a] | .[1:3]) = ["q"]` is an invalid path. `(. as $a | .[1:3])` still writes that slice. `first` and `label` on the left of an update do not run a later slice bound after the place they take. `(reduce .[] as $x (.; .)) = 9` replaces the input. A `reduce` whose steps leave that value in place is that path, and `path` of it is `[]`.
+
 `path(.[ {end:3, start:1} ])` prints that object with the keys in the order they were written. Extra keys stay. A colon slice still prints `start` before `end`.
 
 When a slice of an update cannot be written, a later bound is not run. `try (.[1,(input):] = 9) catch input` reads the next input in `catch`. `del` on a string still runs a later bound, and a bound error replaces `Cannot delete fields from string`.

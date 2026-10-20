@@ -149,8 +149,8 @@ fn apply_rhs(
     });
     match result {
         Err(WalkErr::Path(err) | WalkErr::Write(err)) => Err(err),
-        Ok(()) if !saw => Ok(input.clone()),
-        Ok(()) => Ok(freeze(&edit)),
+        Err(WalkErr::Enough) | Ok(()) if !saw => Ok(input.clone()),
+        Err(WalkErr::Enough) | Ok(()) => Ok(freeze(&edit)),
     }
 }
 
@@ -212,7 +212,7 @@ fn update_modify(
     });
     match result {
         Err(WalkErr::Path(err) | WalkErr::Write(err)) => Err(err),
-        Ok(()) => {
+        Err(WalkErr::Enough) | Ok(()) => {
             if let Some(err) = string_del {
                 return Err(err);
             }
@@ -264,10 +264,12 @@ fn steps_of(root: &Value, out: POut) -> Result<Vec<Step>, WalkErr> {
 }
 
 /// A path failure can be swallowed by `(expr)?`. A write failure cannot,
-/// and it stops the walk before the next slice bound.
+/// and it stops the walk before the next slice bound. `Enough` stops the
+/// walk after `first` or `limit` has the values it needs.
 enum WalkErr {
     Path(Failure),
     Write(Failure),
+    Enough,
 }
 
 fn drive_paths(
@@ -353,6 +355,13 @@ fn send(
         }
         Filter::Param(name) => send_param(name, input, path, line, input_gen, ctx, emit),
         Filter::Define { rest, .. } => send(rest, input, path, line, input_gen, ctx, emit),
+        Filter::Label { slot, body } => {
+            send_label(*slot, body, input, path, line, input_gen, ctx, emit)
+        }
+        Filter::First(Some(inner)) => send_take(inner, 1, input, path, line, input_gen, ctx, emit),
+        Filter::Limit(count, expr) => {
+            send_limit(count, expr, input, path, line, input_gen, ctx, emit)
+        }
         _ => emit_run(filter, input, path, line, input_gen, ctx, emit),
     }
 }
@@ -580,7 +589,14 @@ fn send_bind(
                 env: &child_env,
                 pbinds: ctx.pbinds,
             };
-            match send(body, input, path, line, input_gen, &child, emit) {
+            // A plain `$name` keeps `.` on the input. Destructuring indexes
+            // the value, so the body is no longer a path back to that input.
+            let body_gen = if matches!(pattern, Pattern::Var(_)) {
+                input_gen
+            } else {
+                0
+            };
+            match send(body, input, path, line, body_gen, &child, emit) {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     *slot.borrow_mut() = Some(err);
@@ -669,8 +685,116 @@ fn send_optional(
     match send(inner, input, path, line, input_gen, ctx, emit) {
         Ok(()) => Ok(()),
         Err(WalkErr::Write(err)) => Err(WalkErr::Write(err)),
+        Err(WalkErr::Enough) => Err(WalkErr::Enough),
         Err(WalkErr::Path(_)) => Ok(()),
     }
+}
+
+/// `first` and `limit` keep that many places and do not run a later bound.
+fn send_take(
+    inner: &Filter,
+    want: usize,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    if want == 0 {
+        return Ok(());
+    }
+    let got = Cell::new(0usize);
+    let result = send(inner, input, path, line, input_gen, ctx, &mut |out| {
+        emit(out)?;
+        got.set(got.get() + 1);
+        if got.get() >= want {
+            Err(WalkErr::Enough)
+        } else {
+            Ok(())
+        }
+    });
+    match result {
+        Ok(()) | Err(WalkErr::Enough) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn send_limit(
+    count: &Filter,
+    expr: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let saved = line.get();
+    let (counts, count_err) = parts(eval_in(count, input, ctx.env));
+    line.set(saved);
+    for count in &counts {
+        line.set(saved);
+        match super::stream::limit_how(count) {
+            super::stream::LimitHow::None => {}
+            super::stream::LimitHow::All => {
+                send(expr, input, path, line, input_gen, ctx, emit)?;
+            }
+            super::stream::LimitHow::Count(need) => {
+                send_take(expr, need, input, path, line, input_gen, ctx, emit)?;
+            }
+            super::stream::LimitHow::Subtract => {
+                let got = take_limit_path(count, expr, input, path, line, input_gen, ctx)
+                    .map_err(path_walk)?;
+                for out in got {
+                    emit(out)?;
+                }
+            }
+        }
+    }
+    match count_err {
+        Some(failure) => Err(WalkErr::Path(failure)),
+        None => Ok(()),
+    }
+}
+
+fn send_label(
+    slot: u32,
+    body: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    input_gen: u64,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(POut) -> Result<(), WalkErr>,
+) -> Result<(), WalkErr> {
+    let (runtime, guard) = super::eval::LabelGuard::enter(slot);
+    let result = send(body, input, path, line, input_gen, ctx, emit);
+    drop(guard);
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if walk_label_hit(&err, runtime) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn walk_label_hit(err: &WalkErr, runtime: u32) -> bool {
+    let WalkErr::Path(failure) = err else {
+        return false;
+    };
+    if failure.stop.is_some() {
+        return false;
+    }
+    super::eval::is_label_hit(failure, runtime)
+}
+
+fn path_walk(err: PathErr) -> WalkErr {
+    WalkErr::Path(Failure {
+        partial: Vec::new(),
+        message: err.message,
+        caught: err.caught,
+        stop: err.stop,
+    })
 }
 
 fn send_call(
@@ -777,6 +901,7 @@ fn keep_walk(sent: Result<(), WalkErr>, slot: &RefCell<Option<WalkErr>>) -> Resu
         Err(err) => {
             let failure = match &err {
                 WalkErr::Path(failure) | WalkErr::Write(failure) => failure.clone(),
+                WalkErr::Enough => fail(String::new()),
             };
             *slot.borrow_mut() = Some(err);
             Err(failure)
@@ -2404,6 +2529,115 @@ fn run_collect(
     )])
 }
 
+/// `reduce` is the init's path when the stream is empty, or when every step
+/// leaves that same path in place. Anything else is the reduced value.
+fn kept_place(
+    init: &POut,
+    items: &[Value],
+    pattern: &Pattern,
+    alts: &[Pattern],
+    update: &Filter,
+    ctx: &Ctx,
+) -> Option<POut> {
+    if items.is_empty() {
+        return Some(init.clone());
+    }
+    if !init.carrier || !alts.is_empty() || !keeps_place(update) {
+        return None;
+    }
+    let mut acc = init.clone();
+    for item in items {
+        let mut step: Option<Vec<POut>> = None;
+        let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
+            let child_env = child_scope(frame, ctx.env);
+            let child = Ctx {
+                root: ctx.root,
+                next: ctx.next,
+                env: &child_env,
+                pbinds: ctx.pbinds,
+            };
+            let line = Cell::new(acc.line);
+            let gen = if acc.carrier { acc.value_gen } else { 0 };
+            match run(update, &acc.value, &acc.path, &line, gen, &child) {
+                Ok(outs) => {
+                    step = Some(outs);
+                    Ok(())
+                }
+                Err(_) => Err(fail(String::new())),
+            }
+        });
+        if matched.is_err() {
+            return None;
+        }
+        let Some(outs) = step else {
+            return None;
+        };
+        let [one] = outs.as_slice() else {
+            return None;
+        };
+        if !(one.carrier && same_steps(&one.path, &acc.path)) {
+            return None;
+        }
+        acc = one.clone();
+    }
+    Some(acc)
+}
+
+/// Steps that put the accumulator back where it was, so `reduce` can be a path.
+fn keeps_place(filter: &Filter) -> bool {
+    match filter {
+        Filter::Identity | Filter::Select(_) => true,
+        Filter::Pipe(left, right)
+        | Filter::Alt(left, right)
+        | Filter::And(left, right)
+        | Filter::Or(left, right) => keeps_place(left) && keeps_place(right),
+        Filter::Optional(inner) | Filter::Define { rest: inner, .. } => keeps_place(inner),
+        Filter::Label { body, .. } => keeps_place(body),
+        Filter::Try { body, handler } => {
+            keeps_place(body) && handler.as_deref().is_none_or(keeps_place)
+        }
+        Filter::If { yes, no, .. } => keeps_place(yes) && keeps_place(no),
+        Filter::Bind {
+            pattern,
+            alts,
+            body,
+            ..
+        } => alts.is_empty() && matches!(pattern, Pattern::Var(_)) && keeps_place(body),
+        _ => false,
+    }
+}
+
+fn same_steps(left: &[Step], right: &[Step]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(one, other)| same_step(one, other))
+}
+
+fn same_step(left: &Step, right: &Step) -> bool {
+    match (left, right) {
+        (Step::Key(left), Step::Key(right)) => left == right,
+        (Step::Index { at: left, .. }, Step::Index { at: right, .. }) => left == right,
+        (Step::Huge(left), Step::Huge(right)) => left == right,
+        (
+            Step::Slice {
+                start: left_start,
+                end: left_end,
+            },
+            Step::Slice {
+                start: right_start,
+                end: right_end,
+            },
+        ) => {
+            super::value::cmp_value(left_start, right_start) == 0
+                && super::value::cmp_value(left_end, right_end) == 0
+        }
+        (Step::Raw(left), Step::Raw(right)) => super::value::cmp_value(left, right) == 0,
+        _ => false,
+    }
+}
+
 fn run_reduce_path(
     stream: &Filter,
     pattern: &Pattern,
@@ -2431,6 +2665,10 @@ fn run_reduce_path(
             Ok(outs) => outs.into_iter().map(|item| item.value).collect::<Vec<_>>(),
             Err(err) => return Err(bare_path(err)),
         };
+        if let Some(kept) = kept_place(&init_out, &items, pattern, alts, update, ctx) {
+            out.push(kept);
+            continue;
+        }
         match super::eval::reduce_finished(&init_out.value, &items, pattern, alts, update, ctx.env)
         {
             Ok(value) => out.push(constant(value, path, line.get(), ctx.root)),
