@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
+
+Released on 2026-10-20.
 
 `(foreach (1) as [$a] ?// $v (.; .)) = 9` writes `9`. The alternative runs when taking that value apart is not a path. `foreach (1) as [$a]` stays an invalid path.
 
