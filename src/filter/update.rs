@@ -1972,13 +1972,14 @@ fn run(
         Filter::Foreach {
             stream,
             pattern,
+            alts,
             init,
             update,
             extract,
-            ..
         } => run_foreach(
             stream,
             pattern,
+            alts,
             init,
             update,
             extract.as_deref(),
@@ -2042,6 +2043,7 @@ fn stop_err(stop: PathStop) -> PathErr {
 fn run_foreach(
     stream: &Filter,
     pattern: &Pattern,
+    alts: &[Pattern],
     init: &Filter,
     update: &Filter,
     extract: Option<&Filter>,
@@ -2089,6 +2091,7 @@ fn run_foreach(
                     item.carrier,
                     breaks,
                     pattern,
+                    alts,
                     update,
                     extract,
                     ctx,
@@ -2118,21 +2121,64 @@ fn foreach_yield(
     item_carrier: bool,
     breaks: bool,
     pattern: &Pattern,
+    alts: &[Pattern],
     update: &Filter,
     extract: &Filter,
     ctx: &Ctx,
     outputs: &mut Vec<POut>,
 ) -> Result<(), PathErr> {
-    // `.[] as [$a]` indexes a value reached through the input. `foreach (0)`
-    // does not, so taking that number apart is an invalid path.
-    if !item_carrier && pattern_indexes(pattern) {
-        return Err(destructure_near(pattern, item, ctx));
+    let mut pats = Vec::with_capacity(1 + alts.len());
+    pats.push(pattern);
+    pats.extend(alts);
+    let mut names = Vec::new();
+    if !alts.is_empty() {
+        super::parse::bind_names(pattern, alts, &mut names);
     }
+    for (index, pat) in pats.iter().enumerate() {
+        let last = index + 1 == pats.len();
+        // `.[] as [$a]` indexes a value reached through the input. A plain
+        // `1` does not, so taking it apart is an invalid path and `?//` runs.
+        if !item_carrier && pattern_indexes(pat) {
+            let err = destructure_near(pat, item, ctx);
+            if err.stop.is_none() && !last {
+                continue;
+            }
+            return Err(err);
+        }
+        match foreach_one(
+            state, item, pat, &names, breaks, update, extract, ctx, outputs,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.stop.is_none() && !last => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn foreach_one(
+    state: &mut POut,
+    item: &Value,
+    pattern: &Pattern,
+    names: &[String],
+    breaks: bool,
+    update: &Filter,
+    extract: &Filter,
+    ctx: &Ctx,
+    outputs: &mut Vec<POut>,
+) -> Result<(), PathErr> {
     let mut step_err: Option<PathErr> = None;
     let matched = super::eval::match_pat(pattern, item, ctx.env, &[], &mut |frame| {
         if step_err.is_some() {
             return Ok(());
         }
+        let owned;
+        let frame = if names.is_empty() {
+            frame
+        } else {
+            owned = null_names(frame, names);
+            &owned
+        };
         let child_env = child_scope(frame, ctx.env);
         let child = Ctx {
             root: ctx.root,

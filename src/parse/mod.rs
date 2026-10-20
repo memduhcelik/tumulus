@@ -30,6 +30,9 @@ pub struct LocatedValue {
     pub value: Value,
     /// Line number jq prints in a runtime error for this value.
     pub line: usize,
+    /// Byte just after this value in the buffer that was parsed. `0` when
+    /// the caller does not need a file boundary.
+    pub end: usize,
 }
 
 /// Values read from one input, plus a parse error if the tail is not valid JSON.
@@ -204,6 +207,7 @@ pub fn parse_seq(bytes: &[u8]) -> Vec<SeqItem> {
         push_chunk(
             &mut items,
             chunk,
+            start,
             start_line,
             start_column,
             ended_by_rs,
@@ -226,6 +230,7 @@ fn step(line: &mut usize, column: &mut usize, byte: u8) {
 fn push_chunk(
     items: &mut Vec<SeqItem>,
     chunk: &[u8],
+    origin: usize,
     start_line: usize,
     start_column: usize,
     ended_by_rs: bool,
@@ -258,7 +263,7 @@ fn push_chunk(
                 {
                     let value = value.clone();
                     values.pop();
-                    push_kept(items, &values, &chunk[base..], line);
+                    push_kept(items, &values, &chunk[base..], line, origin + base);
                     if ended_by_rs {
                         let column = end_column + 1;
                         let phrase = if matches!(value, Value::Number(_)) {
@@ -274,13 +279,13 @@ fn push_chunk(
                             "Potentially truncated top-level numeric value at EOF at line {end_line}, column {end_column}"
                         )));
                     } else {
-                        push_kept(items, &[(value, end)], &chunk[base..], line);
+                        push_kept(items, &[(value, end)], &chunk[base..], line, origin + base);
                     }
                     return;
                 }
             }
         }
-        push_kept(items, &values, &chunk[base..], line);
+        push_kept(items, &values, &chunk[base..], line, origin + base);
         let Some(err) = scanned.error else {
             return;
         };
@@ -322,12 +327,19 @@ fn push_chunk(
     }
 }
 
-fn push_kept(items: &mut Vec<SeqItem>, values: &[(Value, usize)], chunk: &[u8], start_line: usize) {
+fn push_kept(
+    items: &mut Vec<SeqItem>,
+    values: &[(Value, usize)],
+    chunk: &[u8],
+    start_line: usize,
+    origin: usize,
+) {
     for (value, end) in values {
         let line = start_line + chunk[..*end].iter().filter(|byte| **byte == b'\n').count();
         items.push(SeqItem::Value(LocatedValue {
             value: value.clone(),
             line,
+            end: origin + *end,
         }));
     }
 }
@@ -646,7 +658,11 @@ fn locate(text: &[u8], bom: usize, parsed: Vec<(Value, usize)>) -> Vec<LocatedVa
         // `end` is the next byte in the text that was parsed. The reader
         // also counts the leading BOM, which that text skipped.
         let line = cursor.line_at(text, end + bom, is_atom(&value));
-        out.push(LocatedValue { value, line });
+        out.push(LocatedValue {
+            value,
+            line,
+            end: 0,
+        });
     }
     out
 }

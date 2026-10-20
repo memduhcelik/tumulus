@@ -167,8 +167,8 @@ fn run(out: &mut dyn Write) -> Result<i32, Error> {
         )?;
     } else if options.stream || (!options.seq && !options.files.is_empty()) {
         // Every file is one stream. An array or an object can open in one
-        // file and close in a later one. `--seq` still reads each file alone.
-        // Standard input on its own stays one read.
+        // file and close in a later one. Plain `--seq` is joined in
+        // `apply_values`. Standard input on its own stays one read.
         apply_shared(&options, &program, &env, &mut run, out)?;
     } else {
         apply_values(
@@ -253,6 +253,7 @@ fn apply_values(
             seq,
             program,
             "<stdin>",
+            &[],
             env,
             run,
             out,
@@ -262,6 +263,11 @@ fn apply_values(
         }
         run.status = outcome.status;
         return Ok(());
+    }
+    // `--seq` is one byte stream. A number can stop in one file and
+    // finish in the next, and a truncated number is warned once, at the end.
+    if seq {
+        return apply_seq_files(files, style, program, env, run, out);
     }
     let mut dirs = DirNote::default();
     let mut saw_dir = false;
@@ -283,7 +289,7 @@ fn apply_values(
             Ok(bytes) => {
                 saw_file = true;
                 let source = if path == "-" { "<stdin>" } else { path };
-                let outcome = apply(&bytes, style, seq, program, source, env, run, out)?;
+                let outcome = apply(&bytes, style, seq, program, source, &[], env, run, out)?;
                 if outcome.jq_halt {
                     run.stopped = true;
                     run.status = outcome.status;
@@ -312,7 +318,7 @@ fn apply_values(
     }
     // `--seq` still parses an empty input when every file was a directory.
     if seq && saw_dir && !saw_file && !run.stopped {
-        let outcome = apply(b"", style, true, program, "<stdin>", env, run, out)?;
+        let outcome = apply(b"", style, true, program, "<stdin>", &[], env, run, out)?;
         if outcome.jq_halt {
             run.stopped = true;
             run.status = outcome.status;
@@ -330,12 +336,13 @@ fn apply(
     seq: bool,
     program: &Filter,
     source: &str,
+    spans: &[SeqSpan],
     env: &[(String, Value)],
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<Outcome, Error> {
     if seq {
-        return apply_seq(bytes, style, program, source, env, run, out);
+        return apply_seq(bytes, style, program, source, spans, env, run, out);
     }
     let parsed = parse_stream(bytes)?;
     let mut failed = false;
@@ -431,26 +438,178 @@ fn apply_incremental(
     Ok(())
 }
 
+/// One file inside a joined `--seq` input. `start` is its first byte.
+struct SeqSpan {
+    name: String,
+    start: usize,
+}
+
+fn apply_seq_files(
+    files: &[String],
+    style: Style,
+    program: &Filter,
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let mut buf = Vec::new();
+    let mut spans = Vec::new();
+    let mut dirs = DirNote::default();
+    let mut saw_dir = false;
+    let mut saw_file = false;
+    // Values already handed to the program. A later file can finish a
+    // number, so the buffer is parsed again, and those values are not run twice.
+    let mut ran = 0usize;
+    for (index, path) in files.iter().enumerate() {
+        if run.stopped {
+            break;
+        }
+        if path_is_dir(path) {
+            // The message waits until another file is opened. The last
+            // directory of the run stays quiet, and the status is still 2.
+            dirs.directory();
+            saw_dir = true;
+            run.missing = true;
+            if run.status == 0 {
+                run.status = 2;
+            }
+        } else {
+            dirs.other();
+            match read_input(path) {
+                Ok(bytes) => {
+                    saw_file = true;
+                    let source = if path == "-" {
+                        "<stdin>".to_string()
+                    } else {
+                        path.to_string()
+                    };
+                    spans.push(SeqSpan {
+                        name: source,
+                        start: buf.len(),
+                    });
+                    buf.extend_from_slice(&bytes);
+                }
+                Err(err) if path != "-" && err.kind() == io::ErrorKind::NotFound => {
+                    eprintln!("jq: error: Could not open file {path}: {}", os_reason(&err));
+                    if run.status == 0 {
+                        run.status = 2;
+                    }
+                    run.missing = true;
+                }
+                Err(err) => return Err(Error::new(format!("cannot read {path}: {err}"))),
+            }
+        }
+        if !saw_file || run.stopped {
+            continue;
+        }
+        // An error at EOF may still be repaired by a later file. `halt`
+        // stops before that file is opened, once the current value has run.
+        let items = parse_seq(&buf);
+        let more = index + 1 < files.len();
+        let end = seq_run_end(&items, more);
+        if end <= ran {
+            continue;
+        }
+        let outcome = drive_seq(
+            &items[ran..end],
+            &buf,
+            style,
+            program,
+            "<stdin>",
+            &spans,
+            env,
+            run,
+            out,
+        )?;
+        ran = end;
+        if outcome.jq_halt {
+            run.stopped = true;
+            run.status = outcome.status;
+            break;
+        }
+        if outcome.status != 0 {
+            run.status = outcome.status;
+        } else if outcome.clear_failure && run.status == 5 && !run.missing {
+            // A later value that runs cleanly clears an earlier filter failure.
+            run.status = 0;
+        }
+        if outcome.halt {
+            break;
+        }
+    }
+    // `--seq` still parses an empty input when every file was a directory.
+    if saw_dir && !saw_file && !run.stopped {
+        let outcome = apply(b"", style, true, program, "<stdin>", &[], env, run, out)?;
+        if outcome.jq_halt {
+            run.stopped = true;
+            run.status = outcome.status;
+        }
+    }
+    if saw_dir && !run.stopped {
+        run.status = 2;
+    }
+    Ok(())
+}
+
+/// How many seq items are safe to run. The last error is kept back while
+/// another file might still finish the value.
+fn seq_run_end(items: &[SeqItem], more: bool) -> usize {
+    if more {
+        if let Some(SeqItem::Error(message)) = items.last() {
+            if message.contains(" at EOF ") {
+                return items.len() - 1;
+            }
+        }
+    }
+    items.len()
+}
+
 fn apply_seq(
     bytes: &[u8],
     style: Style,
     program: &Filter,
     source: &str,
+    spans: &[SeqSpan],
+    env: &[(String, Value)],
+    run: &mut Run,
+    out: &mut dyn Write,
+) -> Result<Outcome, Error> {
+    drive_seq(
+        &parse_seq(bytes),
+        bytes,
+        style,
+        program,
+        source,
+        spans,
+        env,
+        run,
+        out,
+    )
+}
+
+fn drive_seq(
+    items: &[SeqItem],
+    bytes: &[u8],
+    style: Style,
+    program: &Filter,
+    source: &str,
+    spans: &[SeqSpan],
     env: &[(String, Value)],
     run: &mut Run,
     out: &mut dyn Write,
 ) -> Result<Outcome, Error> {
     let mut failed = false;
     let mut any = false;
-    for item in parse_seq(bytes) {
+    for item in items {
         match item {
             SeqItem::Error(message) => {
                 eprintln!("jq: ignoring parse error: {message}");
             }
             SeqItem::Value(item) => {
                 any = true;
-                set_input_line(item.line);
-                set_output_place(format!("{source}:{}", item.line));
+                let (name, line) = seq_place(source, spans, bytes, item.end, item.line);
+                set_input_line(line);
+                set_output_place(format!("{name}:{line}"));
                 match run_program(program, &item.value, env, style, run, out)? {
                     Ok(()) if run.stopped => {
                         return Ok(Outcome {
@@ -471,7 +630,7 @@ fn apply_seq(
                                 jq_halt: true,
                             });
                         }
-                        report_error(&format!("{source}:{}", item.line), &failure);
+                        report_error(&format!("{name}:{line}"), &failure);
                         failed = true;
                     }
                 }
@@ -484,6 +643,46 @@ fn apply_seq(
         clear_failure: !failed && any,
         jq_halt: false,
     })
+}
+
+/// File and line of a `--seq` value. One file keeps the line the parser
+/// counted. Several files use the file that holds the value's last byte,
+/// and the line count starts again in that file.
+fn seq_place(
+    source: &str,
+    spans: &[SeqSpan],
+    bytes: &[u8],
+    end: usize,
+    parsed_line: usize,
+) -> (String, usize) {
+    if spans.len() < 2 {
+        let name = if spans.len() == 1 {
+            spans[0].name.clone()
+        } else {
+            source.to_string()
+        };
+        return (name, parsed_line);
+    }
+    let at = end.saturating_sub(1);
+    let mut index = 0usize;
+    for (i, span) in spans.iter().enumerate() {
+        if span.start <= at {
+            index = i;
+        } else {
+            break;
+        }
+    }
+    let start = spans[index].start;
+    let stop = spans
+        .get(index + 1)
+        .map(|span| span.start)
+        .unwrap_or(bytes.len());
+    let local = end.saturating_sub(start).min(stop.saturating_sub(start));
+    let line = 1 + bytes[start..start + local]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    (spans[index].name.clone(), line)
 }
 
 /// One stream for `.` and for `input`. `-n` does not take a value first.

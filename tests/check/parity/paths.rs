@@ -1713,6 +1713,7 @@ fn later_reduce_step_optional_and_destructure_match_jq() {
 fn indexed_destructure_optional_field_and_alt_match_jq() {
     require_jq();
     let programs = [
+        r#"[0,1,2] | (foreach (1) as [$a] ?// $v (.; .)) = 9"#,
         r#"[[0,1,2,3,4]] | (.[0] as [$a] | .[1:3]) = ["q"]"#,
         r#"[1,2,3,4] | (.[0] as [$a] | .[1:3]) = ["q"]"#,
         r#"[1,2,3,4] | (.[] as [$a] | .[1:3]) = ["q"]"#,

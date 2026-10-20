@@ -637,6 +637,41 @@ fn joined_files_match_jq() {
     );
 }
 
+/// `--seq` joins files. A number cut off at the end of one file is one
+/// warning at the real end, not another warning at that file.
+#[test]
+fn seq_number_cut_across_files_warns_once() {
+    require_jq();
+    let (dir, _guard) = scratch("seq-cut");
+    let head = write_bytes(&dir, "head.seq", b"\x1e12");
+    let tail = write_bytes(&dir, "tail.seq", b"3");
+    compare_exact(
+        "still cut at the end",
+        &["--seq", "-c", ".", &head, &tail],
+        b"",
+    );
+    let done = write_bytes(&dir, "done.seq", b"3\n");
+    compare_exact(
+        "finished in the next file",
+        &["--seq", "-c", ".", &head, &done],
+        b"",
+    );
+    let next = write_bytes(&dir, "next.seq", b"\x1e4\n");
+    compare_exact(
+        "cut by the next record",
+        &["--seq", "-c", ".", &head, &next],
+        b"",
+    );
+    let one = write_bytes(&dir, "one.seq", b"\x1e1\n");
+    let missing = dir.join("missing.seq");
+    let missing = missing.to_str().expect("utf-8");
+    compare_exact(
+        "halt does not open the next file",
+        &["--seq", "-c", "halt", &one, missing],
+        b"",
+    );
+}
+
 #[test]
 fn inputs_span_files_match_jq() {
     require_jq();
