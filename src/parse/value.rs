@@ -61,7 +61,10 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 None => return Err(self.fail("Unfinished JSON term", true)),
-                Some('}') => return Err(self.bump_fail("Unmatched '}'")),
+                // A `}` after a value, as in `[1}`, is the object-pair message.
+                // A `}` where the value itself should be, as in `[1,}`, stays
+                // an unmatched brace.
+                Some('}') => return Err(self.bump_fail("Objects must consist of key:value pairs")),
                 Some(':') => return Err(self.bump_fail("':' not as part of an object")),
                 Some(_) => return Err(self.expected_separator()),
             }

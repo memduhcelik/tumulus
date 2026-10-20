@@ -1776,3 +1776,57 @@ fn indexed_destructure_optional_field_and_alt_match_jq() {
         compare_exact(program, &["-n", "-c", "--", program], b"");
     }
 }
+
+/// A `}` right after a value in an array is jq's object-pair message.
+/// Under `--stream-errors` that `}` after a nested value names that value's
+/// index. `path` of a `reduce` step that slices with `|=` names element 0
+/// of `[result, []]`. jq is asked for each one.
+#[test]
+fn brace_after_value_and_reduce_slice_path_match_jq() {
+    require_jq();
+    let texts = [
+        ("brace after a value", &["-c", "."][..], &b"[1}"[..]),
+        ("brace after a second value", &["-c", "."], b"[1,2}"),
+        ("brace after a nested array", &["-c", "."], b"[[1]}"),
+        ("brace after a nested object", &["-c", "."], b"[{}}"),
+        ("brace where a value was required", &["-c", "."], b"[1,}"),
+        (
+            "stream-errors after a nested array",
+            &["-c", "--stream-errors", "."],
+            b"[[1]}",
+        ),
+        (
+            "stream-errors after a nested object",
+            &["-c", "--stream-errors", "."],
+            b"[{\"a\":1}}",
+        ),
+        (
+            "stream-errors after an empty object",
+            &["-c", "--stream-errors", "."],
+            b"[{}}",
+        ),
+        (
+            "stream-errors after a later object",
+            &["-c", "--stream-errors", "."],
+            b"[1,{\"a\":1}}",
+        ),
+        (
+            "stream-errors keeps the held scalar",
+            &["-c", "--stream-errors", "."],
+            b"[1,2}",
+        ),
+    ];
+    for (name, args, input) in texts {
+        compare_exact(name, args, input);
+    }
+    let programs = [
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[1:3] |= .))"#,
+        r#"[0,1,2,3,4] | path(reduce (0) as $i (.; .[1:3] |= [.]))"#,
+        r#"[0,1,2,3,4] | path(reduce .[] as $x (.; .[1:3] |= [.]))"#,
+        r#"[0,1,2,3,4] | path(.[1:3] |= .)"#,
+        r#"[0,1,2,3,4] | path(.[1:3] += [1])"#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}

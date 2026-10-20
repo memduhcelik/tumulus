@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A `}` right after a value in an array, as in `[1}`, is `Objects must consist of key:value pairs`. A `}` where the next value should be, as in `[1,}`, stays `Unmatched '}'`. Under `--stream-errors`, that brace after a nested array or object names the index of the value that just closed. `path(reduce (0) as $i (.; .[1:3] |= .))` on `[0,1,2,3,4]` names element `0` of `[[0,1,2,3,4],[]]`.
+
 `--stream` prints the same items and reads a large file faster than jq. On the city lots file, `--stream -c .` took 11.15, 11.30, and 11.39 seconds beside jq's 18.98, 19.05, and 19.09. `--stream -c empty` took 3.48, 3.16, and 3.10 seconds beside jq's 3.56, 3.67, and 3.61. Compact printing of that file took 1.23, 1.23, and 1.24 seconds beside jq's 3.71, 3.66, and 3.68.
 
 Under `--seq --stream`, a string cut off by the next separator is `Invalid numeric literal`. A `true`, `false`, or `null` prefix is `Invalid literal`. A container is still `Truncated value`.

@@ -731,10 +731,17 @@ impl<'a> Walker<'a> {
                 Ok(Act::Done)
             }
             Some('}') => {
-                self.mark_arr(arr);
                 if arr.after_comma && arr.held.is_none() {
+                    self.mark_arr(arr);
                     return Err(self.parser.bump_fail("Expected another key:value pair"));
                 }
+                // A nested array or object has already moved the index to the
+                // next slot. The brace still belongs to the value that closed.
+                if arr.held.is_none() && arr.index > 0 {
+                    arr.index -= 1;
+                    arr.index_value = Value::Number(index_text(arr.index));
+                }
+                self.mark_arr(arr);
                 Err(self
                     .parser
                     .bump_fail("Unmatched '}' in the middle of an array"))

@@ -2052,6 +2052,11 @@ fn run(
         } => run_reduce_path(
             stream, pattern, alts, init, update, input, path, line, input_gen, ctx,
         ),
+        // `path(f |= g)` is `path([f |= g, []][0])`. The same is true of
+        // `+=` and the other modify operators. `=` stays the updated value.
+        Filter::Update { op, .. } if *op != UpdateOp::Assign => {
+            run_modify_path(filter, input, path, line, ctx)
+        }
         other => run_fallback(other, input, path, line, ctx),
     }
 }
@@ -4145,6 +4150,41 @@ fn object_field(value: &Value, key: &str) -> Value {
 
 fn child_at(value: &Value, step: &Step) -> Result<Value, String> {
     value_at(value, std::slice::from_ref(step))
+}
+
+/// A modify update inside `path` is the first element of `[update, []]`.
+fn run_modify_path(
+    filter: &Filter,
+    input: &Value,
+    path: &[Step],
+    line: &Cell<u64>,
+    ctx: &Ctx,
+) -> Result<Vec<POut>, PathErr> {
+    let lineage = line.get();
+    let values = match eval_in(filter, input, ctx.env) {
+        Ok(values) => values,
+        Err(failure) => {
+            let partial = failure
+                .partial
+                .into_iter()
+                .map(|value| constant(value, path, lineage, ctx.root))
+                .collect();
+            return Err(PathErr {
+                partial,
+                message: failure.message,
+                caught: failure.caught,
+                stop: failure.stop,
+            });
+        }
+    };
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut items = values;
+    items.push(Value::array(Vec::new()));
+    let shown = Value::array(items);
+    let zero = Value::Number(crate::value::Text::from("0"));
+    Err(bare(near_access(&zero, &shown)))
 }
 
 fn run_fallback(
