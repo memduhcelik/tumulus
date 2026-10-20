@@ -8,6 +8,9 @@ mod value;
 
 use std::io::Write;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::error::Error;
 use crate::print::{self, Style};
 use crate::value::Value;
@@ -62,6 +65,12 @@ pub fn write_input(bytes: &[u8], style: Style, out: &mut dyn Write) -> Result<()
 /// macOS jq ends the input at a NUL that has no newline after it.
 /// Linux jq keeps the later bytes; the NUL only ends that token.
 pub(crate) fn nul_cut(bytes: &[u8]) -> usize {
+    // Tests count every byte this search is asked to walk. `--stream` used to
+    // ask for the whole file again on each read.
+    #[cfg(test)]
+    NUL_CUT_BYTES.with(|cell| {
+        cell.set(cell.get().saturating_add(bytes.len() as u64));
+    });
     #[cfg(target_os = "macos")]
     {
         nul_cut_at(bytes)
@@ -120,6 +129,23 @@ impl NulScan {
             bytes.len()
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static NUL_CUT_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Bytes [`nul_cut`] has been asked to walk on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn nul_cut_bytes() -> u64 {
+    NUL_CUT_BYTES.with(|cell| cell.get())
+}
+
+/// Start a fresh count for [`nul_cut_bytes`].
+#[cfg(test)]
+pub(crate) fn reset_nul_cut_bytes() {
+    NUL_CUT_BYTES.with(|cell| cell.set(0));
 }
 
 fn nul_cut_at(bytes: &[u8]) -> usize {

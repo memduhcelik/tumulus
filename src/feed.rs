@@ -1151,6 +1151,61 @@ impl Chunk {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    /// `--stream` must not search the whole file for a NUL on every read.
+    /// Doing that again is quadratic on macOS. The count is the bytes
+    /// `nul_cut` was asked to walk, so a fast machine cannot hide it.
+    #[test]
+    fn stream_does_not_reread_for_a_nul() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("stream-one-pass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wide.json");
+        // More than one 4096-byte read, so a search of the whole buffer on
+        // every read walks the file many times over.
+        let mut body = vec![b' '; 64 * 4096];
+        body.extend_from_slice(b"1\n");
+        std::fs::write(&path, &body).expect("temp file");
+        let path = path.to_str().expect("temp path").to_string();
+
+        crate::parse::reset_nul_cut_bytes();
+        let output = crate::execute(
+            &[
+                "tumulus".to_string(),
+                "-c".to_string(),
+                "--stream".to_string(),
+                ".".to_string(),
+                path,
+            ],
+            b"",
+        );
+        let seen = crate::parse::nul_cut_bytes();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            output.code, 0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"[[],1]\n");
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            seen <= body.len() as u64,
+            "reread the file for every streamed read: searched {seen} bytes of a {} byte file",
+            body.len()
+        );
+    }
+}
+
 fn with<T>(read: impl FnOnce(&Session) -> T) -> Option<T> {
     SESSION.with(|slot| slot.borrow().as_ref().map(read))
 }
