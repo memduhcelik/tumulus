@@ -20,6 +20,36 @@ Build a release binary with `cargo build --release`. The binary is `target/relea
 
 `cargo test --test check -- --exact jq_suite::compare_jq_test_file --nocapture` runs every program and input from `tests/jq.test` through both and prints how many come out the same. That file is the `tests/jq.test` shipped with jq 1.7.1. The expected lines in it only mark the end of a case. The run asks jq each time. A mismatch is printed and does not fail the test. Of the 447 programs, 444 come out the same on stdout, stderr, and the exit status.
 
+## An example
+
+`tests/fixtures/settings.json` is one settings object. These commands print the same text with tumulus and with jq.
+
+```sh
+tumulus -c '.ids' tests/fixtures/settings.json
+```
+
+```json
+{"exact":9007199254740993,"neg_zero":-0,"long":123456789012345678901234567890}
+```
+
+`exact` is one past 2^53 and `long` is thirty digits. Both stay in decimal. `neg_zero` stays `-0`.
+
+```sh
+tumulus -c '[.limits.tiny, .limits.huge]' tests/fixtures/settings.json
+```
+
+```json
+[5E-324,1.7976931348623157E+308]
+```
+
+```sh
+tumulus -c '.labels | {tr, jp, emoji}' tests/fixtures/settings.json
+```
+
+```json
+{"tr":"Şehir İçi Ölçüm","jp":"潮位計","emoji":"🌊 high tide"}
+```
+
 ## What works
 
 Input is standard input or files. `-` is standard input. With no filter, the filter is `.`. The files are one stream. An array or an object can open in one file and close in a later one. A value already written is kept when that joined text is not valid JSON. The message is jq's parse error and the exit status is 5.
