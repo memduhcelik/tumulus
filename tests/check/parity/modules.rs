@@ -559,3 +559,110 @@ fn search_key_matches_jq() {
         b"",
     );
 }
+
+/// A library that ends in a filter is a compile error for `import`,
+/// `include`, and `modulemeta`.
+#[test]
+fn library_main_matches_jq() {
+    require_jq();
+    let (dir, _guard) = scratch("libmain");
+    let lib = dir.join("lib");
+    let home = dir.join("home");
+    let work = dir.join("work");
+    fs::create_dir_all(&lib).unwrap();
+    fs::create_dir_all(home.join(".jq")).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    fs::write(lib.join("ok.jq"), "def f: 1;\n").unwrap();
+    fs::write(lib.join("main.jq"), "def f: 1; 2\n").unwrap();
+    fs::write(lib.join("call.jq"), "def f: 1; f\n").unwrap();
+    fs::write(lib.join("only.jq"), "1\n").unwrap();
+    fs::write(lib.join("emptyf.jq"), "empty\n").unwrap();
+    fs::write(lib.join("defempty.jq"), "def f: 1; empty\n").unwrap();
+    fs::write(lib.join("modonly.jq"), "module {\"name\":\"m\"};\n").unwrap();
+    fs::write(
+        lib.join("modok.jq"),
+        "module {\"name\":\"m\"}; def f: 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        lib.join("usesmain.jq"),
+        "import \"main\" as m; def f: 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        lib.join("two.jq"),
+        "import \"main\" as a; import \"only\" as b; def f: 1;\n",
+    )
+    .unwrap();
+    fs::write(lib.join("missmain.jq"), "import \"nope\" as n; 2\n").unwrap();
+    fs::write(
+        lib.join("mix.jq"),
+        "import \"main\" as m; import \"nope\" as n; def f: 1;\n",
+    )
+    .unwrap();
+    fs::write(work.join("cwdmain.jq"), "def f: 9; 8\n").unwrap();
+    let lib_path = lib.to_str().unwrap();
+    let programs = [
+        r#"import "main" as m; m::f"#,
+        r#"include "main"; f"#,
+        r#""main" | modulemeta"#,
+        r#"try ("main" | modulemeta) catch ."#,
+        r#""main" | modulemeta, 9"#,
+        r#"("ok","main") | modulemeta"#,
+        r#"import "only" as m; 1"#,
+        r#"import "call" as m; 1"#,
+        r#"import "emptyf" as m; 1"#,
+        r#"import "defempty" as m; 1"#,
+        r#"include "defempty"; 1"#,
+        r#"import "ok" as m; m::f"#,
+        r#"import "modonly" as m; 1"#,
+        r#"import "modok" as m; m::f"#,
+        r#""modok" | modulemeta"#,
+        r#"import "usesmain" as u; 1"#,
+        r#""usesmain" | modulemeta"#,
+        r#"import "two" as t; 1"#,
+        r#"import "missmain" as m; 1"#,
+        r#"import "mix" as m; 1"#,
+        r#"import "main" as a; import "only" as b; 1"#,
+        r#"import "nope" as a; import "gone" as b; 1"#,
+        r#"import "main" as a; import "nope" as b; 1"#,
+        r#"import "nope" as a; import "main" as b; import "only" as c; 1"#,
+    ];
+    for program in programs {
+        compare_module(
+            program,
+            &dir,
+            &home,
+            &["-n", "-c", "-L", lib_path, program],
+            b"",
+        );
+    }
+    compare_module(
+        "run as program",
+        &work,
+        &home,
+        &["-n", "-c", "-f", lib.join("main.jq").to_str().unwrap()],
+        b"",
+    );
+    compare_module(
+        "defs need a program",
+        &work,
+        &home,
+        &["-n", "-f", lib.join("ok.jq").to_str().unwrap()],
+        b"",
+    );
+    compare_module(
+        "cwd import",
+        &work,
+        &home,
+        &["-n", "-c", r#"import "cwdmain" as m; 1"#],
+        b"",
+    );
+    compare_module(
+        "exit null",
+        &dir,
+        &home,
+        &["-n", "-e", "-c", "-L", lib_path, r#""main" | modulemeta"#],
+        b"",
+    );
+}

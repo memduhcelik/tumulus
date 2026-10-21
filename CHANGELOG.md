@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A library that contains a filter besides its definitions is a compile error. The message is `library should only have function definitions, not a main expression`, and the exit status is 3. `import` and `include` stop. `modulemeta` prints the message and yields null.
+
 A string built from several `\( )` pieces runs the rightmost piece outermost. `"\(1,2) \(3,4)"` prints `"1 3"`, `"2 3"`, `"1 4"`, and `"2 4"`. Each piece to the left runs again for every value on the right.
 
 A slice from 0 with no end on a non-empty array leaves that array in place for the next `reduce` or `foreach` step. `path(reduce (0,1) as $i (.; .[$i:]))` on `[0,1,2,3,4]` names the result `[1,2,3,4]`. `path(foreach (0,1) as $i (.; .[$i:]; .))` is a path for each step. A string and an empty array stay results.

@@ -262,6 +262,7 @@ pub(super) fn compile_module_source(
 ) -> Result<Vec<super::modules::Export>, ProgramError> {
     let _place = enter_place(place);
     let mut parser = Parser::open(source, true);
+    parser.library = true;
     let filter = parser.parse_program()?;
     parser.skip_ws();
     if !parser.eof() {
@@ -285,6 +286,7 @@ pub(super) fn compile_module_source(
 pub(super) fn describe_module(source: &str, place: &str) -> Result<Value, ProgramError> {
     let _place = enter_place(place);
     let mut parser = Parser::open(source, false);
+    parser.library = true;
     let filter = parser.parse_program()?;
     parser.skip_ws();
     if !parser.eof() {
@@ -1784,6 +1786,8 @@ pub(super) struct Parser<'a> {
     scopes: Vec<PScope>,
     /// Load `import` and `include`. `modulemeta` only records them.
     link: bool,
+    /// This source is a library. A filter after the definitions is rejected.
+    library: bool,
     /// `module` header, if the file has one.
     meta: Option<Value>,
     /// Import records, in source order.
@@ -1831,6 +1835,7 @@ impl<'a> Parser<'a> {
                 params: Vec::new(),
             }],
             link,
+            library: false,
             meta: None,
             deps: Vec::new(),
             exports: Vec::new(),
@@ -1905,17 +1910,30 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.resolve_imports()?;
+        // A library that ends in a filter is rejected even when an import
+        // would have failed. The import errors are kept when the file itself
+        // is only definitions. The main program still reports the import
+        // error before it parses the rest.
+        let import_err = self.resolve_imports().err();
+        if import_err.is_some() && !self.library {
+            return Err(import_err.expect("import error"));
+        }
         self.skip_ws();
         let mut body = if self.eof() {
             if self.meta.is_none() && self.deps.is_empty() {
-                return Err(ProgramError::Syntax);
+                return Err(import_err.unwrap_or(ProgramError::Syntax));
             }
             self.tail_missing = true;
             Filter::Empty
         } else {
             self.parse_pipe()?
         };
+        if self.library && !self.tail_missing {
+            return Err(super::modules::library_main(self.link));
+        }
+        if let Some(err) = import_err {
+            return Err(err);
+        }
         for (name, value) in self.data.iter().rev() {
             body = Filter::Bind {
                 expr: Box::new(Filter::Literal(value.clone())),
@@ -2007,30 +2025,49 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Later imports are loaded first. The last error is the one jq reports.
-    /// Successful imports are installed in source order.
+    /// Imports are loaded from the end. Each library that ends in a filter
+    /// adds one error and the walk continues. Any other error stops it, and
+    /// the library errors already seen stay in front of that one. Successful
+    /// imports are installed in source order.
     fn resolve_imports(&mut self) -> Result<(), ProgramError> {
         if !self.link {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending);
-        let mut last = None;
-        let mut ready = Vec::new();
-        for item in &pending {
+        let mut ready = Vec::with_capacity(pending.len());
+        for _ in 0..pending.len() {
+            ready.push(None);
+        }
+        let mut mains = 0usize;
+        let mut stop: Option<ProgramError> = None;
+        for index in (0..pending.len()).rev() {
+            let item = &pending[index];
             let loaded = if item.data {
                 super::modules::load_data(&item.path, item.search.as_ref()).map(Ready::Data)
             } else {
                 super::modules::load_code(&item.path, item.search.as_ref()).map(Ready::Code)
             };
             match loaded {
-                Ok(value) => ready.push(value),
-                Err(err) => last = Some(err),
+                Ok(value) => ready[index] = Some(value),
+                Err(ProgramError::Report(text)) => {
+                    if let Some(count) = super::modules::library_main_count(&text) {
+                        mains += count;
+                    } else {
+                        stop = Some(ProgramError::Report(text));
+                        break;
+                    }
+                }
+                Err(err) => {
+                    stop = Some(err);
+                    break;
+                }
             }
         }
-        if let Some(err) = last {
-            return Err(err);
+        if mains > 0 || stop.is_some() {
+            return Err(super::modules::combine_import_errors(mains, stop));
         }
         for (item, value) in pending.into_iter().zip(ready) {
+            let value = value.expect("import");
             match value {
                 Ready::Data(value) => {
                     let name = item.alias.unwrap_or_default();

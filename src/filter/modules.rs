@@ -159,6 +159,66 @@ pub(super) fn linker(message: &str) -> ProgramError {
     ProgramError::Report(format!("jq: error: {message}\n\njq: 1 compile error\n"))
 }
 
+const LIBRARY_MAIN_BODY: &str = "\
+jq: error: jq: error: library should only have function definitions, not a main expression
+<unknown location>
+";
+
+/// How many leading library-main errors `text` reports, when that is the
+/// whole message. Mixed in with another error, this is `None`.
+pub(super) fn library_main_count(text: &str) -> Option<usize> {
+    let mut rest = text;
+    let mut count = 0;
+    while let Some(next) = rest.strip_prefix(LIBRARY_MAIN_BODY) {
+        count += 1;
+        rest = next;
+    }
+    if count == 0 {
+        return None;
+    }
+    let word = if count == 1 { "error" } else { "errors" };
+    if rest == format!("jq: {count} compile {word}\n") {
+        Some(count)
+    } else {
+        None
+    }
+}
+
+/// `with_count` is set for `import` and `include`. `modulemeta` prints the
+/// message and still yields null, so it leaves the count off.
+pub(super) fn library_main(with_count: bool) -> ProgramError {
+    let mut text = LIBRARY_MAIN_BODY.to_string();
+    if with_count {
+        text.push_str("jq: 1 compile error\n");
+    }
+    ProgramError::Report(text)
+}
+
+/// Main-expression errors are listed from the last import backward.
+/// `stop` is a different failure and ends the list. Its own text already
+/// includes the compile-error count.
+pub(super) fn combine_import_errors(mains: usize, stop: Option<ProgramError>) -> ProgramError {
+    if mains == 0 {
+        return match stop {
+            Some(err) => err,
+            None => library_main(true),
+        };
+    }
+    let mut text = LIBRARY_MAIN_BODY.repeat(mains);
+    match stop {
+        Some(ProgramError::Report(rest)) => {
+            text.push_str(&rest);
+            ProgramError::Report(text)
+        }
+        Some(err) => err,
+        None => {
+            let word = if mains == 1 { "error" } else { "errors" };
+            text.push_str(&format!("jq: {mains} compile {word}\n"));
+            ProgramError::Report(text)
+        }
+    }
+}
+
 pub(super) fn load_code(
     rel: &str,
     search: Option<&Value>,
