@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.12.1
+
+Released on 2026-10-21.
 
 A string built from several `\( )` pieces runs the rightmost piece outermost. `"\(1,2) \(3,4)"` prints `"1 3"`, `"2 3"`, `"1 4"`, and `"2 4"`. Each piece to the left runs again for every value on the right.
 

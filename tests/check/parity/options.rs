@@ -1009,7 +1009,7 @@ fn output_options_match_jq() {
     ] {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let got = run(bin, &owned, b"");
-        assert_eq!(got.stdout, b"tumulus-0.12.0\n", "{args:?}");
+        assert_eq!(got.stdout, b"tumulus-0.12.1\n", "{args:?}");
         assert!(
             got.stderr.is_empty(),
             "{args:?} {}",
