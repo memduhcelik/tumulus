@@ -77,7 +77,7 @@ Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+
 
 Filters that work are field access (`.a`, `.a.b`, `.["a"]`, `."a b"`), array indexes (`.[0]` and negative indexes), slices (`.[2:5]`, `.[:-1]`, `.[$i:]`, `.[:length-1]`, `.[index("b"):]`), several keys or indexes in one bracket (`.["a","b"]`), iteration (`.[]`), recurse (`..`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
 
-A program can also contain numbers, strings, `true`, `false`, and `null`. Strings take the usual escapes and `\( )`. Arrays are `[ ]`. Objects are `{ }`, including `{a}` and `{"a"}` as short field copies, `{"a\(1)"}`, and `{(expr): value}`. A `#` comment runs to the end of the line. `-n` and `--null-input` run the program once on `null` and do not read input.
+A program can also contain numbers, strings, `true`, `false`, and `null`. Strings take the usual escapes and `\( )`. The rightmost interpolation is the outer loop, and each piece to its left runs again for every value. Arrays are `[ ]`. Objects are `{ }`, including `{a}` and `{"a"}` as short field copies, `{"a\(1)"}`, and `{(expr): value}`. A `#` comment runs to the end of the line. `-n` and `--null-input` run the program once on `null` and do not read input.
 
 An object key that is not a string fails the way jq fails. A bad string escape does too.
 

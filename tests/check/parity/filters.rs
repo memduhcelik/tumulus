@@ -1022,3 +1022,38 @@ fn operator_syntax_stays_generic() {
         assert_eq!(got.status.code(), Some(3), "{program}");
     }
 }
+
+#[test]
+fn interpolated_strings_match_jq() {
+    require_jq();
+    let programs = [
+        r#""\(1,2) \(3,4)""#,
+        r#""\(1,2)-\(3,4)-\(5,6)""#,
+        r#""a\(1,2)b\(3,4)c""#,
+        r#""\(1,2) \(empty)""#,
+        r#""\(empty) \(1,2)""#,
+        r#""\(1,2) \(empty) \(3,4)""#,
+        r#""\([1,2]) \(true)""#,
+        r#""\({a:1}) \(null)""#,
+        r#"{"\(1,2)\(3,4)": 9}"#,
+        r#"def f: "\(1,2) \(3,4)"; f"#,
+        r#""\(1,2) \(3,error("z"))""#,
+        r#""\(1,error("z")) \(3,4)""#,
+        r#""\(1,2) \(error("z")) \(3,4)""#,
+        r#""\(1,error("L")) \(2,error("R"))""#,
+        r#"try "\(1,error("z")) \(3,4)" catch ."#,
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+    let with_input = [
+        (r#""\(input) \(input)""#, "1\n2\n3\n"),
+        (r#""\(input,input) \(input,input)""#, "1\n2\n3\n4\n5\n6\n7\n8\n"),
+        (r#""\(input)-\(input)-\(input)""#, "1\n2\n3\n4\n"),
+        (r#""\(input,input) \(input,error("z"))""#, "1\n2\n3\n4\n"),
+        (r#"{"\(input,input)\(input,input)": 1}"#, "1\n2\n3\n4\n5\n6\n7\n8\n"),
+    ];
+    for (program, input) in with_input {
+        compare_exact(program, &["-n", "-c", "--", program], input.as_bytes());
+    }
+}
