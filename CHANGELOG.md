@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A string built from several `\( )` pieces runs the rightmost piece outermost. `"\(1,2) \(3,4)"` prints `"1 3"`, `"2 3"`, `"1 4"`, and `"2 4"`. Each piece to the left runs again for every value on the right.
+
 A slice from 0 with no end on a non-empty array leaves that array in place for the next `reduce` or `foreach` step. `path(reduce (0,1) as $i (.; .[$i:]))` on `[0,1,2,3,4]` names the result `[1,2,3,4]`. `path(foreach (0,1) as $i (.; .[$i:]; .))` is a path for each step. A string and an empty array stay results.
 
 `--stream` drops bytes it has finished reading. On the city lots file, `--stream -c empty` used 5013504 bytes beside jq's 2621440, and `--stream -c .` used 5160960 beside jq's 2736128. `--stream -c empty` took 3.21, 3.20, and 3.21 seconds beside jq's 3.68, 3.69, and 3.68. `--stream -c .` took 11.31, 11.29, and 11.35 seconds beside jq's 18.83, 18.84, and 18.66.

@@ -1395,79 +1395,9 @@ pub(super) fn eval_interpolate(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let strings = expand_pieces(pieces, 0, String::new(), input, env)?;
-    Ok(strings
-        .into_iter()
-        .map(|text| Value::String(crate::value::Text::from(text)))
-        .collect())
-}
-
-pub(super) fn expand_pieces(
-    pieces: &[Piece],
-    index: usize,
-    prefix: String,
-    input: &Value,
-    env: &[(String, Value)],
-) -> Result<Vec<String>, Failure> {
-    let Some(piece) = pieces.get(index) else {
-        return Ok(vec![prefix]);
-    };
-    match piece {
-        Piece::Text(text) => {
-            let mut next = prefix;
-            next.push_str(text);
-            expand_pieces(pieces, index + 1, next, input, env)
-        }
-        Piece::Interp(filter) => match eval_in(filter, input, env) {
-            Ok(values) => {
-                let mut out = Vec::new();
-                for value in values {
-                    let mut next = prefix.clone();
-                    next.push_str(&jq_text(&value));
-                    out.extend(expand_pieces(pieces, index + 1, next, input, env)?);
-                }
-                Ok(out)
-            }
-            Err(failure) => {
-                let caught = failure.caught.clone();
-                let message = failure.message.clone();
-                let mut partial = Vec::new();
-                for value in failure.partial {
-                    let mut next = prefix.clone();
-                    next.push_str(&jq_text(&value));
-                    match expand_pieces(pieces, index + 1, next, input, env) {
-                        Ok(more) => partial.extend(more),
-                        Err(inner) => {
-                            for value in inner.partial {
-                                if let Value::String(text) = &value {
-                                    partial.push(text.to_string());
-                                }
-                            }
-                            // An inner piece that fails reuses this piece's error.
-                            return Err(Failure {
-                                partial: partial
-                                    .into_iter()
-                                    .map(|text| Value::String(crate::value::Text::from(text)))
-                                    .collect(),
-                                message,
-                                caught,
-                                stop: failure.stop.clone(),
-                            });
-                        }
-                    }
-                }
-                Err(Failure {
-                    partial: partial
-                        .into_iter()
-                        .map(|text| Value::String(crate::value::Text::from(text)))
-                        .collect(),
-                    message,
-                    caught,
-                    stop: failure.stop,
-                })
-            }
-        },
-    }
+    // The rightmost `\( )` is the outer loop. Each piece to its left runs
+    // again for every value. That is the same walk as `@text`.
+    super::builtin::eval_format_string("text", pieces, input, env)
 }
 
 pub(super) fn jq_text(value: &Value) -> String {
