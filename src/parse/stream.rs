@@ -1154,7 +1154,7 @@ fn clone_path(path: &[Value]) -> Vec<Value> {
 
 fn index_text(index: usize) -> Text {
     thread_local! {
-        static SMALL: OnceCell<Vec<Text>> = OnceCell::new();
+        static SMALL: OnceCell<Vec<Text>> = const { OnceCell::new() };
     }
     if index < 256 {
         return SMALL.with(|cell| {
@@ -1167,7 +1167,7 @@ fn index_text(index: usize) -> Text {
 
 fn empty_text() -> Text {
     thread_local! {
-        static EMPTY: OnceCell<Text> = OnceCell::new();
+        static EMPTY: OnceCell<Text> = const { OnceCell::new() };
     }
     EMPTY.with(|cell| cell.get_or_init(|| Text::from("")).clone())
 }

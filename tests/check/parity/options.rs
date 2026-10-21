@@ -973,9 +973,10 @@ fn output_options_match_jq() {
         ("seq raw lines", b"\x1e1\n\x1e2\n"),
     ];
     for (name, input) in seq_in {
-        let args: &[&str] = if name.starts_with("seq slurp bad") || name == "seq slurp" {
-            &["-s", "--seq", "-c", "."]
-        } else if name == "seq slurp empty" {
+        let args: &[&str] = if name.starts_with("seq slurp bad")
+            || name == "seq slurp"
+            || name == "seq slurp empty"
+        {
             &["-s", "--seq", "-c", "."]
         } else if name.starts_with("seq stream") {
             &["--stream", "--seq", "-c", "."]

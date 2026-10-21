@@ -39,7 +39,7 @@ impl<'a> Parser<'a> {
                 self.advance_ascii(index + 1);
                 return Some(text);
             }
-            if byte == b'\\' || byte < 0x20 || byte >= 0x80 {
+            if byte == b'\\' || !(0x20..0x80).contains(&byte) {
                 return None;
             }
             index += 1;

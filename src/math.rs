@@ -278,7 +278,7 @@ fn zero_sign(x: f64, y: f64, min: bool) -> Option<f64> {
         } else {
             x.is_sign_negative() && y.is_sign_negative()
         };
-        return Some(if negative { -0.0 } else { 0.0 });
+        Some(if negative { -0.0 } else { 0.0 })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -323,7 +323,7 @@ fn significand_value(x: f64) -> f64 {
     {
         let mut exp = 0;
         let frac = unsafe { frexp(x, &mut exp) };
-        return frac * 2.0;
+        frac * 2.0
     }
     #[cfg(not(target_os = "macos"))]
     unsafe {

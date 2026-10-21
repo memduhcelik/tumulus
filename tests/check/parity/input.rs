@@ -156,7 +156,7 @@ fn input_lines_match_jq() {
 
     // A read holds 4095 bytes. Past that, the newline is a later read.
     let mut same_line = b"1".to_vec();
-    same_line.extend(std::iter::repeat(b' ').take(4093));
+    same_line.extend(std::iter::repeat_n(b' ', 4093));
     same_line.extend(b"2\n");
     compare_exact(
         "two values on a line longer than one read",
@@ -182,7 +182,7 @@ fn input_lines_match_jq() {
 
     let mut bom_long = vec![0xEF, 0xBB, 0xBF];
     bom_long.extend(b"1");
-    bom_long.extend(std::iter::repeat(b' ').take(4092));
+    bom_long.extend(std::iter::repeat_n(b' ', 4092));
     bom_long.push(b'\n');
     compare_exact(
         "bom on a line longer than one read",

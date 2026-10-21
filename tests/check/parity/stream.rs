@@ -270,7 +270,7 @@ fn streaming_match_jq() {
 
     let mut deep = vec![b'['; 300];
     deep.push(b'0');
-    deep.extend(std::iter::repeat(b']').take(300));
+    deep.extend(std::iter::repeat_n(b']', 300));
     compare_exact("stream deep", &["-c", "--stream", "length"], &deep);
 
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

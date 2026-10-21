@@ -13,11 +13,11 @@ use super::eval::shown;
 use super::value::{apply_op, put};
 
 thread_local! {
-    static REACHED: RefCell<Option<HashSet<usize>>> = RefCell::new(None);
+    static REACHED: RefCell<Option<HashSet<usize>>> = const { RefCell::new(None) };
     /// `$name` uses that are not in scope. Collected while checking variables.
-    static UNBOUND: RefCell<Vec<(usize, String)>> = RefCell::new(Vec::new());
+    static UNBOUND: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
     /// File shown in a compile error. Empty means `<top-level>`.
-    static PLACE: RefCell<String> = RefCell::new(String::new());
+    static PLACE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 struct PlaceGuard(String);
@@ -1056,10 +1056,6 @@ fn reserved(name: &str) -> bool {
     )
 }
 
-fn unbox(args: Vec<Box<Filter>>) -> Vec<Filter> {
-    args.into_iter().map(|arg| *arg).collect()
-}
-
 fn is_builtin(name: &str, arity: usize) -> bool {
     match name {
         "not" | "empty" | "length" | "keys" | "keys_unsorted" | "type" | "tonumber"
@@ -1159,8 +1155,7 @@ fn type_is_not(kind: &str) -> Filter {
 /// `match`, `test`, and `capture` as jq defines them. One argument binds
 /// `$val` and may pass an array through. Two arguments call the search.
 /// `match` then iterates the array of match objects.
-fn regex_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
-    let mut args = args.into_iter();
+fn regex_builtin(name: &str, mut args: impl Iterator<Item = Box<Filter>>) -> Filter {
     let regex = args.next().expect("regex");
     match args.next() {
         Some(flags) => regex_two(name, regex, flags),
@@ -1321,24 +1316,24 @@ const SUB: &str = r#"def sub(s): . as $in | (reduce match($re; $flags) as $edit 
 /// `gsub` is `sub` with `g` added at the end of the flags.
 const GSUB: &str = r#"def gsub(s; flags): sub($re; s; flags + "g"); gsub(null; null)"#;
 
-fn scan_call(re: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+fn scan_call(re: Filter, flags: Option<Box<Filter>>) -> Filter {
     let flags = match flags {
         Some(flags) => *flags,
         None => Filter::Literal(Value::Null),
     };
     bind_lazy(
-        vec![("re", *re), ("flags", flags)],
+        vec![("re", re), ("flags", flags)],
         compile_scoped(SCAN, &["re", "flags"]),
     )
 }
 
-fn splits_call(re: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+fn splits_call(re: Filter, flags: Option<Box<Filter>>) -> Filter {
     let flags = match flags {
         Some(flags) => *flags,
         None => Filter::Literal(Value::Null),
     };
     bind_lazy(
-        vec![("re", *re)],
+        vec![("re", re)],
         call_with(compile_scoped(SPLITS, &["re"]), vec![flags]),
     )
 }
@@ -1350,23 +1345,23 @@ fn split_regex(re: Filter, flags: Filter) -> Filter {
     )
 }
 
-fn sub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+fn sub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Filter {
     // Two arguments use an empty flags string. Null is a real flags value.
     let flags = match flags {
         Some(flags) => *flags,
         None => Filter::Literal(Value::String(crate::value::Text::from(String::new()))),
     };
     bind_lazy(
-        vec![("re", *re), ("flags", flags)],
-        call_with(compile_scoped(SUB, &["re", "flags"]), vec![*replacement]),
+        vec![("re", re), ("flags", flags)],
+        call_with(compile_scoped(SUB, &["re", "flags"]), vec![replacement]),
     )
 }
 
-fn gsub_call(re: Box<Filter>, replacement: Box<Filter>, flags: Option<Box<Filter>>) -> Filter {
+fn gsub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Filter {
     match flags {
         Some(flags) => bind_lazy(
-            vec![("re", *re)],
-            call_with(compile_scoped(GSUB, &["re"]), vec![*replacement, *flags]),
+            vec![("re", re)],
+            call_with(compile_scoped(GSUB, &["re"]), vec![replacement, *flags]),
         ),
         None => sub_call(
             re,
@@ -1411,8 +1406,8 @@ fn call_with(mut filter: Filter, call_args: Vec<Filter>) -> Filter {
     filter
 }
 
-fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
-    let mut args = args.into_iter();
+fn build_builtin(name: &str, args: Vec<Filter>) -> Filter {
+    let mut args = args.into_iter().map(Box::new);
     match name {
         "not" => Filter::Not,
         "input" => Filter::Input,
@@ -1590,7 +1585,7 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "halt" => Filter::Halt,
         "debug" => match args.next() {
             None => Filter::Debug,
-            Some(msgs) => with_stream_arg(DEBUG_MSGS, msgs),
+            Some(msgs) => with_stream_arg(DEBUG_MSGS, *msgs),
         },
         "stderr" => Filter::Stderr,
         "input_line_number" => Filter::InputLine,
@@ -1602,37 +1597,37 @@ fn build_builtin(name: &str, args: Vec<Box<Filter>>) -> Filter {
         "get_jq_origin" => Filter::JqOrigin,
         "get_prog_origin" => Filter::ProgOrigin,
         "reverse" => compile_stream(REVERSE),
-        "in" => with_stream_arg(IN_VALUE, args.next().expect("in")),
-        "bsearch" => with_stream_arg(BSEARCH, args.next().expect("bsearch")),
+        "in" => with_stream_arg(IN_VALUE, *args.next().expect("in")),
+        "bsearch" => with_stream_arg(BSEARCH, *args.next().expect("bsearch")),
         "format" => Filter::FormatBy(args.next().expect("format")),
         "fromdateiso8601" => compile_stream(FROM_ISO),
         "todateiso8601" => compile_stream(TO_ISO),
         "JOIN" => with_call_args(join_source(args.len()), unbox_keep(args)),
-        "match" | "test" | "capture" => regex_builtin(name, args.collect()),
-        "scan" => scan_call(args.next().expect("scan"), args.next()),
-        "splits" => splits_call(args.next().expect("splits"), args.next()),
+        "match" | "test" | "capture" => regex_builtin(name, args),
+        "scan" => scan_call(*args.next().expect("scan"), args.next()),
+        "splits" => splits_call(*args.next().expect("splits"), args.next()),
         "sub" => sub_call(
-            args.next().expect("sub"),
-            args.next().expect("sub"),
+            *args.next().expect("sub"),
+            *args.next().expect("sub"),
             args.next(),
         ),
         "gsub" => gsub_call(
-            args.next().expect("gsub"),
-            args.next().expect("gsub"),
+            *args.next().expect("gsub"),
+            *args.next().expect("gsub"),
             args.next(),
         ),
         "halt_error" => match args.next() {
             None => compile_stream(HALT_ERROR),
             Some(code) => Filter::HaltError(code),
         },
-        "pick" => with_stream_arg(PICK, args.next().expect("pick")),
+        "pick" => with_stream_arg(PICK, *args.next().expect("pick")),
         "transpose" => compile_stream(TRANSPOSE),
         "combinations" => match args.next() {
             None => compile_stream(COMBINATIONS),
-            Some(count) => with_stream_arg(COMBINATIONS_N, count),
+            Some(count) => with_stream_arg(COMBINATIONS_N, *count),
         },
-        "fromstream" => with_stream_arg(FROMSTREAM, args.next().expect("fromstream")),
-        "truncate_stream" => with_stream_arg(TRUNCATE_STREAM, args.next().expect("truncate")),
+        "fromstream" => with_stream_arg(FROMSTREAM, *args.next().expect("fromstream")),
+        "truncate_stream" => with_stream_arg(TRUNCATE_STREAM, *args.next().expect("truncate")),
         _ => match math::kind(name).expect("math builtin") {
             Kind::Unary(op) => Filter::Math1(op),
             Kind::Abs => Filter::Abs,
@@ -1670,7 +1665,7 @@ fn join_source(arity: usize) -> &'static str {
     }
 }
 
-fn unbox_keep(args: std::vec::IntoIter<Box<Filter>>) -> Vec<Filter> {
+fn unbox_keep(args: impl Iterator<Item = Box<Filter>>) -> Vec<Filter> {
     args.map(|arg| *arg).collect()
 }
 
@@ -1731,7 +1726,7 @@ fn compile_stream(source: &str) -> Filter {
     }
 }
 
-fn with_stream_arg(source: &str, arg: Box<Filter>) -> Filter {
+fn with_stream_arg(source: &str, arg: Filter) -> Filter {
     let mut filter = compile_stream(source);
     let Filter::Define { rest, .. } = &mut filter else {
         panic!("stream builtin is not a definition");
@@ -1740,7 +1735,7 @@ fn with_stream_arg(source: &str, arg: Box<Filter>) -> Filter {
         panic!("stream builtin is not a call");
     };
     args.clear();
-    args.push(*arg);
+    args.push(arg);
     filter
 }
 
@@ -1914,9 +1909,11 @@ impl<'a> Parser<'a> {
         // would have failed. The import errors are kept when the file itself
         // is only definitions. The main program still reports the import
         // error before it parses the rest.
-        let import_err = self.resolve_imports().err();
-        if import_err.is_some() && !self.library {
-            return Err(import_err.expect("import error"));
+        let mut import_err = self.resolve_imports().err();
+        if !self.library {
+            if let Some(err) = import_err.take() {
+                return Err(err);
+            }
         }
         self.skip_ws();
         let mut body = if self.eof() {
@@ -2522,7 +2519,7 @@ impl<'a> Parser<'a> {
             return Ok(match found {
                 Found::Func(func) => Filter::Call {
                     func: Rc::downgrade(&func),
-                    args: unbox(args),
+                    args,
                 },
                 Found::Param => Filter::Param(name),
             });
@@ -2544,7 +2541,7 @@ impl<'a> Parser<'a> {
             at,
             name,
             arity,
-            args: unbox(args),
+            args,
         })
     }
 
@@ -2696,7 +2693,7 @@ impl<'a> Parser<'a> {
 
     /// Arguments of one call, separated by `;`. The count is how many
     /// expressions parsed, which is the arity jq reports.
-    fn parse_call_args(&mut self) -> Result<Vec<Box<Filter>>, ProgramError> {
+    fn parse_call_args(&mut self) -> Result<Vec<Filter>, ProgramError> {
         if !self.eat('(') {
             return Err(ProgramError::Syntax);
         }
@@ -2710,10 +2707,10 @@ impl<'a> Parser<'a> {
         parsed
     }
 
-    fn parse_separated_args(&mut self) -> Result<Vec<Box<Filter>>, ProgramError> {
-        let mut args = vec![Box::new(self.parse_pipe()?)];
+    fn parse_separated_args(&mut self) -> Result<Vec<Filter>, ProgramError> {
+        let mut args = vec![self.parse_pipe()?];
         while self.eat(';') {
-            args.push(Box::new(self.parse_pipe()?));
+            args.push(self.parse_pipe()?);
         }
         if !self.eat(')') {
             return Err(ProgramError::Syntax);
@@ -3939,15 +3936,14 @@ pub(super) fn at_key(base: Option<Filter>, key: Filter) -> Filter {
 /// step so the slice math is unchanged, and `path` asks for this spelling.
 pub(super) fn canonical_number(literal: &str) -> String {
     let literal = literal.strip_prefix('\u{1}').unwrap_or(literal);
-    match crate::parse_stream(literal.as_bytes()) {
-        Ok(parsed) if parsed.error.is_none() => match parsed.values.as_slice() {
-            [one] => match &one.value {
-                Value::Number(text) => return text.to_string(),
-                _ => {}
-            },
-            _ => {}
-        },
-        _ => {}
+    if let Ok(parsed) = crate::parse_stream(literal.as_bytes()) {
+        if parsed.error.is_none() {
+            if let [one] = parsed.values.as_slice() {
+                if let Value::Number(text) = &one.value {
+                    return text.to_string();
+                }
+            }
+        }
     }
     literal.to_string()
 }
@@ -4071,7 +4067,7 @@ impl<'a> Parser<'a> {
         let mut text = format!(
             "jq: error: syntax error, unexpected end of file (Unix shell quoting issues?) at {place}, line {line_no}:\n{line}"
         );
-        text.extend(std::iter::repeat(' ').take(pad));
+        text.extend(std::iter::repeat_n(' ', pad));
         text.push('\n');
         text.push_str(&format!(
             "jq: error: Possibly unterminated 'if' statement at {place}, line {line_no}:\n{line}\n"
@@ -4119,7 +4115,7 @@ fn jq_syntax(detail: &str, line_no: usize, line: &str, pad: usize) -> ProgramErr
         "jq: error: syntax error, {detail} (Unix shell quoting issues?) at {}, line {line_no}:\n{line}",
         place_label()
     );
-    text.extend(std::iter::repeat(' ').take(pad));
+    text.extend(std::iter::repeat_n(' ', pad));
     text.push_str("\njq: 1 compile error\n");
     ProgramError::Report(text)
 }

@@ -2822,9 +2822,7 @@ fn kept_place(
         if matched.is_err() {
             return None;
         }
-        let Some(outs) = step else {
-            return None;
-        };
+        let outs = step?;
         let [one] = outs.as_slice() else {
             return None;
         };
@@ -4840,7 +4838,7 @@ fn write_slice(
             };
             let cur = match freeze(edit).into_array() {
                 Ok(items) => items,
-                Err(other) if matches!(other, Value::Null) => Vec::new(),
+                Err(Value::Null) => Vec::new(),
                 Err(other) => {
                     return Err(format!("Cannot index {} with object", other.type_name()));
                 }
@@ -4899,11 +4897,11 @@ fn read_edit(edit: &Edit, path: &[Step]) -> Result<Value, String> {
         (_, Step::Raw(key)) => {
             let current = freeze(edit);
             let got = get_one(&current, key)?;
-            return if path.len() == 1 {
+            if path.len() == 1 {
                 Ok(got)
             } else {
                 value_at(&got, &path[1..])
-            };
+            }
         }
         (Edit::Pure(value), _) => value_at(value, path),
         (Edit::Obj(fields), Step::Key(key)) => match fields.iter().find(|(name, _)| name == key) {

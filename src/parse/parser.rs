@@ -211,11 +211,11 @@ fn decode_utf8(bytes: &[u8], hard_end: bool) -> (char, usize) {
         return ('\u{FFFD}', bytes.len());
     }
     let available = bytes.len().min(width);
-    for i in 1..available {
-        if !is_continuation(bytes[i]) {
+    for (i, byte) in bytes.iter().enumerate().take(available).skip(1) {
+        if !is_continuation(*byte) {
             return ('\u{FFFD}', i);
         }
-        value = (value << 6) | u32::from(bytes[i] & 0x3F);
+        value = (value << 6) | u32::from(*byte & 0x3F);
     }
     if available < width
         || value < min_value

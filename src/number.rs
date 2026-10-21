@@ -267,9 +267,7 @@ impl Scanned<'_> {
         if self.huge {
             return Some(Sig { first: 0, last: 0 });
         }
-        if self.scale.is_none() {
-            return None;
-        }
+        self.scale?;
         let total = self.total();
         let mut first = 0;
         while first < total && self.digit(first) == b'0' {
@@ -395,9 +393,7 @@ fn scan_decimal(literal: &str) -> Option<Scanned<'_>> {
     } else {
         0
     };
-    let Some(scale) = exponent.checked_sub(fraction as i32) else {
-        return None;
-    };
+    let scale = exponent.checked_sub(fraction as i32)?;
     Some(Scanned {
         negative,
         int_digits: &bytes[int_at..int_end],

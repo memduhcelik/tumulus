@@ -37,7 +37,7 @@ enum Body {
     Call(Call),
     /// `[]`, `{}`, `//`, `try`, `reduce`, `as`, `first`, `limit`, `map`, and
     /// the index after an array. The child runs on this stack.
-    Nest(Nest),
+    Nest(Box<Nest>),
     /// `..` and `recurse` with no arguments, once a call is already here.
     /// One value leaves at a time, so `limit` can stop.
     Dots(Dots),
@@ -540,7 +540,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             None => Ok(Act::Fail(fail(format!("unbound {name}")))),
         },
         Filter::Pipe(left, right) => {
-            machine.stack[index].body = Box::new(Body::Pipe(Pipe {
+            *machine.stack[index].body = Body::Pipe(Pipe {
                 left: Rc::new((**left).clone()),
                 right: Rc::new((**right).clone()),
                 input,
@@ -548,22 +548,22 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 scope,
                 on_right: false,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Comma(left, right) => {
-            machine.stack[index].body = Box::new(Body::Comma(Comma {
+            *machine.stack[index].body = Body::Comma(Comma {
                 left: Rc::new((**left).clone()),
                 right: Rc::new((**right).clone()),
                 input,
                 env,
                 scope,
                 phase: 0,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Bin { op, left, right } => {
-            machine.stack[index].body = Box::new(Body::Bin(Bin {
+            *machine.stack[index].body = Body::Bin(Bin {
                 op: *op,
                 left: Rc::new((**left).clone()),
                 right: Rc::new((**right).clone()),
@@ -575,21 +575,21 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 right_at: 0,
                 right_err: None,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Neg(inner) => {
-            machine.stack[index].body = Box::new(Body::Neg(Neg {
+            *machine.stack[index].body = Body::Neg(Neg {
                 inner: Rc::new((**inner).clone()),
                 input,
                 env,
                 scope,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::If { cond, yes, no } => {
-            machine.stack[index].body = Box::new(Body::If(Ifs {
+            *machine.stack[index].body = Body::If(Ifs {
                 cond: Rc::new((**cond).clone()),
                 yes: Rc::new((**yes).clone()),
                 no: Rc::new((**no).clone()),
@@ -601,14 +601,14 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 cond_err: None,
                 phase: 0,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Call { func, args } => begin_call(machine, index, func, args, input, env, scope),
         Filter::Param(name) => begin_param(machine, index, name, input),
         Filter::Define { rest, .. } => {
             machine.kept.push(Rc::clone(&filter));
-            machine.stack[index].body = Box::new(Body::Run(Run {
+            *machine.stack[index].body = Body::Run(Run {
                 filter: Rc::new((**rest).clone()),
                 input,
                 env,
@@ -617,14 +617,14 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 pending: Vec::new(),
                 pending_at: 0,
                 fail_after: None,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Unresolved { name, arity, .. } => {
             Ok(Act::Fail(fail(format!("{name}/{arity} is not defined"))))
         }
         Filter::Inputs => {
-            machine.stack[index].body = Box::new(Body::Inputs);
+            *machine.stack[index].body = Body::Inputs;
             Ok(Act::Cont)
         }
         Filter::Collect(inner) => replace_nest(
@@ -764,13 +764,13 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             scope,
         ),
         Filter::Recurse => {
-            machine.stack[index].body = Box::new(Body::Dots(Dots { stack: vec![input] }));
+            *machine.stack[index].body = Body::Dots(Dots { stack: vec![input] });
             Ok(Act::Cont)
         }
         Filter::RecurseDown { step, cond } => {
             let cond = cond.as_ref().map(|cond| Rc::new((**cond).clone()));
             let step = Rc::new((**step).clone());
-            machine.stack[index].body = Box::new(Body::Recur(Recur {
+            *machine.stack[index].body = Body::Recur(Recur {
                 step,
                 cond,
                 env: env.flatten(),
@@ -782,11 +782,11 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                     cond_i: 0,
                     child: None,
                 }],
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::Walk(update) => {
-            machine.stack[index].body = Box::new(Body::Walk(Walk {
+            *machine.stack[index].body = Body::Walk(Walk {
                 update: Rc::new((**update).clone()),
                 env,
                 scope,
@@ -799,7 +799,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 mode: 0,
                 kept: false,
                 cut_child: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::MatchImpl {
@@ -807,7 +807,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             flags,
             testing,
         } => {
-            machine.stack[index].body = Box::new(Body::MatchRun(MatchRun {
+            *machine.stack[index].body = Body::MatchRun(MatchRun {
                 regex: Rc::new((**regex).clone()),
                 flags: Rc::new((**flags).clone()),
                 testing: *testing,
@@ -817,11 +817,11 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 phase: 0,
                 flag: None,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         Filter::StreamBind { expr, name, body } => {
-            machine.stack[index].body = Box::new(Body::StreamRun(StreamRun {
+            *machine.stack[index].body = Body::StreamRun(StreamRun {
                 expr: Rc::new((**expr).clone()),
                 name: name.clone(),
                 body: Rc::new((**body).clone()),
@@ -830,7 +830,7 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 scope,
                 phase: 0,
                 started: false,
-            }));
+            });
             Ok(Act::Cont)
         }
         other => fallback(machine, index, other, &input, &env),
@@ -897,7 +897,7 @@ fn begin_call(
     let body = Rc::clone(&cell.body.borrow());
     let slots = func::prepare(&cell.params, args, &env, &scope);
     let filters: Vec<_> = slots.iter().map(func::slot_closure).collect();
-    machine.stack[index].body = Box::new(Body::Call(Call {
+    *machine.stack[index].body = Body::Call(Call {
         body,
         input,
         env,
@@ -908,7 +908,7 @@ fn begin_call(
         slot_at: 0,
         pulling: false,
         body_on: false,
-    }));
+    });
     Ok(Act::Cont)
 }
 
@@ -921,7 +921,7 @@ fn begin_param(
     let Some(closure) = func::lookup(name) else {
         return Ok(Act::Fail(fail(format!("{name} is not defined"))));
     };
-    machine.stack[index].body = Box::new(Body::Run(Run {
+    *machine.stack[index].body = Body::Run(Run {
         filter: Rc::new(closure.expr.clone()),
         input,
         env: Rc::clone(&closure.env),
@@ -930,7 +930,7 @@ fn begin_param(
         pending: Vec::new(),
         pending_at: 0,
         fail_after: None,
-    }));
+    });
     Ok(Act::Cont)
 }
 
@@ -1796,7 +1796,7 @@ fn replace_nest(
     env: Rc<func::EnvLink>,
     scope: Rc<ScopeNode>,
 ) -> Result<Act, Failure> {
-    machine.stack[index].body = Box::new(Body::Nest(Nest {
+    *machine.stack[index].body = Body::Nest(Box::new(Nest {
         kind,
         input,
         env,
@@ -2011,61 +2011,79 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
     match kind {
         1 => {
             let inner = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Collect(inner),
                     ..
-                }) => Rc::clone(inner),
-                _ => unreachable!("collect"),
+                } => Rc::clone(inner),
+_ => unreachable!("collect"),
+},
+_ => unreachable!("collect"),
             };
             nest_arm(machine, index, inner, input);
         }
         2 => {
             let base = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::At { base, .. },
                     ..
-                }) => Rc::clone(base),
-                _ => unreachable!("at"),
+                } => Rc::clone(base),
+_ => unreachable!("at"),
+},
+_ => unreachable!("at"),
             };
             nest_arm(machine, index, base, input);
         }
         3 => {
             let left = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Alt { left, .. },
                     ..
-                }) => Rc::clone(left),
-                _ => unreachable!("alt"),
+                } => Rc::clone(left),
+_ => unreachable!("alt"),
+},
+_ => unreachable!("alt"),
             };
             nest_arm(machine, index, left, input);
         }
         4 => {
             let body = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Try { body, .. },
                     ..
-                }) => Rc::clone(body),
-                _ => unreachable!("try"),
+                } => Rc::clone(body),
+_ => unreachable!("try"),
+},
+_ => unreachable!("try"),
             };
             nest_arm(machine, index, body, input);
         }
         5 => {
             let expr = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Bind { expr, .. },
                     ..
-                }) => Rc::clone(expr),
-                _ => unreachable!("bind"),
+                } => Rc::clone(expr),
+_ => unreachable!("bind"),
+},
+_ => unreachable!("bind"),
             };
             nest_arm(machine, index, expr, input);
         }
         6 => {
             let init = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Reduce { init, .. },
                     ..
-                }) => Rc::clone(init),
-                _ => unreachable!("reduce"),
+                } => Rc::clone(init),
+_ => unreachable!("reduce"),
+},
+_ => unreachable!("reduce"),
             };
             nest_arm(machine, index, init, input);
         }
@@ -2081,11 +2099,14 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 }
                 Ok(items) => {
                     let inner = match &*machine.stack[index].body {
-                        Body::Nest(Nest {
+                        Body::Nest(nest) => match &**nest {
+Nest {
                             kind: Kind::Map(inner),
                             ..
-                        }) => Rc::clone(inner),
-                        _ => unreachable!("map"),
+                        } => Rc::clone(inner),
+_ => unreachable!("map"),
+},
+_ => unreachable!("map"),
                     };
                     let first = items[0].clone();
                     if let Body::Nest(nest) = &mut *machine.stack[index].body {
@@ -2098,31 +2119,40 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         }
         8 => {
             let expr = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::First(expr),
                     ..
-                }) => Rc::clone(expr),
-                _ => unreachable!("first"),
+                } => Rc::clone(expr),
+_ => unreachable!("first"),
+},
+_ => unreachable!("first"),
             };
             nest_arm(machine, index, expr, input);
         }
         9 => {
             let count = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Limit { count, .. },
                     ..
-                }) => Rc::clone(count),
-                _ => unreachable!("limit"),
+                } => Rc::clone(count),
+_ => unreachable!("limit"),
+},
+_ => unreachable!("limit"),
             };
             nest_arm(machine, index, count, input);
         }
         11 => {
             let (slot, body) = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Label { slot, body },
                     ..
-                }) => (*slot, Rc::clone(body)),
-                _ => unreachable!("label"),
+                } => (*slot, Rc::clone(body)),
+_ => unreachable!("label"),
+},
+_ => unreachable!("label"),
             };
             let (runtime, guard) = eval::LabelGuard::enter(slot);
             if let Body::Nest(nest) = &mut *machine.stack[index].body {
@@ -2133,11 +2163,14 @@ fn nest_begin(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         }
         _ => {
             let empty = match &*machine.stack[index].body {
-                Body::Nest(Nest {
+                Body::Nest(nest) => match &**nest {
+Nest {
                     kind: Kind::Object(fields),
                     ..
-                }) => fields.is_empty(),
-                _ => true,
+                } => fields.is_empty(),
+_ => true,
+},
+_ => true,
             };
             if empty {
                 return hold(machine, index, vec![Value::object(Vec::new())], None);
@@ -2167,18 +2200,21 @@ fn kind_tag(kind: &Kind) -> u8 {
 
 fn object_key(machine: &Machine, index: usize) -> Rc<Filter> {
     match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Object(fields),
             item_at,
             ..
-        }) => {
+        } => {
             let field = &fields[*item_at];
             let key = match field {
                 ObjField::Lookup(key) | ObjField::Pair { key, .. } => key,
             };
             Rc::new((**key).clone())
-        }
-        _ => unreachable!("object"),
+        },
+_ => unreachable!("object"),
+},
+_ => unreachable!("object"),
     }
 }
 
@@ -2265,25 +2301,30 @@ fn finish_at_base(machine: &mut Machine, index: usize) -> Result<DoneAct, Failur
         return Ok(DoneAct::Fail(eval::with_partial(bases, failure)));
     }
     let key = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::At { key, .. },
             ..
-        }) => Rc::clone(key),
-        _ => unreachable!("at"),
+        } => Rc::clone(key),
+_ => unreachable!("at"),
+},
+_ => unreachable!("at"),
     };
     let input = match &*machine.stack[index].body {
         Body::Nest(nest) => nest.input.clone(),
         _ => Value::Null,
     };
-    if let Body::Nest(Nest {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+if let Nest {
         kind: Kind::At { bases: slot, .. },
         phase,
         ..
-    }) = &mut *machine.stack[index].body
-    {
+    } = &mut **nest {
+
         *slot = bases;
         *phase = 1;
     }
+}
     nest_arm(machine, index, key, input);
     Ok(DoneAct::Stay)
 }
@@ -2291,13 +2332,16 @@ fn finish_at_base(machine: &mut Machine, index: usize) -> Result<DoneAct, Failur
 fn finish_at_key(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
     let (keys, key_err) = take_got(machine, index);
     let (bases, optional) = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::At {
                 bases, optional, ..
             },
             ..
-        }) => (bases.clone(), *optional),
-        _ => (Vec::new(), false),
+        } => (bases.clone(), *optional),
+_ => (Vec::new(), false),
+},
+_ => (Vec::new(), false),
     };
     match index_pairs(&bases, &keys, optional, key_err) {
         Ok(values) => queue_out(machine, index, values, None),
@@ -2369,11 +2413,14 @@ fn finish_alt_left(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         return queue_out(machine, index, defined, None);
     }
     let right = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Alt { right, .. },
             ..
-        }) => Rc::clone(right),
-        _ => unreachable!("alt"),
+        } => Rc::clone(right),
+_ => unreachable!("alt"),
+},
+_ => unreachable!("alt"),
     };
     let input = match &*machine.stack[index].body {
         Body::Nest(nest) => nest.input.clone(),
@@ -2403,11 +2450,14 @@ fn finish_try_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         return Ok(DoneAct::Fail(eval::with_partial(partial, failure)));
     }
     let handler = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Try { handler, .. },
             ..
-        }) => handler.clone(),
-        _ => None,
+        } => handler.clone(),
+_ => None,
+},
+_ => None,
     };
     let Some(handler) = handler else {
         return queue_out(machine, index, partial, None);
@@ -2441,11 +2491,14 @@ fn finish_try_handler(machine: &mut Machine, index: usize) -> Result<DoneAct, Fa
 fn finish_bind_expr(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
     let (values, err) = take_got(machine, index);
     let pattern = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Bind { pattern, .. },
             ..
-        }) => pattern.clone(),
-        _ => unreachable!("bind"),
+        } => pattern.clone(),
+_ => unreachable!("bind"),
+},
+_ => unreachable!("bind"),
     };
     let flat = match &*machine.stack[index].body {
         Body::Nest(nest) => nest.env.flatten(),
@@ -2529,13 +2582,15 @@ fn finish_reduce_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Fa
             None => DoneAct::Finish,
         });
     }
-    if let Body::Nest(Nest {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+if let Nest {
         kind: Kind::Reduce { inits: slot, .. },
         ..
-    }) = &mut *machine.stack[index].body
-    {
+    } = &mut **nest {
+
         *slot = inits;
     }
+}
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.fail_last = err;
         nest.seen = 0;
@@ -2745,12 +2800,15 @@ fn reduce_end_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         nest.seen += 1;
     }
     let more = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Reduce { inits, .. },
             seen,
             ..
-        }) => *seen < inits.len(),
-        _ => false,
+        } => *seen < inits.len(),
+_ => false,
+},
+_ => false,
     };
     if more {
         return reduce_stream(machine, index);
@@ -2895,14 +2953,17 @@ fn limit_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
 fn finish_object_key(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
     let (keys, err) = take_got(machine, index);
     let is_lookup = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Object(fields),
             item_at,
             ..
-        }) => {
+        } => {
             matches!(fields.get(*item_at), Some(ObjField::Lookup(_)))
-        }
-        _ => false,
+        },
+_ => false,
+},
+_ => false,
     };
     if is_lookup {
         let input = match &*machine.stack[index].body {
@@ -2920,15 +2981,18 @@ fn finish_object_key(machine: &mut Machine, index: usize) -> Result<DoneAct, Fai
         _ => Value::Null,
     };
     let value = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Object(fields),
             item_at,
             ..
-        }) => match &fields[*item_at] {
+        } => match &fields[*item_at] {
             ObjField::Pair { value, .. } => Rc::new((**value).clone()),
             ObjField::Lookup(_) => unreachable!("lookup"),
         },
-        _ => unreachable!("object"),
+_ => unreachable!("object"),
+},
+_ => unreachable!("object"),
     };
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.keys = keys;
@@ -2958,12 +3022,15 @@ fn object_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> 
         nest.phase = 0;
     }
     let more = match &*machine.stack[index].body {
-        Body::Nest(Nest {
+        Body::Nest(nest) => match &**nest {
+Nest {
             kind: Kind::Object(fields),
             item_at,
             ..
-        }) => *item_at < fields.len(),
-        _ => false,
+        } => *item_at < fields.len(),
+_ => false,
+},
+_ => false,
     };
     if !more {
         let alts = match &mut *machine.stack[index].body {

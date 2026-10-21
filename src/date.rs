@@ -248,8 +248,8 @@ fn fields(items: &[Value]) -> Option<Tm> {
         return None;
     }
     let mut tm = blank();
-    for index in 0..8 {
-        let Value::Number(text) = &items[index] else {
+    for (index, item) in items.iter().enumerate().take(8) {
+        let Value::Number(text) = item else {
             return None;
         };
         let raw = number::c_cast_i32(as_f64(text));

@@ -1043,9 +1043,7 @@ fn fold_pattern(
         *lookup = None;
         Ok(())
     });
-    if let Err(failure) = stepped {
-        return Err(failure);
-    }
+    stepped?;
     Ok(stop)
 }
 
@@ -1178,6 +1176,8 @@ fn deliver(
     }
 }
 
+type PatternStep<'a> = dyn FnMut(&[(String, Value)]) -> Result<(), Failure> + 'a;
+
 /// A pattern is indexing. Array elements are stored right to left, object
 /// fields left to right, and an `also` name before its subpattern. The first
 /// stored binding of a name wins. The body runs inside the cross product.
@@ -1186,7 +1186,7 @@ pub(super) fn match_pat(
     value: &Value,
     env: &[(String, Value)],
     binds: &[(String, Value)],
-    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+    cont: &mut PatternStep<'_>,
 ) -> Result<(), Failure> {
     match pattern {
         Pattern::Var(name) => {
@@ -1206,7 +1206,7 @@ pub(super) fn match_array(
     env: &[(String, Value)],
     binds: &[(String, Value)],
     index: usize,
-    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+    cont: &mut PatternStep<'_>,
 ) -> Result<(), Failure> {
     if index == 0 {
         return cont(binds);
@@ -1227,7 +1227,7 @@ pub(super) fn match_object(
     env: &[(String, Value)],
     binds: &[(String, Value)],
     index: usize,
-    cont: &mut dyn FnMut(&[(String, Value)]) -> Result<(), Failure>,
+    cont: &mut PatternStep<'_>,
 ) -> Result<(), Failure> {
     let Some(field) = fields.get(index) else {
         return cont(binds);
@@ -1235,10 +1235,7 @@ pub(super) fn match_object(
     let field = field.clone();
     let (keys, key_err) = parts(eval_in(&field.key, value, env));
     for key in keys {
-        let elements = match index_by(value, &key) {
-            Ok(got) => got,
-            Err(failure) => return Err(failure),
-        };
+        let elements = index_by(value, &key)?;
         for element in elements {
             let mut next = Vec::with_capacity(binds.len() + 1);
             next.extend_from_slice(binds);

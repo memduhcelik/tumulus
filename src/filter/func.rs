@@ -14,7 +14,7 @@ use super::ast::*;
 use super::eval::{child_scope, eval_in, fail};
 
 thread_local! {
-    static SCOPE: RefCell<Option<Rc<ScopeNode>>> = RefCell::new(None);
+    static SCOPE: RefCell<Option<Rc<ScopeNode>>> = const { RefCell::new(None) };
 }
 
 /// Bindings layered so a recursive call shares the caller's environment
@@ -136,7 +136,7 @@ pub(super) fn current_scope() -> Rc<ScopeNode> {
 }
 
 pub(super) fn set_scope(scope: Rc<ScopeNode>) -> ScopeGuard {
-    let prev = SCOPE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), Some(scope)));
+    let prev = SCOPE.with(|slot| (*slot.borrow_mut()).replace(scope));
     ScopeGuard { prev }
 }
 

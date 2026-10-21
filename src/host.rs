@@ -55,9 +55,7 @@ pub(crate) fn args() -> Vec<String> {
 pub(crate) fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
     let taken = CAPTURE.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(cap) = slot.as_mut() else {
-            return None;
-        };
+        let cap = slot.as_mut()?;
         let rest = &cap.stdin[cap.stdin_at..];
         let n = rest.len().min(buf.len());
         buf[..n].copy_from_slice(&rest[..n]);

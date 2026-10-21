@@ -613,10 +613,7 @@ pub(super) fn eval_map(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let items = match iterate(input) {
-        Ok(items) => items,
-        Err(failure) => return Err(failure),
-    };
+    let items = iterate(input)?;
     let mut collected = Vec::new();
     for item in items {
         match eval_in(inner, &item, env) {
@@ -653,7 +650,7 @@ pub(super) fn parse_number_text(text: &str) -> Result<Value, String> {
     match parsed.values.as_slice() {
         [] => Err(format!("Expected JSON value{suffix}")),
         [only] => match &only.value {
-            Value::Number(raw) => Ok(Value::Number(crate::value::Text::from(raw.clone()))),
+            Value::Number(raw) => Ok(Value::Number(raw.clone())),
             _ => Err(format!(
                 "string ({}) cannot be parsed as a number",
                 shown(&Value::String(crate::value::Text::from(text.to_string())))
@@ -1532,6 +1529,7 @@ pub(super) fn eval_flatten(
     finish(out, err)
 }
 
+#[derive(Clone, Copy)]
 enum Flat {
     /// Do not enter nested arrays.
     Keep,
@@ -1559,22 +1557,24 @@ fn flatten_one(input: &Value, depth: Option<&Value>) -> Result<Value, String> {
         mode,
         depth,
     }];
-    loop {
-        let Some(top) = stack.last() else {
-            break;
+    while !stack.is_empty() {
+        let ready = {
+            let top = stack.last().expect("frame");
+            if top.index >= top.items.len() {
+                None
+            } else {
+                Some((
+                    top.index,
+                    top.items[top.index].clone(),
+                    top.mode,
+                    top.depth.clone(),
+                ))
+            }
         };
-        if top.index >= top.items.len() {
+        let Some((at, item, mode, depth)) = ready else {
             stack.pop();
             continue;
-        }
-        let at = top.index;
-        let item = top.items[at].clone();
-        let mode = match top.mode {
-            Flat::Keep => Flat::Keep,
-            Flat::Full => Flat::Full,
-            Flat::Down => Flat::Down,
         };
-        let depth = top.depth.clone();
         stack.last_mut().expect("frame").index = at + 1;
         if !matches!(item, Value::Array(_)) {
             out.push(item);
@@ -1704,9 +1704,8 @@ pub(super) fn eval_map_values(
         Value::Array(items) => {
             let mut out = Vec::new();
             for item in items.iter() {
-                match first_value(expr, item, env)? {
-                    Some(value) => out.push(value),
-                    None => {}
+                if let Some(value) = first_value(expr, item, env)? {
+                    out.push(value);
                 }
             }
             Ok(vec![Value::array(out)])

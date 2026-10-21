@@ -1216,7 +1216,7 @@ mod tests {
         // stops before that read starts.
         let mut boundary = vec![b'x'; 4095];
         boundary.push(b'\n');
-        boundary.extend(std::iter::repeat(b'y').take(20));
+        boundary.extend(std::iter::repeat_n(b'y', 20));
         texts.push(boundary);
 
         for text in &texts {
@@ -1263,7 +1263,7 @@ mod tests {
         ];
         let mut boundary = vec![b'x'; 4095];
         boundary.push(b'\n');
-        boundary.extend(std::iter::repeat(b'y').take(20));
+        boundary.extend(std::iter::repeat_n(b'y', 20));
         samples.push(boundary);
         for text in samples {
             let step = if text.len() > 500 { 128 } else { 1 };
@@ -1383,7 +1383,7 @@ mod tests {
             vec![b'a'; 8190],
         ];
         let mut nl_then = vec![b'\n'];
-        nl_then.extend(std::iter::repeat(b'a').take(5000));
+        nl_then.extend(std::iter::repeat_n(b'a', 5000));
         texts.push(nl_then);
         let mut boundary = vec![b'a'; 4094];
         boundary.push(b'\n');
@@ -1414,10 +1414,10 @@ mod tests {
 
         // A short tail that grows past a 4095-byte read is a new last read.
         let mut grown = vec![b'\n'];
-        grown.extend(std::iter::repeat(b'a').take(100));
+        grown.extend(std::iter::repeat_n(b'a', 100));
         let mut walk = EofCut::default();
         agrees(&mut walk, &grown, grown.len());
-        grown.extend(std::iter::repeat(b'a').take(4090));
+        grown.extend(std::iter::repeat_n(b'a', 4090));
         agrees(&mut walk, &grown, 50);
         agrees(&mut walk, &grown, grown.len());
         grown.push(b'\n');
@@ -1511,7 +1511,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut scan = NulScan::default();
         for _ in 0..2_000 {
-            buf.extend_from_slice(&[b'1', b'\n', b'{', b'}']);
+            buf.extend_from_slice(b"1\n{}");
             assert_eq!(scan.at(&buf), reference_nul(&buf));
         }
         buf.extend_from_slice(b"\0tail");
@@ -1525,7 +1525,7 @@ mod tests {
         let mut scan = NulScan::default();
         let started = std::time::Instant::now();
         for _ in 0..2_000 {
-            big.extend(std::iter::repeat(b'a').take(4096));
+            big.extend(std::iter::repeat_n(b'a', 4096));
             let _ = scan.at(&big);
         }
         assert!(

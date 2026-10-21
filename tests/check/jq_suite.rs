@@ -399,19 +399,12 @@ fn compare_jq_test_file() {
     println!("{}", lines.join("\n"));
 }
 
+#[derive(Default)]
 struct Bucket {
     count: usize,
     examples: Vec<(usize, String)>,
 }
 
-impl Default for Bucket {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            examples: Vec::new(),
-        }
-    }
-}
 
 struct Diff {
     line: usize,

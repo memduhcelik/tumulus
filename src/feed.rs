@@ -875,14 +875,14 @@ impl Session {
         // A parse error stops the input. A closer staged before that error
         // has already happened, so it is not still waiting to see EOF.
         let flush = finished || self.fault.is_some();
-        loop {
-            let (end, atom, single) = match self.staging.front() {
-                Some(front) => (
+        while self.staging.front().is_some() {
+            let (end, atom, single) = {
+                let front = self.staging.front().expect("staged item");
+                (
                     front.end,
                     front.atom,
                     matches!(front.value, Value::Array(ref items) if items.len() == 1),
-                ),
-                None => break,
+                )
             };
             let hold = !flush && self.staging.len() == 1 && single;
             if hold || !self.item_ready(end, atom) {
@@ -1518,7 +1518,7 @@ impl Session {
         } else {
             self.eof_once = true;
             match &self.cur {
-                Some(cur) if !(cur.any_byte && !cur.ended_nl) => {
+                Some(cur) if !cur.any_byte || cur.ended_nl => {
                     format!("{}:{}", cur.name, cur.line)
                 }
                 _ => "<unknown>".to_string(),
@@ -1551,6 +1551,97 @@ fn note_stream_hold(buf: &Vec<u8>, chunks: &[Chunk]) {
             cell.set(hold);
         }
     });
+}
+
+fn take_tail(buf: &mut Vec<u8>, cut: usize) {
+    if cut == 0 || cut > buf.len() {
+        return;
+    }
+    let mut tail = Vec::with_capacity(buf.len() - cut + 8192);
+    tail.extend_from_slice(&buf[cut..]);
+    *buf = tail;
+}
+
+fn with<T>(read: impl FnOnce(&Session) -> T) -> Option<T> {
+    SESSION.with(|slot| slot.borrow().as_ref().map(read))
+}
+
+fn with_mut<T>(write: impl FnOnce(&mut Session) -> T) -> Option<T> {
+    SESSION.with(|slot| slot.borrow_mut().as_mut().map(write))
+}
+
+fn source_name(path: &str) -> String {
+    if path == "-" {
+        "<stdin>".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+enum LiveOpen {
+    Reader(Live),
+    Missing(String),
+    Directory,
+}
+
+fn open_live(path: &str) -> Result<LiveOpen, String> {
+    if path == "-" {
+        return Ok(LiveOpen::Reader(Live::Stdin));
+    }
+    match File::open(path) {
+        Ok(file) => {
+            if fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                return Ok(LiveOpen::Directory);
+            }
+            Ok(LiveOpen::Reader(Live::File(file)))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LiveOpen::Missing(os_reason(&err))),
+        Err(err) if is_directory(path, &err) => Ok(LiveOpen::Directory),
+        Err(err) => Err(format!("cannot read {path}: {err}")),
+    }
+}
+
+fn read_path(path: &str) -> Result<Opened, String> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        crate::host::read_stdin_to_end(&mut buf).map_err(|err| format!("cannot read -: {err}"))?;
+        return Ok(Opened::Data(buf));
+    }
+    match fs::read(path) {
+        Ok(bytes) => Ok(Opened::Data(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Opened::Missing(os_reason(&err))),
+        Err(err) if is_directory(path, &err) => Ok(Opened::Directory),
+        Err(err) => Err(format!("cannot read {path}: {err}")),
+    }
+}
+
+fn is_directory(path: &str, err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::IsADirectory
+        || err.raw_os_error() == Some(21)
+        || fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+fn os_reason(err: &io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
+}
+
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn is_atom(value: &Value) -> bool {
+    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
+}
+
+fn environment() -> Value {
+    let fields = std::env::vars()
+        .map(|(key, value)| (key, Value::String(Text::from(value))))
+        .collect();
+    Value::object(fields)
 }
 
 #[cfg(test)]
@@ -1650,95 +1741,4 @@ mod tests {
             body.len()
         );
     }
-}
-
-fn take_tail(buf: &mut Vec<u8>, cut: usize) {
-    if cut == 0 || cut > buf.len() {
-        return;
-    }
-    let mut tail = Vec::with_capacity(buf.len() - cut + 8192);
-    tail.extend_from_slice(&buf[cut..]);
-    *buf = tail;
-}
-
-fn with<T>(read: impl FnOnce(&Session) -> T) -> Option<T> {
-    SESSION.with(|slot| slot.borrow().as_ref().map(read))
-}
-
-fn with_mut<T>(write: impl FnOnce(&mut Session) -> T) -> Option<T> {
-    SESSION.with(|slot| slot.borrow_mut().as_mut().map(write))
-}
-
-fn source_name(path: &str) -> String {
-    if path == "-" {
-        "<stdin>".to_string()
-    } else {
-        path.to_string()
-    }
-}
-
-enum LiveOpen {
-    Reader(Live),
-    Missing(String),
-    Directory,
-}
-
-fn open_live(path: &str) -> Result<LiveOpen, String> {
-    if path == "-" {
-        return Ok(LiveOpen::Reader(Live::Stdin));
-    }
-    match File::open(path) {
-        Ok(file) => {
-            if fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
-                return Ok(LiveOpen::Directory);
-            }
-            Ok(LiveOpen::Reader(Live::File(file)))
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LiveOpen::Missing(os_reason(&err))),
-        Err(err) if is_directory(path, &err) => Ok(LiveOpen::Directory),
-        Err(err) => Err(format!("cannot read {path}: {err}")),
-    }
-}
-
-fn read_path(path: &str) -> Result<Opened, String> {
-    if path == "-" {
-        let mut buf = Vec::new();
-        crate::host::read_stdin_to_end(&mut buf).map_err(|err| format!("cannot read -: {err}"))?;
-        return Ok(Opened::Data(buf));
-    }
-    match fs::read(path) {
-        Ok(bytes) => Ok(Opened::Data(bytes)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Opened::Missing(os_reason(&err))),
-        Err(err) if is_directory(path, &err) => Ok(Opened::Directory),
-        Err(err) => Err(format!("cannot read {path}: {err}")),
-    }
-}
-
-fn is_directory(path: &str, err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::IsADirectory
-        || err.raw_os_error() == Some(21)
-        || fs::metadata(path).is_ok_and(|meta| meta.is_dir())
-}
-
-fn os_reason(err: &io::Error) -> String {
-    let text = err.to_string();
-    match text.rfind(" (os error") {
-        Some(end) => text[..end].to_string(),
-        None => text,
-    }
-}
-
-fn decode(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn is_atom(value: &Value) -> bool {
-    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
-}
-
-fn environment() -> Value {
-    let fields = std::env::vars()
-        .map(|(key, value)| (key, Value::String(Text::from(value))))
-        .collect();
-    Value::object(fields)
 }

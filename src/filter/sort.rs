@@ -38,10 +38,7 @@ pub(super) fn eval_order(
     if matches!(kind, SortKind::Sort) {
         return Ok(vec![Value::array(sorted(items))]);
     }
-    let keyed = match keys_of(items, by, env) {
-        Ok(keyed) => keyed,
-        Err(failure) => return Err(failure),
-    };
+    let keyed = keys_of(items, by, env)?;
     let value = match kind {
         SortKind::SortBy => Value::array(arrange(keyed, false)),
         SortKind::Group | SortKind::Unique | SortKind::UniqueBy => {

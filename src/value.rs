@@ -250,10 +250,10 @@ impl Drop for VecPool {
 
 thread_local! {
     static POOL_OPEN: Cell<bool> = const { Cell::new(true) };
-    static POOL: RefCell<VecPool> = RefCell::new(VecPool {
+    static POOL: RefCell<VecPool> = const { RefCell::new(VecPool {
         bins: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         arrays: Vec::new(),
-    });
+    }) };
 }
 
 fn vec_bin(cap: usize) -> Option<usize> {
@@ -418,26 +418,6 @@ fn drop_deep(value: &mut Value) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Text;
-
-    #[test]
-    fn text_roundtrip_short_and_long() {
-        for len in [0, 1, 23, 24, 80] {
-            let text_src = "y".repeat(len);
-            let text = Text::from(text_src.as_str());
-            assert_eq!(&*text, text_src);
-            let copy = text.clone();
-            drop(text);
-            assert_eq!(&*copy, text_src);
-        }
-        let left = Text::from("same-long-string-value-aaaa");
-        let right = Text::from("same-long-string-value-aaaa");
-        assert_eq!(left, right);
-    }
-}
-
 fn take_children(value: &mut Value, stack: &mut Vec<Value>) {
     match value {
         Value::Array(items) => {
@@ -513,5 +493,25 @@ impl Value {
             Value::Array(_) => "array",
             Value::Object(_) => "object",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Text;
+
+    #[test]
+    fn text_roundtrip_short_and_long() {
+        for len in [0, 1, 23, 24, 80] {
+            let text_src = "y".repeat(len);
+            let text = Text::from(text_src.as_str());
+            assert_eq!(&*text, text_src);
+            let copy = text.clone();
+            drop(text);
+            assert_eq!(&*copy, text_src);
+        }
+        let left = Text::from("same-long-string-value-aaaa");
+        let right = Text::from("same-long-string-value-aaaa");
+        assert_eq!(left, right);
     }
 }
