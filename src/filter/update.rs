@@ -562,6 +562,7 @@ fn has_slice(filter: &Filter) -> bool {
         Filter::Optional(inner) | Filter::Define { rest: inner, .. } => has_slice(inner),
         Filter::If { yes, no, .. } => has_slice(yes) || has_slice(no),
         Filter::Bind { body, .. } => has_slice(body),
+        Filter::GsubLit { slow, .. } => has_slice(slow),
         _ => false,
     }
 }
@@ -2038,6 +2039,9 @@ fn run(
             flags,
             testing,
         } => run_match_value(regex, flags, *testing, input, path, line, ctx),
+        // The replaced string is not a path. Walking `slow` keeps the match
+        // array in the error `path` prints.
+        Filter::GsubLit { slow, .. } => run(slow, input, path, line, input_gen, ctx),
         // The inside is walked before the array exists. A failure there, such
         // as iterating a match array, is the failure jq reports.
         Filter::Collect(inner) => run_collect(inner, input, path, line, input_gen, ctx),

@@ -204,6 +204,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             Filter::Break { .. } => false,
             Filter::MatchImpl { regex, flags, .. } => walk(regex, seen) || walk(flags, seen),
             Filter::StreamBind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
+            Filter::GsubLit { slow, .. } => walk(slow, seen),
             Filter::Bind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
             Filter::Reduce {
                 stream,
@@ -654,6 +655,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             inner.push(name.clone());
             check_vars(body, &inner)
         }
+        Filter::GsubLit { slow, .. } => check_vars(slow, scope),
     }
 }
 
@@ -973,6 +975,7 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
             walk_defs(expr, seen, errors);
             walk_defs(body, seen, errors);
         }
+        Filter::GsubLit { slow, .. } => walk_defs(slow, seen, errors),
         Filter::Break {
             slot: None,
             at,
@@ -1363,14 +1366,45 @@ fn gsub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Fil
             vec![("re", re)],
             call_with(compile_scoped(GSUB, &["re"]), vec![replacement, *flags]),
         ),
-        None => sub_call(
-            re,
-            replacement,
-            Some(Box::new(Filter::Literal(Value::String(
-                crate::value::Text::from("g".to_string()),
-            )))),
-        ),
+        None => {
+            // A plain string is the same match `g` would find, without
+            // building a match object for every hit.
+            let fast = match (&re, &replacement) {
+                (
+                    Filter::Literal(Value::String(pattern)),
+                    Filter::Literal(Value::String(repl)),
+                ) if literal_pattern(pattern.as_str()) => Some((pattern.clone(), repl.clone())),
+                _ => None,
+            };
+            let slow = sub_call(
+                re,
+                replacement,
+                Some(Box::new(Filter::Literal(Value::String(
+                    crate::value::Text::from("g".to_string()),
+                )))),
+            );
+            match fast {
+                Some((pattern, replacement)) => Filter::GsubLit {
+                    pattern,
+                    replacement,
+                    slow: Box::new(slow),
+                },
+                None => slow,
+            }
+        }
     }
+}
+
+/// True when Oniguruma would match this text as itself. An empty pattern
+/// matches between characters, and a metacharacter changes the search.
+fn literal_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && !pattern.chars().any(|ch| {
+            matches!(
+                ch,
+                '.' | '\\' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '(' | ')' | '^' | '$' | '|'
+            )
+        })
 }
 
 fn bind_lazy(pairs: Vec<(&str, Filter)>, body: Filter) -> Filter {

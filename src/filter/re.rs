@@ -13,6 +13,38 @@ use crate::value::Value;
 use super::ast::Failure;
 use super::eval::{self, fail};
 
+/// Every non-overlapping copy of `pattern` in a string, replaced by `replacement`.
+/// `pattern` is not empty and has no regular-expression syntax. A value that
+/// is not a string fails the way `match` fails.
+pub(super) fn gsub_literal(
+    input: &Value,
+    pattern: &str,
+    replacement: &str,
+) -> Result<Vec<Value>, Failure> {
+    let Value::String(text) = input else {
+        return Err(fail(format!(
+            "{} ({}) cannot be matched, as it is not a string",
+            input.type_name(),
+            eval::shown(input)
+        )));
+    };
+    let text = text.as_str();
+    let Some(first) = text.find(pattern) else {
+        return Ok(vec![input.clone()]);
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..first]);
+    out.push_str(replacement);
+    let mut rest = &text[first + pattern.len()..];
+    while let Some(at) = rest.find(pattern) {
+        out.push_str(&rest[..at]);
+        out.push_str(replacement);
+        rest = &rest[at + pattern.len()..];
+    }
+    out.push_str(rest);
+    Ok(vec![Value::String(crate::value::Text::from(out))])
+}
+
 pub(super) fn apply_pair(
     subject: &Value,
     pattern: &Value,

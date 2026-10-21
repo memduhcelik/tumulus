@@ -281,6 +281,11 @@ pub(super) fn produce(
         Filter::MatchImpl { .. } | Filter::StreamBind { .. } => {
             super::stream::collect(filter, input, env)
         }
+        Filter::GsubLit {
+            pattern,
+            replacement,
+            ..
+        } => super::re::gsub_literal(input, pattern, replacement),
     }
 }
 

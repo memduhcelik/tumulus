@@ -281,6 +281,14 @@ The same five commands were timed on that file. Stdout and stderr matched. `--st
 | 2 | 1.77 | 1.10 |
 | 3 | 1.78 | 1.10 |
 
+`.path | gsub("/"; "_")` on `requests.ndjson` writes 4251398 bytes. Stdout matched and stderr was empty.
+
+| run | `jq -c` | `tumulus -c` |
+| --- | ---: | ---: |
+| 1 | 4.23 | 0.62 |
+| 2 | 4.22 | 0.63 |
+| 3 | 4.21 | 0.61 |
+
 Times are seconds.
 
 ## License

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`gsub` of a literal pattern and a literal replacement replaces each match in one pass. `.path | gsub("/"; "_")` on the requests file took 0.62, 0.63, and 0.61 seconds beside jq's 4.23, 4.22, and 4.21. The text is unchanged. `path(gsub(...))` still fails while iterating the match array.
+
 The README runs two filters on `tests/fixtures/package.json`. One keeps the major number of every dependency, including dev dependencies. The other prints the test script.
 
 A library that contains a filter besides its definitions is a compile error. The message is `library should only have function definitions, not a main expression`, and the exit status is 3. `import` and `include` stop. `modulemeta` prints the message and yields null.

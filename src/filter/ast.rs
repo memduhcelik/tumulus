@@ -386,6 +386,15 @@ pub enum Filter {
         flags: Box<Filter>,
         testing: bool,
     },
+    /// `gsub` of two strings, with `g` and no other flag, when the pattern
+    /// has no regular-expression syntax. Values are replaced in one pass.
+    /// `slow` is the match program `path` walks, so that error still names
+    /// the match array.
+    GsubLit {
+        pattern: crate::value::Text,
+        replacement: crate::value::Text,
+        slow: Box<Filter>,
+    },
     /// Bind each value of `expr` and run `body`, and do not read the next
     /// value once `body` stops or fails. Regex filters use this for `$`
     /// arguments, so a later argument is not touched.
