@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+The README runs two filters on `tests/fixtures/package.json`. One keeps the major number of every dependency, including dev dependencies. The other prints the test script.
+
 A library that contains a filter besides its definitions is a compile error. The message is `library should only have function definitions, not a main expression`, and the exit status is 3. `import` and `include` stop. `modulemeta` prints the message and yields null.
 
 A string built from several `\( )` pieces runs the rightmost piece outermost. `"\(1,2) \(3,4)"` prints `"1 3"`, `"2 3"`, `"1 4"`, and `"2 4"`. Each piece to the left runs again for every value on the right.

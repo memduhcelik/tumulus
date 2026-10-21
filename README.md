@@ -50,6 +50,26 @@ tumulus -c '.labels | {tr, jp, emoji}' tests/fixtures/settings.json
 {"tr":"Şehir İçi Ölçüm","jp":"潮位計","emoji":"🌊 high tide"}
 ```
 
+`tests/fixtures/package.json` is one package manifest. Dependencies and dev dependencies are one object, and each version keeps only its major number. These commands print the same text with tumulus and with jq.
+
+```sh
+tumulus -c '[.dependencies, .devDependencies] | add | map_values(ltrimstr("^") | ltrimstr("~") | split(".")[0] | tonumber)' tests/fixtures/package.json
+```
+
+```json
+{"react":18,"react-dom":18,"date-fns":3,"zod":3,"typescript":5,"vite":5,"vitest":2,"eslint":9}
+```
+
+The test script is the string under `scripts.test`.
+
+```sh
+tumulus -r '.scripts.test' tests/fixtures/package.json
+```
+
+```text
+vitest run
+```
+
 ## What works
 
 Input is standard input or files. `-` is standard input. With no filter, the filter is `.`. The files are one stream. An array or an object can open in one file and close in a later one. A value already written is kept when that joined text is not valid JSON. The message is jq's parse error and the exit status is 5.
