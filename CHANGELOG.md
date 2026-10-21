@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`1 ?// 2` is a syntax error. jq reports `unexpected ?//`, and the exit status is 3. `?//` is still the alternative pattern in `as`, `reduce`, and `foreach`.
+
 `gsub` of a literal pattern and a literal replacement replaces each match in one pass. `.path | gsub("/"; "_")` on the requests file took 0.62, 0.63, and 0.61 seconds beside jq's 4.23, 4.22, and 4.21. The text is unchanged. `path(gsub(...))` still fails while iterating the match array.
 
 The README runs two filters on `tests/fixtures/package.json`. One keeps the major number of every dependency, including dev dependencies. The other prints the test script.

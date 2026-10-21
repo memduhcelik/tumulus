@@ -1811,6 +1811,12 @@ pub(super) struct Parser<'a> {
     interp: u32,
     /// The leading minus of a `try` operand. `?` there marks only the last suffix.
     suffix_question: bool,
+    /// What jq expects when `?//` follows a finished term. A pattern
+    /// alternative is the only place that token is legal.
+    qalt: &'static str,
+    /// How many `then` keywords are still open. A `?//` after one of them
+    /// also reports an unterminated `if`.
+    if_then: u32,
     /// Inner scopes are at the back. Each `def` body gets its own scope.
     scopes: Vec<PScope>,
     /// Load `import` and `include`. `modulemeta` only records them.
@@ -1859,6 +1865,8 @@ impl<'a> Parser<'a> {
             reject_try: false,
             interp: 0,
             suffix_question: false,
+            qalt: QALT_EOF,
+            if_then: 0,
             scopes: vec![PScope {
                 funcs: Vec::new(),
                 params: Vec::new(),
@@ -2412,6 +2420,9 @@ impl<'a> Parser<'a> {
         let mut bracket = false;
         loop {
             self.skip_ws();
+            if self.question_alt_at() {
+                return Err(self.bad_question_alt(false));
+            }
             if self.eat('?') {
                 filter = if self.suffix_question || bracket {
                     optional_last(filter)
@@ -2458,6 +2469,9 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<Filter, ProgramError> {
         self.skip_ws();
+        if self.question_alt_at() {
+            return Err(self.bad_question_alt(true));
+        }
         if let Some(err) = self.lone_closing_brace() {
             return Err(err);
         }
@@ -2466,7 +2480,7 @@ impl<'a> Parser<'a> {
             let saved_try = self.reject_try;
             self.reject_block = false;
             self.reject_try = false;
-            let inner = self.parse_pipe();
+            let inner = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe());
             self.reject_block = saved_block;
             self.reject_try = saved_try;
             let inner = inner?;
@@ -2622,7 +2636,7 @@ impl<'a> Parser<'a> {
             funcs: Vec::new(),
             params: names,
         });
-        let body = self.parse_pipe();
+        let body = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe());
         self.scopes.pop();
         let body = body?;
         if !self.eat(';') {
@@ -2735,7 +2749,7 @@ impl<'a> Parser<'a> {
         let saved_try = self.reject_try;
         self.reject_block = false;
         self.reject_try = false;
-        let parsed = self.parse_separated_args();
+        let parsed = self.in_qalt(QALT_CALL, |parser| parser.parse_separated_args());
         self.reject_block = saved_block;
         self.reject_try = saved_try;
         parsed
@@ -2762,7 +2776,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_fold(&mut self, foreach: bool) -> Result<Filter, ProgramError> {
-        let stream = self.parse_stream_term()?;
+        let stream = self.in_qalt(QALT_FOLD, |parser| parser.parse_stream_term())?;
         if !self.eat_keyword("as") {
             return Err(ProgramError::Syntax);
         }
@@ -2770,13 +2784,13 @@ impl<'a> Parser<'a> {
         if !self.eat('(') {
             return Err(ProgramError::Syntax);
         }
-        let init = self.parse_pipe()?;
+        let init = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         if !self.eat(';') {
             return Err(ProgramError::Syntax);
         }
-        let update = self.parse_pipe()?;
+        let update = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         let extract = if foreach && self.eat(';') {
-            Some(Box::new(self.parse_pipe()?))
+            Some(Box::new(self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?))
         } else if !foreach && self.sees(';') {
             return Err(ProgramError::Syntax);
         } else {
@@ -2828,6 +2842,112 @@ impl<'a> Parser<'a> {
         } else {
             false
         }
+    }
+
+    fn in_qalt<T>(&mut self, detail: &'static str, body: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.qalt;
+        self.qalt = detail;
+        let out = body(self);
+        self.qalt = saved;
+        out
+    }
+
+    fn question_alt_at(&self) -> bool {
+        self.src[self.index..].starts_with("?//")
+    }
+
+    /// `?//` outside a pattern. `at_start` is a term that has not begun.
+    /// Only the first token of the program expects the end of the file there.
+    fn bad_question_alt(&self, at_start: bool) -> ProgramError {
+        let detail = if at_start {
+            if self.qalt == QALT_EOF && self.at_first_token() {
+                QALT_EOF
+            } else {
+                QALT_PLAIN
+            }
+        } else {
+            self.qalt
+        };
+        self.question_alt_report(detail)
+    }
+
+    fn question_alt_report(&self, detail: &str) -> ProgramError {
+        if place_label() != "<top-level>" {
+            return ProgramError::Syntax;
+        }
+        let (line_no, line, column) = line_at(self.src, self.index);
+        let place = place_label();
+        let mut text = format!(
+            "jq: error: syntax error, {detail} (Unix shell quoting issues?) at {place}, line {line_no}:\n{line}"
+        );
+        text.extend(std::iter::repeat_n(' ', column));
+        text.push('\n');
+        if self.if_then > 0 {
+            text.push_str(&format!(
+                "jq: error: Possibly unterminated 'if' statement at {place}, line {line_no}:\n{line}\n"
+            ));
+            text.push_str("jq: 2 compile errors\n");
+        } else {
+            text.push_str("jq: 1 compile error\n");
+        }
+        ProgramError::Report(text)
+    }
+
+    fn at_first_token(&self) -> bool {
+        let bytes = self.src.as_bytes();
+        let mut index = 0;
+        while index < self.index {
+            match bytes[index] {
+                b' ' | b'\t' | b'\n' | b'\r' => index += 1,
+                b'#' => {
+                    index += 1;
+                    while index < self.index && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// `. ?//` is both an unexpected token and a field jq will not read.
+    fn dot_question_alt(&self) -> ProgramError {
+        if place_label() != "<top-level>" {
+            return ProgramError::Syntax;
+        }
+        let (line_no, line, column) = line_at(self.src, self.index);
+        let place = place_label();
+        let dot = self.dot_before_question_alt();
+        let (_, _, dot_col) = line_at(self.src, dot);
+        let mut text = format!(
+            "jq: error: syntax error, unexpected ?// (Unix shell quoting issues?) at {place}, line {line_no}:\n{line}"
+        );
+        text.extend(std::iter::repeat_n(' ', column));
+        text.push('\n');
+        text.push_str(&format!(
+            "jq: error: try .[\"field\"] instead of .field for unusually named fields at {place}, line {line_no}:\n{line}"
+        ));
+        text.extend(std::iter::repeat_n(' ', dot_col));
+        text.push('\n');
+        let count = 2 + usize::from(self.if_then > 0);
+        if self.if_then > 0 {
+            text.push_str(&format!(
+                "jq: error: Possibly unterminated 'if' statement at {place}, line {line_no}:\n{line}\n"
+            ));
+        }
+        text.push_str(&format!("jq: {count} compile errors\n"));
+        ProgramError::Report(text)
+    }
+
+    /// The `.` that `?//` was written after. Whitespace between them is skipped.
+    fn dot_before_question_alt(&self) -> usize {
+        let bytes = self.src.as_bytes();
+        let mut index = self.index;
+        while index > 0 && matches!(bytes[index - 1], b' ' | b'\t' | b'\n' | b'\r') {
+            index -= 1;
+        }
+        index.saturating_sub(1)
     }
 
     /// `label $name | body`. The name is visible in the body and nowhere after it.
@@ -3105,6 +3225,9 @@ impl<'a> Parser<'a> {
                 }
                 return Err(ProgramError::Syntax);
             }
+            if self.question_alt_at() {
+                return Err(self.bad_question_alt(false));
+            }
             if extended && self.eat('?') {
                 filter = optional_last(filter);
                 continue;
@@ -3125,12 +3248,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if(&mut self) -> Result<Filter, ProgramError> {
-        let cond = self.parse_pipe()?;
+        let cond = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         if !self.eat_keyword("then") {
             return Err(ProgramError::Syntax);
         }
-        let yes = self.parse_pipe()?;
-        let no = self.parse_else()?;
+        self.if_then += 1;
+        let yes = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe());
+        let no = self.parse_else();
+        self.if_then -= 1;
+        let yes = yes?;
+        let no = no?;
         Ok(Filter::If {
             cond: Box::new(cond),
             yes: Box::new(yes),
@@ -3140,11 +3267,11 @@ impl<'a> Parser<'a> {
 
     fn parse_else(&mut self) -> Result<Filter, ProgramError> {
         if self.eat_keyword("elif") {
-            let cond = self.parse_pipe()?;
+            let cond = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
             if !self.eat_keyword("then") {
                 return Err(ProgramError::Syntax);
             }
-            let yes = self.parse_pipe()?;
+            let yes = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
             let no = self.parse_else()?;
             return Ok(Filter::If {
                 cond: Box::new(cond),
@@ -3153,7 +3280,7 @@ impl<'a> Parser<'a> {
             });
         }
         let no = if self.eat_keyword("else") {
-            self.parse_pipe()?
+            self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?
         } else {
             // A missing else yields the input, which is null under -n.
             Filter::Identity
@@ -3290,6 +3417,13 @@ impl<'a> Parser<'a> {
     fn finish_path(&mut self, mut filter: Option<Filter>) -> Result<Filter, ProgramError> {
         loop {
             self.skip_ws();
+            if self.question_alt_at() {
+                // `. ?//` is a field name, and also the token jq did not expect.
+                if filter.is_none() {
+                    return Err(self.dot_question_alt());
+                }
+                return Err(self.bad_question_alt(false));
+            }
             if self.eat('?') {
                 let base = filter.unwrap_or(Filter::Identity);
                 filter = Some(optional_last(base));
@@ -3364,7 +3498,7 @@ impl<'a> Parser<'a> {
             }
             return Ok(segment);
         }
-        let key = self.parse_pipe()?;
+        let key = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         self.skip_ws();
         if !self.eat(']') {
             return Err(ProgramError::Syntax);
@@ -3412,7 +3546,7 @@ impl<'a> Parser<'a> {
         let start = if self.peek() == Some(':') {
             None
         } else {
-            let start = self.parse_pipe()?;
+            let start = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
             self.skip_ws();
             Some(Box::new(start))
         };
@@ -3423,7 +3557,7 @@ impl<'a> Parser<'a> {
         let end = if self.peek() == Some(']') {
             None
         } else {
-            let end = self.parse_pipe()?;
+            let end = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
             self.skip_ws();
             Some(Box::new(end))
         };
@@ -3545,7 +3679,7 @@ impl<'a> Parser<'a> {
         if self.eat(']') {
             return Ok(Filter::Literal(Value::array(Vec::new())));
         }
-        let inner = self.parse_pipe()?;
+        let inner = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         // `[1,2` parsed the elements and then the file ended.
         let token_end = self.index;
         self.skip_ws();
@@ -3566,6 +3700,14 @@ impl<'a> Parser<'a> {
         if !self.eat('{') {
             return Err(ProgramError::Syntax);
         }
+        let saved = self.qalt;
+        self.qalt = QALT_BRACE;
+        let parsed = self.parse_object_body();
+        self.qalt = saved;
+        parsed
+    }
+
+    fn parse_object_body(&mut self) -> Result<Filter, ProgramError> {
         self.skip_ws();
         if self.eat('}') {
             return Ok(Filter::Literal(Value::object(Vec::new())));
@@ -3605,7 +3747,7 @@ impl<'a> Parser<'a> {
             if !self.eat(')') || !self.eat(':') {
                 return Err(ProgramError::Syntax);
             }
-            let value = self.parse_expd()?;
+            let value = self.in_qalt(QALT_BRACE, |parser| parser.parse_expd())?;
             if let Some(constant) = const_one(&key) {
                 if !matches!(constant, Value::String(_)) {
                     return Err(report_at(self.src, pos, &key_message(&constant)));
@@ -3620,7 +3762,7 @@ impl<'a> Parser<'a> {
             let key = self.parse_string_expr()?;
             self.skip_ws();
             if self.eat(':') {
-                let value = self.parse_expd()?;
+                let value = self.in_qalt(QALT_BRACE, |parser| parser.parse_expd())?;
                 return Ok(ObjField::Pair {
                     key: Box::new(key),
                     value: Box::new(value),
@@ -3634,8 +3776,11 @@ impl<'a> Parser<'a> {
         if self.starts_ident() {
             let name = self.ident_key()?;
             self.skip_ws();
+            if self.question_alt_at() {
+                return Err(self.bad_question_alt(false));
+            }
             if self.eat(':') {
-                let value = self.parse_expd()?;
+                let value = self.in_qalt(QALT_BRACE, |parser| parser.parse_expd())?;
                 return Ok(ObjField::Pair {
                     key: Box::new(Filter::Literal(Value::String(crate::value::Text::from(
                         name,
@@ -3802,7 +3947,7 @@ impl<'a> Parser<'a> {
                     let saved_try = self.reject_try;
                     self.reject_try = false;
                     self.interp += 1;
-                    let inner = self.parse_pipe();
+                    let inner = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe());
                     self.interp -= 1;
                     self.reject_try = saved_try;
                     let inner = inner?;
@@ -4143,6 +4288,12 @@ impl<'a> Parser<'a> {
         ))
     }
 }
+
+const QALT_EOF: &str = "unexpected ?//, expecting end of file";
+const QALT_PLAIN: &str = "unexpected ?//";
+const QALT_BRACE: &str = "unexpected ?//, expecting '}'";
+const QALT_CALL: &str = "unexpected ?//, expecting ';' or ')'";
+const QALT_FOLD: &str = "unexpected ?//, expecting FIELD or as or '.' or '['";
 
 fn jq_syntax(detail: &str, line_no: usize, line: &str, pad: usize) -> ProgramError {
     let mut text = format!(
