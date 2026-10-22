@@ -955,6 +955,87 @@ fn operators_match_jq() {
 }
 
 #[test]
+fn generator_order_matches_jq() {
+    require_jq();
+    let cases = [
+        (
+            "op add",
+            "(input,input) + (input,input)",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "op add in def",
+            "def f: (input,input) + (input,input); f",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "op sub",
+            "(input,input) - (input,input)",
+            "8\n3\n2\n2\n9\n4\n",
+        ),
+        (
+            "op mul",
+            "(input,input) * (input,input)",
+            "2\n3\n4\n5\n6\n7\n",
+        ),
+        (
+            "op div",
+            "(input,input) / (input,input)",
+            "8\n3\n2\n2\n9\n4\n",
+        ),
+        (
+            "op rem",
+            "(input,input) % (input,input)",
+            "8\n3\n2\n2\n9\n4\n",
+        ),
+        (
+            "op ge",
+            "(input,input) >= (input,input)",
+            "5\n1\n5\n1\n0\n9\n",
+        ),
+        ("op debug", "((1,2)|debug) + ((3,4)|debug)", ""),
+        ("op pure", "(1,2) + (10,20)", ""),
+        (
+            "obj fields",
+            "{a:(input,input), b:(input,input)}",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "obj fields in def",
+            "def f: {a:(input,input), b:(input,input)}; f",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "obj key",
+            "{(input|tostring, input|tostring):(input,input)}",
+            "1\n2\n3\n4\n5\n6\n7\n8\n",
+        ),
+        (
+            "obj three",
+            "{a:(input,input), b:(input,input), c:(input,input)}",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n",
+        ),
+        ("obj pure", "{a:(1,2), b:(3,4)}", ""),
+        ("obj key pure", "{(\"a\",\"b\"):(1,2)}", ""),
+        ("obj empty field", "{a:empty, b:debug(\"b\")}", ""),
+        (
+            "dollar",
+            "def f($a; $b): [$a,$b]; f(input,input; input,input)",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "dollar three",
+            "def f($a; $b; $c): [$a,$b,$c]; f(input,input; input,input; input,input)",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n",
+        ),
+        ("dollar pure", "def f($a; $b): [$a,$b]; f(1,2; 3,4)", ""),
+    ];
+    for (name, program, input) in cases {
+        compare_exact(name, &["-n", "-c", "--", program], input.as_bytes());
+    }
+}
+
+#[test]
 fn halfway_decimal_matches_jq() {
     require_jq();
     let programs = [
@@ -1087,10 +1168,16 @@ fn interpolated_strings_match_jq() {
     }
     let with_input = [
         (r#""\(input) \(input)""#, "1\n2\n3\n"),
-        (r#""\(input,input) \(input,input)""#, "1\n2\n3\n4\n5\n6\n7\n8\n"),
+        (
+            r#""\(input,input) \(input,input)""#,
+            "1\n2\n3\n4\n5\n6\n7\n8\n",
+        ),
         (r#""\(input)-\(input)-\(input)""#, "1\n2\n3\n4\n"),
         (r#""\(input,input) \(input,error("z"))""#, "1\n2\n3\n4\n"),
-        (r#"{"\(input,input)\(input,input)": 1}"#, "1\n2\n3\n4\n5\n6\n7\n8\n"),
+        (
+            r#"{"\(input,input)\(input,input)": 1}"#,
+            "1\n2\n3\n4\n5\n6\n7\n8\n",
+        ),
     ];
     for (program, input) in with_input {
         compare_exact(program, &["-n", "-c", "--", program], input.as_bytes());

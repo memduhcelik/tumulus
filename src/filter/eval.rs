@@ -1281,23 +1281,50 @@ pub(super) fn eval_bin(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    // The right stream is the outer loop. A left error drops the remaining
-    // rights; a right error is reported after the successful rights.
-    let (rights, right_err) = parts(eval_in(right, input, env));
+    // The right-hand filter is the outer loop. One of its values runs the
+    // left-hand filter to the end before the next right-hand value is read.
+    // A left error drops the remaining rights. A right error is reported
+    // after the rights that were already produced.
     let mut out = Vec::new();
-    for right_value in rights {
-        let (lefts, left_err) = parts(eval_in(left, input, env));
+    let mut left_err: Option<Failure> = None;
+    let apply_right = |right_value: &Value, out: &mut Vec<Value>| -> Result<(), Failure> {
+        let (lefts, err) = parts(eval_in(left, input, env));
         for left_value in lefts {
-            match apply_op(op, &left_value, &right_value) {
+            match apply_op(op, &left_value, right_value) {
                 Ok(value) => out.push(value),
-                Err(message) => return Err(fresh(out, message)),
+                Err(message) => return Err(fresh(Vec::new(), message)),
             }
         }
-        if let Some(failure) = left_err {
-            return Err(with_partial(out, failure));
+        if let Some(failure) = err {
+            return Err(failure);
+        }
+        Ok(())
+    };
+    let right_result = {
+        let mut on_right = |right_value: &Value| match apply_right(right_value, &mut out) {
+            Ok(()) => false,
+            Err(failure) => {
+                left_err = Some(failure);
+                true
+            }
+        };
+        super::stream::feed(right, input, env, &mut on_right)
+    };
+    if let Some(failure) = left_err {
+        return Err(extend_err(out, failure));
+    }
+    match right_result {
+        Ok(_) => Ok(out),
+        Err(mut failure) => {
+            let pending = std::mem::take(&mut failure.partial);
+            for right_value in pending {
+                if let Err(err) = apply_right(&right_value, &mut out) {
+                    return Err(extend_err(out, err));
+                }
+            }
+            Err(extend_err(out, failure))
         }
     }
-    finish(out, right_err)
 }
 
 pub(super) fn eval_and(
@@ -1446,132 +1473,188 @@ pub(super) fn eval_object(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let mut streams = Vec::with_capacity(fields.len());
-    for field in fields {
-        streams.push(field_alts(field, input, env));
-    }
-    combine_fields(&streams, 0, Vec::new())
-}
-
-pub(super) struct Alts {
-    pub(super) pairs: Vec<(String, Value)>,
-    pub(super) error: Option<Failure>,
-}
-
-pub(super) fn field_alts(field: &ObjField, input: &Value, env: &[(String, Value)]) -> Alts {
-    match field {
-        ObjField::Lookup(key) => lookup_alts(key, input, env),
-        ObjField::Pair { key, value } => pair_alts(key, value, input, env),
-    }
-}
-
-pub(super) fn lookup_alts(key: &Filter, input: &Value, env: &[(String, Value)]) -> Alts {
-    let (keys, key_err) = parts(eval_in(key, input, env));
-    let mut pairs = Vec::new();
-    for value in keys {
-        let Ok(name) = value.clone().into_string() else {
-            return Alts {
-                pairs,
-                error: Some(fail(key_message(&value))),
-            };
-        };
-        match index_by(
+    // An earlier field is the outer loop. One of its values runs the later
+    // fields before the next value is read. An empty earlier field does not
+    // run the later ones.
+    let mut out = Vec::new();
+    let result = {
+        let mut walk = ObjBuild {
+            fields,
             input,
+            env,
+            out: &mut out,
+        };
+        walk.rest(0, &[])
+    };
+    match result {
+        Ok(()) => Ok(out),
+        Err(failure) => Err(extend_err(out, failure)),
+    }
+}
+
+/// One object under construction. `out` collects finished objects.
+struct ObjBuild<'a> {
+    fields: &'a [ObjField],
+    input: &'a Value,
+    env: &'a [(String, Value)],
+    out: &'a mut Vec<Value>,
+}
+
+impl ObjBuild<'_> {
+    fn rest(&mut self, index: usize, base: &[(String, Value)]) -> Result<(), Failure> {
+        let Some(field) = self.fields.get(index) else {
+            self.out.push(Value::object(base.to_vec()));
+            return Ok(());
+        };
+        match field {
+            ObjField::Lookup(key) => self.lookup(key, index, base),
+            ObjField::Pair { key, value } => self.pair(key, value, index, base),
+        }
+    }
+
+    /// A copied field. A key that is not a string fails when it is produced.
+    fn lookup(
+        &mut self,
+        key: &Filter,
+        index: usize,
+        base: &[(String, Value)],
+    ) -> Result<(), Failure> {
+        let mut stop: Option<Failure> = None;
+        let input = self.input;
+        let env = self.env;
+        let read = {
+            let mut on_key = |key_value: &Value| match self.lookup_one(key_value, index, base) {
+                Ok(()) => false,
+                Err(failure) => {
+                    stop = Some(failure);
+                    true
+                }
+            };
+            super::stream::feed(key, input, env, &mut on_key)
+        };
+        if let Some(failure) = stop {
+            return Err(failure);
+        }
+        match read {
+            Ok(_) => Ok(()),
+            Err(mut failure) => {
+                let pending = std::mem::take(&mut failure.partial);
+                for key_value in pending {
+                    self.lookup_one(&key_value, index, base)?;
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    fn lookup_one(
+        &mut self,
+        key_value: &Value,
+        index: usize,
+        base: &[(String, Value)],
+    ) -> Result<(), Failure> {
+        let Ok(name) = key_value.clone().into_string() else {
+            return Err(fail(key_message(key_value)));
+        };
+        let one = match index_by(
+            self.input,
             &Value::String(crate::value::Text::from(name.clone())),
         ) {
-            Ok(got) => {
-                let one = got.into_iter().next().unwrap_or(Value::Null);
-                pairs.push((name, one));
-            }
-            Err(failure) => {
-                return Alts {
-                    pairs,
-                    error: Some(bare_fail(failure)),
-                };
-            }
-        }
+            Ok(got) => got.into_iter().next().unwrap_or(Value::Null),
+            Err(failure) => return Err(bare_fail(failure)),
+        };
+        let mut next = base.to_vec();
+        put(&mut next, name, one);
+        self.rest(index + 1, &next)
     }
-    Alts {
-        pairs,
-        error: key_err,
-    }
-}
 
-pub(super) fn pair_alts(
-    key: &Filter,
-    value: &Filter,
-    input: &Value,
-    env: &[(String, Value)],
-) -> Alts {
-    let (keys, key_err) = parts(eval_in(key, input, env));
-    let (values, value_err) = parts(eval_in(value, input, env));
-    // No value was produced. A bad key is not an error until a value needs it.
-    // A value error is kept, unless the key failed before it produced anything.
-    if values.is_empty() {
-        if let Some(failure) = value_err {
-            if keys.is_empty() {
-                if let Some(key_failure) = key_err {
-                    return Alts {
-                        pairs: Vec::new(),
-                        error: Some(key_failure),
-                    };
+    /// One key, then every value, then the next key. A value error stops the
+    /// keys that follow. A key that is not a string is checked once a value
+    /// exists; no value means a bad key is not an error.
+    fn pair(
+        &mut self,
+        key: &Filter,
+        value: &Filter,
+        index: usize,
+        base: &[(String, Value)],
+    ) -> Result<(), Failure> {
+        let mut stop: Option<Failure> = None;
+        let input = self.input;
+        let env = self.env;
+        let read = {
+            let mut on_key = |key_value: &Value| match self.for_key(key_value, value, index, base) {
+                Ok(()) => false,
+                Err(failure) => {
+                    stop = Some(failure);
+                    true
                 }
+            };
+            super::stream::feed(key, input, env, &mut on_key)
+        };
+        if let Some(failure) = stop {
+            return Err(failure);
+        }
+        match read {
+            Ok(_) => Ok(()),
+            Err(mut failure) => {
+                let pending = std::mem::take(&mut failure.partial);
+                for key_value in pending {
+                    self.for_key(&key_value, value, index, base)?;
+                }
+                Err(failure)
             }
-            return Alts {
-                pairs: Vec::new(),
-                error: Some(failure),
-            };
-        }
-        return Alts {
-            pairs: Vec::new(),
-            error: key_err,
-        };
-    }
-    let mut pairs = Vec::new();
-    for key_value in &keys {
-        let Value::String(name) = key_value else {
-            return Alts {
-                pairs,
-                error: Some(fail(key_message(key_value))),
-            };
-        };
-        for item in &values {
-            pairs.push((name.to_string(), item.clone()));
-        }
-        if let Some(failure) = &value_err {
-            return Alts {
-                pairs,
-                error: Some(failure.clone()),
-            };
         }
     }
-    Alts {
-        pairs,
-        error: key_err.or(value_err),
-    }
-}
 
-pub(super) fn combine_fields(
-    streams: &[Alts],
-    index: usize,
-    base: Vec<(String, Value)>,
-) -> Result<Vec<Value>, Failure> {
-    let Some(stream) = streams.get(index) else {
-        return Ok(vec![Value::object(base)]);
-    };
-    let mut out = Vec::new();
-    for (key, value) in &stream.pairs {
-        let mut next = base.clone();
-        put(&mut next, key.clone(), value.clone());
-        match combine_fields(streams, index + 1, next) {
-            Ok(more) => out.extend(more),
-            Err(failure) => return Err(extend_err(out, failure)),
+    fn for_key(
+        &mut self,
+        key_value: &Value,
+        value: &Filter,
+        index: usize,
+        base: &[(String, Value)],
+    ) -> Result<(), Failure> {
+        let mut stop: Option<Failure> = None;
+        let input = self.input;
+        let env = self.env;
+        let read = {
+            let mut on_value = |item: &Value| match self.place(key_value, item, index, base) {
+                Ok(()) => false,
+                Err(failure) => {
+                    stop = Some(failure);
+                    true
+                }
+            };
+            super::stream::feed(value, input, env, &mut on_value)
+        };
+        if let Some(failure) = stop {
+            return Err(failure);
+        }
+        match read {
+            Ok(_) => Ok(()),
+            Err(mut failure) => {
+                let pending = std::mem::take(&mut failure.partial);
+                for item in pending {
+                    self.place(key_value, &item, index, base)?;
+                }
+                Err(failure)
+            }
         }
     }
-    if let Some(failure) = &stream.error {
-        return Err(with_partial(out, failure.clone()));
+
+    fn place(
+        &mut self,
+        key_value: &Value,
+        item: &Value,
+        index: usize,
+        base: &[(String, Value)],
+    ) -> Result<(), Failure> {
+        let Ok(name) = key_value.clone().into_string() else {
+            return Err(fail(key_message(key_value)));
+        };
+        let mut next = base.to_vec();
+        put(&mut next, name, item.clone());
+        self.rest(index + 1, &next)
     }
-    Ok(out)
 }
 
 pub(super) fn eval_at(

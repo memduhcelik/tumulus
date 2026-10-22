@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`+`, `-`, `*`, `/`, `%`, and the comparisons take one value from the right-hand filter and run the left-hand filter before the next right-hand value. `(input,input) + (input,input)` on `1` through `6` prints `3`, `4`, `9`, and `10`. An object takes one value from an earlier field and runs the later fields before the next value. In one field, one key runs the value before the next key. `{a:(input,input), b:(input,input)}` on those inputs prints `{"a":1,"b":2}`, `{"a":1,"b":3}`, `{"a":4,"b":5}`, and `{"a":4,"b":6}`. A `$` argument does the same: one value, then the later arguments. `def f($a; $b): [$a,$b]; f(input,input; input,input)` prints `[1,2]`, `[1,3]`, `[4,5]`, and `[4,6]`.
+
 A computed number that is exactly halfway between two shortest decimals prints the one with an even last digit. `1e15+0.3` prints `1000000000000000.2`. So does its negative, and so do `tostring` and `tojson`.
 
 `if` runs the branch for one condition value before it reads the next. `printf '1\n2\n3\n4\n5\n' | tumulus -n -c 'if (input,input) then (input) else (input) end'` prints `2` and `4`. `join` joins one separator before it reads the next. `[1,2] | join(input,input)` on `1` then `2` fails at `<stdin>:1` and does not read `2`.
