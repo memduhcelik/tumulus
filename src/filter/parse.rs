@@ -2473,7 +2473,9 @@ impl<'a> Parser<'a> {
             return Err(self.bad_question_alt(true));
         }
         if self.peek() == Some('%') {
-            let detail = if self.qalt == QALT_EOF {
+            // jq expects the end of the file only when `%` is the first token.
+            // After an operator, as in `1 + %`, the message is `unexpected '%'`.
+            let detail = if self.qalt == QALT_EOF && self.at_first_token() {
                 "unexpected '%', expecting end of file"
             } else {
                 "unexpected '%'"

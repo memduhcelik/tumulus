@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A `%` after an operator is `unexpected '%'`. `1 + %`, `.a | %`, and `1, %` are that message. A `%` that starts the program still expects the end of the file.
+
 `as`, `reduce`, and `foreach` take one source value and run the body before the next source value. `reduce (input,input) as $x (0; . + input)` on `1` through `6` prints `6`. One initial value runs that source before the next initial value.
 
 `+`, `-`, `*`, `/`, `%`, and the comparisons take one value from the right-hand filter and run the left-hand filter before the next right-hand value. `(input,input) + (input,input)` on `1` through `6` prints `3`, `4`, `9`, and `10`. An object takes one value from an earlier field and runs the later fields before the next value. In one field, one key runs the value before the next key. `{a:(input,input), b:(input,input)}` on those inputs prints `{"a":1,"b":2}`, `{"a":1,"b":3}`, `{"a":4,"b":5}`, and `{"a":4,"b":6}`. A `$` argument does the same: one value, then the later arguments. `def f($a; $b): [$a,$b]; f(input,input; input,input)` prints `[1,2]`, `[1,3]`, `[4,5]`, and `[4,6]`.
