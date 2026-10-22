@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`. as [] | null`, `. as {} | null`, and `%::wat` print jq's syntax error, naming the token jq did not expect. The exit status is 3. All 447 programs in jq 1.7.1's test file come out the same.
+
 `1 ?// 2` is a syntax error. jq reports `unexpected ?//`, and the exit status is 3. `?//` is still the alternative pattern in `as`, `reduce`, and `foreach`.
 
 `gsub` of a literal pattern and a literal replacement replaces each match in one pass. `.path | gsub("/"; "_")` on the requests file took 0.62, 0.63, and 0.61 seconds beside jq's 4.23, 4.22, and 4.21. The text is unchanged. `path(gsub(...))` still fails while iterating the match array.

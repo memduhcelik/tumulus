@@ -2472,6 +2472,14 @@ impl<'a> Parser<'a> {
         if self.question_alt_at() {
             return Err(self.bad_question_alt(true));
         }
+        if self.peek() == Some('%') {
+            let detail = if self.qalt == QALT_EOF {
+                "unexpected '%', expecting end of file"
+            } else {
+                "unexpected '%'"
+            };
+            return Err(self.unexpected_token(self.index, detail));
+        }
         if let Some(err) = self.lone_closing_brace() {
             return Err(err);
         }
@@ -3006,7 +3014,10 @@ impl<'a> Parser<'a> {
         if self.eat('[') {
             self.skip_ws();
             if self.peek() == Some(']') {
-                return Err(ProgramError::Syntax);
+                return Err(self.unexpected_token(
+                    self.index,
+                    "unexpected ']', expecting BINDING or '[' or '{'",
+                ));
             }
             let mut items = Vec::new();
             loop {
@@ -3029,7 +3040,7 @@ impl<'a> Parser<'a> {
         if self.eat('{') {
             self.skip_ws();
             if self.peek() == Some('}') {
-                return Err(ProgramError::Syntax);
+                return Err(self.unexpected_token(self.index, "unexpected '}'"));
             }
             let mut fields = Vec::new();
             loop {
