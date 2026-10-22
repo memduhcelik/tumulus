@@ -2531,6 +2531,13 @@ impl<'a> Parser<'a> {
                     Filter::Optional(Box::new(filter))
                 };
                 bracket = false;
+                // `1[0]?[1]` keeps going. `1?[` and `(.[])?[` do not.
+                // Another `?`, as in `1??`, is still allowed.
+                if !chain_open(&filter, false) {
+                    if let Some(err) = self.sealed_question_tail() {
+                        return Err(err);
+                    }
+                }
                 continue;
             }
             if self.peek() == Some('[') {
@@ -2992,10 +2999,15 @@ impl<'a> Parser<'a> {
     }
 
     fn question_alt_report(&self, detail: &str) -> ProgramError {
+        self.report_detail(self.index, detail)
+    }
+
+    /// A jq syntax error at `at`. An open `if` adds the unterminated-if line.
+    fn report_detail(&self, at: usize, detail: &str) -> ProgramError {
         if place_label() != "<top-level>" {
             return ProgramError::Syntax;
         }
-        let (line_no, line, column) = line_at(self.src, self.index);
+        let (line_no, line, column) = line_at(self.src, at);
         let place = place_label();
         let mut text = format!(
             "jq: error: syntax error, {detail} (Unix shell quoting issues?) at {place}, line {line_no}:\n{line}"
@@ -3011,6 +3023,48 @@ impl<'a> Parser<'a> {
             text.push_str("jq: 1 compile error\n");
         }
         ProgramError::Report(text)
+    }
+
+    /// The token name after a `?` that ended the term. Top level expects
+    /// the end of the file. Inside `def` or `( )` the name stands alone.
+    fn tail_detail(&self, token: &str) -> String {
+        if self.qalt == QALT_EOF {
+            format!("unexpected {token}, expecting end of file")
+        } else {
+            format!("unexpected {token}")
+        }
+    }
+
+    /// `[` or `.` after a `?` that is not part of a field or index chain.
+    /// `.a?[1]` stays an index. `.?[1]` and `1?[` do not.
+    fn sealed_question_tail(&mut self) -> Option<ProgramError> {
+        self.skip_ws();
+        let start = self.index;
+        if self.peek() == Some('[') {
+            return Some(self.report_detail(start, &self.tail_detail("'['")));
+        }
+        if self.peek() != Some('.') {
+            return None;
+        }
+        let bytes = self.src.as_bytes();
+        // `.1` is a number. It is not a field.
+        if bytes
+            .get(start + 1)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        if bytes.get(start + 1) == Some(&b'.') {
+            return Some(self.report_detail(start, &self.tail_detail("..")));
+        }
+        let mut index = start + 1;
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b'\n' | b'\r') {
+            index += 1;
+        }
+        if index < bytes.len() && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+            return Some(self.report_detail(start, &self.tail_detail("FIELD")));
+        }
+        Some(self.report_detail(start, &self.tail_detail("'.'")))
     }
 
     fn at_first_token(&self) -> bool {
@@ -3353,6 +3407,11 @@ impl<'a> Parser<'a> {
             }
             if extended && self.eat('?') {
                 filter = optional_last(filter);
+                if !chain_open(&filter, true) {
+                    if let Some(err) = self.sealed_question_tail() {
+                        return Err(err);
+                    }
+                }
                 continue;
             }
             break;
@@ -3550,6 +3609,13 @@ impl<'a> Parser<'a> {
             if self.eat('?') {
                 let base = filter.unwrap_or(Filter::Identity);
                 filter = Some(optional_last(base));
+                // `.[]?[1]` and `.a?[1]` stay indexes. `.?[1]` and `..?[1]` do not.
+                // `.??` is still the optional operator applied twice.
+                if !chain_open(filter.as_ref().unwrap(), true) {
+                    if let Some(err) = self.sealed_question_tail() {
+                        return Err(err);
+                    }
+                }
                 continue;
             }
             self.skip_ws();
@@ -4157,6 +4223,19 @@ pub(super) fn chain(left: Option<Filter>, right: Filter) -> Filter {
     match left {
         Some(left) => Filter::Pipe(Box::new(left), Box::new(right)),
         None => right,
+    }
+}
+
+/// True when another `.` or `[` can follow `filter`. A `?` on a field,
+/// index, slice, or `.[]` still can. A second `?`, or `?` on `.`, `..`,
+/// or a finished term, cannot. `allow_iterate` is for the dot chain,
+/// where `.[]?` is still that chain.
+fn chain_open(filter: &Filter, allow_iterate: bool) -> bool {
+    match filter {
+        Filter::At { .. } | Filter::Slice { .. } | Filter::Field(_) | Filter::Iterate => true,
+        Filter::Pipe(_, right) => chain_open(right, allow_iterate),
+        Filter::Optional(inner) => allow_iterate && matches!(inner.as_ref(), Filter::Iterate),
+        _ => false,
     }
 }
 
