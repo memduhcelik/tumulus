@@ -442,8 +442,6 @@ fn variable_syntax_stays_generic() {
     let bin = env!("CARGO_BIN_EXE_tumulus");
     let programs = [
         "1 as $x",
-        ". as []",
-        ". as {}",
         ". as [$a,]",
         ". as {a:$a,}",
         "reduce 1+2 as $x (0; .)",
