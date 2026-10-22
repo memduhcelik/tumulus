@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
+
+Released on 2026-10-22.
 
 `. as [] | null`, `. as {} | null`, and `%::wat` print jq's syntax error, naming the token jq did not expect. The exit status is 3. All 447 programs in jq 1.7.1's test file come out the same.
 
