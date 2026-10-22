@@ -954,6 +954,16 @@ fn operators_match_jq() {
     }
 }
 
+/// Collecting `(input,input)` before `. + input` prints 7. jq prints 6.
+#[test]
+fn reduce_reads_one_source_value_before_the_body() {
+    require_jq();
+    let program = "reduce (input,input) as $x (0; . + input)";
+    compare_exact(program, &["-n", "-c", "--", program], b"1\n2\n3\n4\n5\n6\n");
+    let program = "def f: reduce (input,input) as $x (0; . + input); f";
+    compare_exact(program, &["-n", "-c", "--", program], b"1\n2\n3\n4\n5\n6\n");
+}
+
 #[test]
 fn generator_order_matches_jq() {
     require_jq();
@@ -1029,6 +1039,31 @@ fn generator_order_matches_jq() {
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n",
         ),
         ("dollar pure", "def f($a; $b): [$a,$b]; f(1,2; 3,4)", ""),
+        (
+            "as",
+            "(input,input) as $x | [$x, input]",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "as in def",
+            "def f: (input,input) as $x | [$x, input]; f",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "foreach",
+            "foreach (input,input) as $x (0; . + input)",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "foreach in def",
+            "def f: foreach (input,input) as $x (0; . + input); f",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
+        (
+            "reduce inits",
+            "reduce (input) as $x ((input,input); . + $x)",
+            "1\n2\n3\n4\n5\n6\n",
+        ),
     ];
     for (name, program, input) in cases {
         compare_exact(name, &["-n", "-c", "--", program], input.as_bytes());

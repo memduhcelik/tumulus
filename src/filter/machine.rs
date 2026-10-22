@@ -166,7 +166,10 @@ struct Nest {
     lookup: Option<super::update::ObjIndex>,
     frames: Vec<Vec<(String, Value)>>,
     frame_at: usize,
-    key_err: Option<Failure>,
+    /// Which `?//` pattern is running. `0` is the first pattern.
+    alt_at: usize,
+    /// `foreach` extract is running above an update frame that must resume.
+    update_open: bool,
     take: Take,
     seen: usize,
     /// Fields of the object being built, and one cursor per open field.
@@ -196,6 +199,7 @@ enum Kind {
     Bind {
         expr: Rc<Filter>,
         pattern: Pattern,
+        alts: Vec<Pattern>,
         body: Rc<Filter>,
     },
     /// `label $name | body`. `runtime` is this entry's `__jq` number.
@@ -203,12 +207,17 @@ enum Kind {
         slot: u32,
         body: Rc<Filter>,
     },
+    /// `reduce` when `each` is false, `foreach` when it is true.
+    /// One initial value runs the source before the next. One source value
+    /// runs the update before the next. `foreach` emits each step.
     Reduce {
         pattern: Pattern,
         init: Rc<Filter>,
         stream: Rc<Filter>,
         update: Rc<Filter>,
-        inits: Vec<Value>,
+        extract: Option<Rc<Filter>>,
+        alts: Vec<Pattern>,
+        each: bool,
     },
     Map(Rc<Filter>),
     First(Rc<Filter>),
@@ -675,12 +684,6 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
             env,
             scope,
         ),
-        Filter::Bind { alts, .. } if !alts.is_empty() => {
-            fallback(machine, index, &filter, &input, &env)
-        }
-        Filter::Reduce { alts, .. } if !alts.is_empty() => {
-            fallback(machine, index, &filter, &input, &env)
-        }
         Filter::Label { slot, body } => replace_nest(
             machine,
             index,
@@ -695,14 +698,15 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Filter::Bind {
             expr,
             pattern,
+            alts,
             body,
-            ..
         } => replace_nest(
             machine,
             index,
             Kind::Bind {
                 expr: Rc::new((**expr).clone()),
                 pattern: pattern.clone(),
+                alts: alts.clone(),
                 body: Rc::new((**body).clone()),
             },
             input,
@@ -712,9 +716,9 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         Filter::Reduce {
             stream,
             pattern,
+            alts,
             init,
             update,
-            ..
         } => replace_nest(
             machine,
             index,
@@ -723,7 +727,32 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 init: Rc::new((**init).clone()),
                 stream: Rc::new((**stream).clone()),
                 update: Rc::new((**update).clone()),
-                inits: Vec::new(),
+                extract: None,
+                alts: alts.clone(),
+                each: false,
+            },
+            input,
+            env,
+            scope,
+        ),
+        Filter::Foreach {
+            stream,
+            pattern,
+            alts,
+            init,
+            update,
+            extract,
+        } => replace_nest(
+            machine,
+            index,
+            Kind::Reduce {
+                pattern: pattern.clone(),
+                init: Rc::new((**init).clone()),
+                stream: Rc::new((**stream).clone()),
+                update: Rc::new((**update).clone()),
+                extract: extract.as_ref().map(|filter| Rc::new((**filter).clone())),
+                alts: alts.clone(),
+                each: true,
             },
             input,
             env,
@@ -1369,6 +1398,24 @@ fn finished(
                 machine.stack.truncate(index);
                 parent = next;
             }
+            DoneAct::Yield(value) => {
+                let next = machine.stack[index].parent;
+                match give(machine, next, value, emit) {
+                    Up::Go(true) => return Ok(true),
+                    Up::Go(false) => return Ok(false),
+                    Up::Fail {
+                        index: fail_at,
+                        failure,
+                    } => {
+                        let next = machine.stack[fail_at as usize].parent;
+                        machine.stack.truncate(fail_at as usize);
+                        return match failed(machine, next, failure, emit)? {
+                            Some(stopped) => Ok(stopped),
+                            None => Ok(false),
+                        };
+                    }
+                }
+            }
             DoneAct::Fail(failure) => {
                 let next = machine.stack[index].parent;
                 machine.stack.truncate(index);
@@ -1385,6 +1432,8 @@ enum DoneAct {
     Stay,
     Finish,
     Fail(Failure),
+    /// Send `value` upward and leave this frame in place.
+    Yield(Value),
 }
 
 fn on_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
@@ -1592,7 +1641,8 @@ fn replace_nest(
         lookup: None,
         frames: Vec::new(),
         frame_at: 0,
-        key_err: None,
+        alt_at: 0,
+        update_open: false,
         take: Take::Off,
         seen: 0,
         obj_pairs: Vec::new(),
@@ -1624,7 +1674,7 @@ fn step_nest(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
         }
         return match nest_after_stop(machine, index)? {
             DoneAct::Stay => Ok(Act::Cont),
-            DoneAct::Finish => Ok(Act::Done),
+            DoneAct::Finish | DoneAct::Yield(_) => Ok(Act::Done),
             DoneAct::Fail(failure) => Ok(Act::Fail(failure)),
         };
     }
@@ -1705,11 +1755,28 @@ fn nest_accept(machine: &mut Machine, index: usize, value: Value) -> Result<Take
     if object {
         return object_accept(machine, index, value);
     }
+    let fold = match &*machine.stack[index].body {
+        Body::Nest(nest) => matches!(nest.kind, Kind::Reduce { .. }),
+        _ => false,
+    };
+    if fold {
+        return accept_fold(machine, index, phase, value);
+    }
+    if phase == 0 && matches!(machine_kind(machine, index), Some(5)) {
+        return accept_bind_expr(machine, index, value);
+    }
     let _ = phase;
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
         nest.got.push(value);
     }
     Ok(Taken::Keep)
+}
+
+fn machine_kind(machine: &Machine, index: usize) -> Option<u8> {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => Some(kind_tag(&nest.kind)),
+        _ => None,
+    }
 }
 
 fn limit_take(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
@@ -1995,9 +2062,10 @@ fn nest_child_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         (4, _) => finish_try_handler(machine, index),
         (5, 0) => finish_bind_expr(machine, index),
         (5, _) => finish_bind_body(machine, index),
-        (6, 0) => finish_reduce_init(machine, index),
-        (6, 1) => finish_reduce_stream(machine, index),
-        (6, _) => finish_reduce_update(machine, index),
+        (6, 0) => finish_fold_init(machine, index),
+        (6, 1) => finish_fold_stream(machine, index),
+        (6, 2) => finish_fold_update(machine, index),
+        (6, _) => finish_fold_extract(machine, index),
         (7, _) => finish_map_item(machine, index),
         (8, _) => finish_first(machine, index),
         (9, 0) => finish_limit_count(machine, index),
@@ -2236,32 +2304,105 @@ fn finish_try_handler(machine: &mut Machine, index: usize) -> Result<DoneAct, Fa
 }
 
 fn finish_bind_expr(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let (values, err) = take_got(machine, index);
-    let pattern = match &*machine.stack[index].body {
-        Body::Nest(nest) => match &**nest {
-            Nest {
-                kind: Kind::Bind { pattern, .. },
-                ..
-            } => pattern.clone(),
+    // Every value already ran its body. This is the expression finishing.
+    Ok(match take_nest_err(machine, index) {
+        Some(failure) => DoneAct::Fail(failure),
+        None => DoneAct::Finish,
+    })
+}
+
+fn accept_bind_expr(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.items.clear();
+        nest.items.push(value);
+        nest.alt_at = 0;
+    }
+    match begin_bind_alt(machine, index) {
+        Ok(BindStep::Resume) => Ok(Taken::Keep),
+        Ok(BindStep::Spawned) => Ok(Taken::Spawn),
+        Err(failure) => Err(failure),
+    }
+}
+
+enum BindStep {
+    /// This value matched nothing. The expression continues.
+    Resume,
+    /// The body for one pattern frame was pushed.
+    Spawned,
+}
+
+/// Try `?//` patterns for the value in `items`. A pattern that matches
+/// nothing does not try the next one. `halt` does not either.
+fn begin_bind_alt(machine: &mut Machine, index: usize) -> Result<BindStep, Failure> {
+    loop {
+        let (pattern, last, names, value, flat) = match &*machine.stack[index].body {
+            Body::Nest(nest) => {
+                let (first, alts) = match &nest.kind {
+                    Kind::Bind { pattern, alts, .. } => (pattern.clone(), alts.clone()),
+                    _ => unreachable!("bind"),
+                };
+                let mut pats = Vec::with_capacity(1 + alts.len());
+                pats.push(first);
+                pats.extend(alts.iter().cloned());
+                let at = nest.alt_at;
+                if at >= pats.len() {
+                    return Err(fail("bind".to_string()));
+                }
+                let names = eval::bind_name_list(&pats[0], &pats[1..]);
+                let value = nest.items.first().cloned().unwrap_or(Value::Null);
+                (
+                    pats[at].clone(),
+                    at + 1 == pats.len(),
+                    names,
+                    value,
+                    nest.env.flatten(),
+                )
+            }
             _ => unreachable!("bind"),
-        },
+        };
+        let mut frames = Vec::new();
+        match bind_frames(&pattern, &value, &flat, &mut frames) {
+            Ok(()) if frames.is_empty() => return Ok(BindStep::Resume),
+            Ok(()) => {
+                let frames = frames
+                    .into_iter()
+                    .map(|frame| eval::with_nulls(&frame, &names))
+                    .collect();
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.frames = frames;
+                    nest.frame_at = 0;
+                    nest.phase = 1;
+                }
+                push_bind_body(machine, index);
+                return Ok(BindStep::Spawned);
+            }
+            Err(failure) if failure.stop.is_some() || last => return Err(failure),
+            Err(_) => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.alt_at += 1;
+                }
+            }
+        }
+    }
+}
+
+fn push_bind_body(machine: &mut Machine, index: usize) {
+    let (body, env, input) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let frame = nest.frames[nest.frame_at].clone();
+            let body = match &nest.kind {
+                Kind::Bind { body, .. } => Rc::clone(body),
+                _ => unreachable!("bind"),
+            };
+            let env = func::EnvLink::child(frame, &nest.env);
+            (body, env, nest.input.clone())
+        }
         _ => unreachable!("bind"),
     };
-    let flat = match &*machine.stack[index].body {
-        Body::Nest(nest) => nest.env.flatten(),
-        _ => Vec::new(),
-    };
-    let mut frames = Vec::new();
-    for value in &values {
-        bind_frames(&pattern, value, &flat, &mut frames)?;
-    }
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.frames = frames;
-        nest.frame_at = 0;
-        nest.fail_last = err;
-        nest.phase = 1;
+        nest.frame_at += 1;
     }
-    bind_next(machine, index)
+    nest_arm_in(machine, index, body, input, env);
 }
 
 fn bind_frames(
@@ -2280,152 +2421,464 @@ fn bind_frames(
     })
 }
 
-fn bind_next(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let next = match &*machine.stack[index].body {
-        Body::Nest(nest) if nest.frame_at < nest.frames.len() => {
-            let frame = nest.frames[nest.frame_at].clone();
-            let body = match &nest.kind {
-                Kind::Bind { body, .. } => Rc::clone(body),
-                _ => unreachable!("bind"),
-            };
-            let env = func::EnvLink::child(frame, &nest.env);
-            Some((body, env, nest.input.clone()))
+fn finish_bind_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    if let Some(failure) = take_nest_err(machine, index) {
+        if failure.stop.is_some() {
+            return Ok(DoneAct::Fail(failure));
         }
-        _ => None,
-    };
-    if let Some((body, env, input)) = next {
+        let last = match &*machine.stack[index].body {
+            Body::Nest(nest) => match &nest.kind {
+                Kind::Bind { alts, .. } => nest.alt_at >= alts.len(),
+                _ => true,
+            },
+            _ => true,
+        };
+        if last {
+            return Ok(DoneAct::Fail(failure));
+        }
         if let Body::Nest(nest) = &mut *machine.stack[index].body {
-            nest.frame_at += 1;
+            nest.alt_at += 1;
         }
-        nest_arm_in(machine, index, body, input, env);
+        return match begin_bind_alt(machine, index) {
+            Ok(BindStep::Resume) => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.phase = 0;
+                }
+                Ok(DoneAct::Stay)
+            }
+            Ok(BindStep::Spawned) => Ok(DoneAct::Stay),
+            Err(failure) => Ok(DoneAct::Fail(failure)),
+        };
+    }
+    let more = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.frame_at < nest.frames.len(),
+        _ => false,
+    };
+    if more {
+        push_bind_body(machine, index);
         return Ok(DoneAct::Stay);
     }
-    let failure = match &mut *machine.stack[index].body {
-        Body::Nest(nest) => nest.fail_last.take(),
-        _ => None,
-    };
-    match failure {
-        Some(failure) => Ok(DoneAct::Fail(failure)),
-        None => Ok(DoneAct::Finish),
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 0;
     }
+    // The expression frame is still under this one. It yields the next value.
+    Ok(DoneAct::Stay)
 }
 
-fn finish_bind_body(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let err = match &mut *machine.stack[index].body {
+fn take_nest_err(machine: &mut Machine, index: usize) -> Option<Failure> {
+    match &mut *machine.stack[index].body {
         Body::Nest(nest) => nest.err.take(),
         _ => None,
-    };
-    if let Some(failure) = err {
-        return Ok(DoneAct::Fail(failure));
     }
-    bind_next(machine, index)
 }
 
-fn finish_reduce_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let (inits, err) = take_got(machine, index);
-    if inits.is_empty() {
-        return Ok(match err {
-            Some(failure) => DoneAct::Fail(failure),
-            None => DoneAct::Finish,
-        });
+fn fold_each(machine: &Machine, index: usize) -> bool {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => matches!(nest.kind, Kind::Reduce { each: true, .. }),
+        _ => false,
     }
-    if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        if let Nest {
-            kind: Kind::Reduce { inits: slot, .. },
-            ..
-        } = &mut **nest
-        {
-            *slot = inits;
-        }
-    }
-    if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.fail_last = err;
-        nest.seen = 0;
-        nest.phase = 1;
-    }
-    reduce_stream(machine, index)
 }
 
-fn reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let (stream, input, acc) = match &*machine.stack[index].body {
+fn fold_extract(machine: &Machine, index: usize) -> Option<Rc<Filter>> {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => match &nest.kind {
+            Kind::Reduce { extract, .. } => extract.clone(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn extract_passes_through(extract: &Option<Rc<Filter>>) -> bool {
+    match extract {
+        None => true,
+        Some(filter) => matches!(filter.as_ref(), Filter::Identity),
+    }
+}
+
+enum FoldCont {
+    /// This source value is done. The source frame resumes.
+    ItemDone,
+    /// An update or extract frame was pushed.
+    Spawned,
+    /// One accelerated `foreach` step. The source frame resumes.
+    Emit(Value),
+}
+
+fn accept_fold(
+    machine: &mut Machine,
+    index: usize,
+    phase: u8,
+    value: Value,
+) -> Result<Taken, Failure> {
+    match phase {
+        0 => accept_fold_init(machine, index, value),
+        1 => accept_fold_item(machine, index, value),
+        2 => accept_fold_update(machine, index, value),
+        _ => Ok(Taken::Send(value)),
+    }
+}
+
+fn accept_fold_init(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    let (stream, input) = match &*machine.stack[index].body {
         Body::Nest(nest) => {
-            let init = match &nest.kind {
-                Kind::Reduce { inits, stream, .. } => {
-                    let value = inits.get(nest.seen).cloned().unwrap_or(Value::Null);
-                    (Rc::clone(stream), value)
-                }
-                _ => (Rc::new(Filter::Empty), Value::Null),
+            let stream = match &nest.kind {
+                Kind::Reduce { stream, .. } => Rc::clone(stream),
+                _ => Rc::new(Filter::Empty),
             };
             let input = if nest.seen == 0 {
                 nest.input.clone()
             } else {
                 Value::Null
             };
-            (init.0, input, init.1)
+            (stream, input)
         }
-        _ => (Rc::new(Filter::Empty), Value::Null, Value::Null),
+        _ => (Rc::new(Filter::Empty), Value::Null),
     };
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.acc = acc;
+        nest.acc = value;
         nest.lookup = None;
+        nest.seen += 1;
         nest.phase = 1;
+        nest.frames.clear();
+        nest.frame_at = 0;
+        nest.item_at = 0;
+        nest.update_open = false;
     }
     nest_arm(machine, index, stream, input);
-    Ok(DoneAct::Stay)
+    Ok(Taken::Spawn)
 }
 
-fn finish_reduce_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let (items, err) = take_got(machine, index);
+fn accept_fold_item(machine: &mut Machine, index: usize, item: Value) -> Result<Taken, Failure> {
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.items = items;
-        nest.item_at = 0;
-        nest.frame_at = 0;
-        nest.frames.clear();
-        nest.key_err = err;
-        nest.phase = 2;
+        nest.items.clear();
+        nest.items.push(item);
+        nest.alt_at = 0;
+        nest.buf.clear();
     }
-    reduce_item(machine, index)
+    match begin_fold_alt(machine, index) {
+        Ok(FoldCont::ItemDone) => Ok(Taken::Keep),
+        Ok(FoldCont::Spawned) => Ok(Taken::Spawn),
+        Ok(FoldCont::Emit(value)) => Ok(Taken::Send(value)),
+        Err(failure) => Err(failure),
+    }
 }
 
-enum NextItem {
-    End,
-    Loaded,
+/// Pick a `?//` pattern for the source value in `items` and run its update.
+fn begin_fold_alt(machine: &mut Machine, index: usize) -> Result<FoldCont, Failure> {
+    loop {
+        let (pattern, last, names, item, flat) = match &*machine.stack[index].body {
+            Body::Nest(nest) => {
+                let (first, alts) = match &nest.kind {
+                    Kind::Reduce { pattern, alts, .. } => (pattern.clone(), alts.clone()),
+                    _ => (Pattern::Var(String::new()), Vec::new()),
+                };
+                let mut pats = Vec::with_capacity(1 + alts.len());
+                pats.push(first);
+                pats.extend(alts.iter().cloned());
+                let at = nest.alt_at;
+                if at >= pats.len() {
+                    return Err(fail("reduce".to_string()));
+                }
+                let names = eval::bind_name_list(&pats[0], &pats[1..]);
+                let item = nest.items.first().cloned().unwrap_or(Value::Null);
+                (
+                    pats[at].clone(),
+                    at + 1 == pats.len(),
+                    names,
+                    item,
+                    nest.env.flatten(),
+                )
+            }
+            _ => unreachable!("fold"),
+        };
+        let mut frames = Vec::new();
+        match bind_frames(&pattern, &item, &flat, &mut frames) {
+            Ok(()) if frames.is_empty() => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.phase = 1;
+                }
+                return Ok(FoldCont::ItemDone);
+            }
+            Ok(()) => {
+                let frames = frames
+                    .into_iter()
+                    .map(|frame| eval::with_nulls(&frame, &names))
+                    .collect();
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.frames = frames;
+                    nest.frame_at = 0;
+                    nest.item_at = 0;
+                    nest.update_open = false;
+                    nest.buf.clear();
+                }
+                return advance_fold_item(machine, index);
+            }
+            Err(failure) if failure.stop.is_some() || last => return Err(failure),
+            Err(_) => {
+                if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                    nest.alt_at += 1;
+                }
+            }
+        }
+    }
 }
 
-fn load_next_reduce_item(machine: &mut Machine, index: usize) -> Result<NextItem, Failure> {
-    let more = match &*machine.stack[index].body {
-        Body::Nest(nest) => nest.item_at < nest.items.len(),
+fn fold_alt_last(machine: &Machine, index: usize) -> bool {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => match &nest.kind {
+            Kind::Reduce { alts, .. } => nest.alt_at >= alts.len(),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+fn drop_open_update(machine: &mut Machine, index: usize) {
+    let open = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.update_open,
         _ => false,
     };
-    if !more {
-        return Ok(NextItem::End);
+    if !open {
+        return;
     }
-    let (pattern, item, flat) = match &*machine.stack[index].body {
-        Body::Nest(nest) => {
-            let pattern = match &nest.kind {
-                Kind::Reduce { pattern, .. } => pattern.clone(),
-                _ => Pattern::Var(String::new()),
-            };
-            let item = nest.items[nest.item_at].clone();
-            (pattern, item, nest.env.flatten())
-        }
-        _ => (Pattern::Var(String::new()), Value::Null, Vec::new()),
-    };
-    let mut frames = Vec::new();
-    bind_frames(&pattern, &item, &flat, &mut frames)?;
+    // Above this frame: the initial generator, the source, then the update.
+    let keep = index + 3;
+    if machine.stack.len() > keep {
+        machine.stack.truncate(keep);
+    }
     if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.item_at += 1;
-        nest.frames = frames;
-        nest.frame_at = 0;
+        nest.update_open = false;
     }
-    Ok(NextItem::Loaded)
 }
 
-fn reduce_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    match load_next_reduce_item(machine, index)? {
-        NextItem::End => reduce_end_init(machine, index),
-        NextItem::Loaded => reduce_frame(machine, index),
+fn retry_fold_alt(
+    machine: &mut Machine,
+    index: usize,
+    failure: Failure,
+) -> Result<DoneAct, Failure> {
+    if failure.stop.is_some() || fold_alt_last(machine, index) {
+        return Ok(DoneAct::Fail(failure));
     }
+    drop_open_update(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.alt_at += 1;
+        nest.buf.clear();
+    }
+    match begin_fold_alt(machine, index) {
+        Ok(FoldCont::ItemDone | FoldCont::Spawned) => Ok(DoneAct::Stay),
+        Ok(FoldCont::Emit(value)) => Ok(DoneAct::Yield(value)),
+        Err(failure) => Ok(DoneAct::Fail(failure)),
+    }
+}
+
+fn accept_fold_update(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Failure> {
+    if !fold_each(machine, index) {
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.got.push(value);
+        }
+        return Ok(Taken::Keep);
+    }
+    let extract = fold_extract(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        // Commit this value only when the update finishes, so a failing
+        // pattern can try the next `?//` from the same accumulator.
+        nest.buf.clear();
+        nest.buf.push(value.clone());
+        nest.item_at += 1;
+        nest.lookup = None;
+    }
+    if extract_passes_through(&extract) {
+        return Ok(Taken::Send(value));
+    }
+    let extract = extract.expect("extract");
+    let env = fold_frame_env(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 3;
+        nest.update_open = true;
+    }
+    nest_arm_in(machine, index, extract, value, env);
+    Ok(Taken::Spawn)
+}
+
+fn fold_frame_env(machine: &Machine, index: usize) -> Rc<func::EnvLink> {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let at = nest.frame_at.saturating_sub(1);
+            let frame = nest.frames.get(at).cloned().unwrap_or_default();
+            func::EnvLink::child(frame, &nest.env)
+        }
+        _ => func::EnvLink::from_slice(&[]),
+    }
+}
+
+fn advance_fold_item(machine: &mut Machine, index: usize) -> Result<FoldCont, Failure> {
+    loop {
+        let (ready, each, single) = match &*machine.stack[index].body {
+            Body::Nest(nest) => (
+                nest.frame_at < nest.frames.len(),
+                matches!(nest.kind, Kind::Reduce { each: true, .. }),
+                nest.frames.len() == 1 && nest.frame_at == 0,
+            ),
+            _ => (false, false, false),
+        };
+        if !ready {
+            if let Body::Nest(nest) = &mut *machine.stack[index].body {
+                nest.phase = 1;
+            }
+            return Ok(FoldCont::ItemDone);
+        }
+        let try_fast = each && single && foreach_shape(machine, index);
+        if try_fast && accelerate_machine_frame(machine, index)? {
+            return accelerated_foreach(machine, index);
+        }
+        if !each && accelerate_machine_frame(machine, index)? {
+            continue;
+        }
+        push_fold_update(machine, index);
+        return Ok(FoldCont::Spawned);
+    }
+}
+
+fn foreach_shape(machine: &Machine, index: usize) -> bool {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => match &nest.kind {
+            Kind::Reduce { update, .. } => super::update::foreach_can_accelerate(update),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn accelerated_foreach(machine: &mut Machine, index: usize) -> Result<FoldCont, Failure> {
+    let extract = fold_extract(machine, index);
+    if !extract_passes_through(&extract) {
+        let extract = extract.expect("extract");
+        let acc = match &*machine.stack[index].body {
+            Body::Nest(nest) => nest.acc.clone(),
+            _ => Value::Null,
+        };
+        let env = fold_frame_env(machine, index);
+        if let Body::Nest(nest) = &mut *machine.stack[index].body {
+            nest.phase = 3;
+            nest.update_open = false;
+            nest.item_at = 1;
+        }
+        nest_arm_in(machine, index, extract, acc, env);
+        return Ok(FoldCont::Spawned);
+    }
+    let acc = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.acc.clone(),
+        _ => Value::Null,
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 1;
+        nest.item_at = 1;
+    }
+    Ok(FoldCont::Emit(acc))
+}
+
+fn push_fold_update(machine: &mut Machine, index: usize) {
+    let (update, env, acc) = match &*machine.stack[index].body {
+        Body::Nest(nest) => {
+            let frame = nest.frames[nest.frame_at].clone();
+            let update = match &nest.kind {
+                Kind::Reduce { update, .. } => Rc::clone(update),
+                _ => Rc::new(Filter::Empty),
+            };
+            let env = func::EnvLink::child(frame, &nest.env);
+            (update, env, nest.acc.clone())
+        }
+        _ => (
+            Rc::new(Filter::Empty),
+            func::EnvLink::from_slice(&[]),
+            Value::Null,
+        ),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.frame_at += 1;
+        nest.item_at = 0;
+        nest.buf.clear();
+        nest.phase = 2;
+        nest.update_open = true;
+    }
+    nest_arm_in(machine, index, update, acc, env);
+}
+
+fn finish_fold_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    Ok(match take_nest_err(machine, index) {
+        Some(failure) => DoneAct::Fail(failure),
+        None => DoneAct::Finish,
+    })
+}
+
+fn finish_fold_stream(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    if let Some(failure) = take_nest_err(machine, index) {
+        return Ok(DoneAct::Fail(failure));
+    }
+    let (each, acc) = match &*machine.stack[index].body {
+        Body::Nest(nest) => (
+            matches!(nest.kind, Kind::Reduce { each: true, .. }),
+            nest.acc.clone(),
+        ),
+        _ => (false, Value::Null),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 0;
+    }
+    // `foreach` already emitted each step. `reduce` emits the accumulator
+    // once, then the next initial value is read.
+    if each {
+        Ok(DoneAct::Stay)
+    } else {
+        Ok(DoneAct::Yield(acc))
+    }
+}
+
+fn finish_fold_update(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let (values, err) = take_got(machine, index);
+    if let Some(failure) = err {
+        return retry_fold_alt(machine, index, failure);
+    }
+    let each = fold_each(machine, index);
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        if each {
+            nest.acc = if nest.item_at == 0 {
+                Value::Null
+            } else {
+                nest.buf.last().cloned().unwrap_or(Value::Null)
+            };
+            nest.buf.clear();
+            nest.lookup = None;
+        } else {
+            nest.acc = values.last().cloned().unwrap_or(Value::Null);
+            nest.lookup = None;
+        }
+    }
+    match advance_fold_item(machine, index) {
+        Ok(FoldCont::ItemDone | FoldCont::Spawned) => Ok(DoneAct::Stay),
+        Ok(FoldCont::Emit(value)) => Ok(DoneAct::Yield(value)),
+        Err(failure) => Ok(DoneAct::Fail(failure)),
+    }
+}
+
+fn finish_fold_extract(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    if let Some(failure) = take_nest_err(machine, index) {
+        return retry_fold_alt(machine, index, failure);
+    }
+    let update_open = match &*machine.stack[index].body {
+        Body::Nest(nest) => nest.update_open,
+        _ => false,
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        if update_open {
+            nest.phase = 2;
+            nest.update_open = false;
+        } else {
+            nest.phase = 1;
+        }
+    }
+    Ok(DoneAct::Stay)
 }
 
 /// One fast step. `Ok(false)` leaves the frame for the copying path.
@@ -2456,115 +2909,6 @@ fn accelerate_machine_frame(machine: &mut Machine, index: usize) -> Result<bool,
     nest.frame_at += 1;
     nest.phase = 2;
     Ok(true)
-}
-
-fn reduce_frame(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    loop {
-        let ready = match &*machine.stack[index].body {
-            Body::Nest(nest) => nest.frame_at < nest.frames.len(),
-            _ => false,
-        };
-        if !ready {
-            match load_next_reduce_item(machine, index)? {
-                NextItem::End => return reduce_end_init(machine, index),
-                NextItem::Loaded => continue,
-            }
-        }
-        match accelerate_machine_frame(machine, index) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(failure) => {
-                let done = match &mut *machine.stack[index].body {
-                    Body::Nest(nest) => std::mem::take(&mut nest.buf),
-                    _ => Vec::new(),
-                };
-                return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
-            }
-        }
-        break;
-    }
-    let (update, env, acc) = match &*machine.stack[index].body {
-        Body::Nest(nest) => {
-            let frame = nest.frames[nest.frame_at].clone();
-            let update = match &nest.kind {
-                Kind::Reduce { update, .. } => Rc::clone(update),
-                _ => Rc::new(Filter::Empty),
-            };
-            let env = func::EnvLink::child(frame, &nest.env);
-            (update, env, nest.acc.clone())
-        }
-        _ => (
-            Rc::new(Filter::Empty),
-            func::EnvLink::from_slice(&[]),
-            Value::Null,
-        ),
-    };
-    if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.frame_at += 1;
-        nest.phase = 2;
-    }
-    nest_arm_in(machine, index, update, acc, env);
-    Ok(DoneAct::Stay)
-}
-
-fn finish_reduce_update(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let (values, err) = take_got(machine, index);
-    if let Some(failure) = err {
-        let done = match &mut *machine.stack[index].body {
-            Body::Nest(nest) => std::mem::take(&mut nest.buf),
-            _ => Vec::new(),
-        };
-        return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
-    }
-    let acc = values.last().cloned().unwrap_or(Value::Null);
-    if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.acc = acc;
-        nest.lookup = None;
-    }
-    reduce_frame(machine, index)
-}
-
-fn reduce_end_init(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
-    let acc = match &*machine.stack[index].body {
-        Body::Nest(nest) => nest.acc.clone(),
-        _ => Value::Null,
-    };
-    let stream_err = match &mut *machine.stack[index].body {
-        Body::Nest(nest) => {
-            nest.buf.push(acc);
-            nest.key_err.take()
-        }
-        _ => None,
-    };
-    if let Some(failure) = stream_err {
-        let done = match &mut *machine.stack[index].body {
-            Body::Nest(nest) => std::mem::take(&mut nest.buf),
-            _ => Vec::new(),
-        };
-        return Ok(DoneAct::Fail(eval::with_partial(done, failure)));
-    }
-    if let Body::Nest(nest) = &mut *machine.stack[index].body {
-        nest.seen += 1;
-    }
-    let more = match &*machine.stack[index].body {
-        Body::Nest(nest) => match &**nest {
-            Nest {
-                kind: Kind::Reduce { inits, .. },
-                seen,
-                ..
-            } => *seen < inits.len(),
-            _ => false,
-        },
-        _ => false,
-    };
-    if more {
-        return reduce_stream(machine, index);
-    }
-    let (out, err) = match &mut *machine.stack[index].body {
-        Body::Nest(nest) => (std::mem::take(&mut nest.buf), nest.fail_last.take()),
-        _ => (Vec::new(), None),
-    };
-    queue_out(machine, index, out, err)
 }
 
 fn finish_map_item(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
@@ -2984,6 +3328,8 @@ fn nest_on_error(
         DoneAct::Stay => Ok(NestErr::Stay),
         DoneAct::Fail(failure) => Ok(NestErr::Go(failure)),
         DoneAct::Finish => Ok(NestErr::Done),
+        // A fold reports an error instead of yielding when the child failed.
+        DoneAct::Yield(_) => unreachable!("fold yield on error"),
     }
 }
 
@@ -3090,7 +3436,7 @@ fn step_walk(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
     }
     match walk_done(machine, index)? {
         DoneAct::Stay => Ok(Act::Cont),
-        DoneAct::Finish => Ok(Act::Done),
+        DoneAct::Finish | DoneAct::Yield(_) => Ok(Act::Done),
         DoneAct::Fail(failure) => Ok(Act::Fail(failure)),
     }
 }

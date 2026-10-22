@@ -237,6 +237,32 @@ fn drive(
         // levels deep. Every other filter stays on the direct path. That path
         // is what walks a large array.
         Filter::Define { rest, .. } => drive(rest, input, env, emit),
+        Filter::Bind {
+            expr,
+            pattern,
+            alts,
+            body,
+        } => eval::bind_into(expr, pattern, alts, body, input, env, &mut |value| {
+            emit.call(value)
+        }),
+        Filter::Reduce {
+            stream,
+            pattern,
+            alts,
+            init,
+            update,
+        } => eval::fold_into(
+            stream,
+            pattern,
+            alts,
+            init,
+            update,
+            None,
+            false,
+            input,
+            env,
+            &mut |value| emit.call(value),
+        ),
         Filter::Foreach {
             stream,
             pattern,

@@ -705,21 +705,71 @@ pub(super) fn eval_bind(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let names = bind_name_list(pattern, alts);
-    let (values, err) = parts(eval_in(expr, input, env));
     let mut out = Vec::new();
-    for value in values {
-        if let Err(failure) = bind_value(pattern, alts, &names, &value, body, input, env, &mut out)
-        {
-            return Err(with_partial(out, failure));
+    let mut sink = |value: &Value| {
+        out.push(value.clone());
+        false
+    };
+    match bind_into(expr, pattern, alts, body, input, env, &mut sink) {
+        Ok(_) => Ok(out),
+        Err(failure) => Err(with_partial(out, failure)),
+    }
+}
+
+/// One value from `expr`, then `body`, then the next value.
+/// `true` means a consumer asked to stop.
+pub(super) fn bind_into(
+    expr: &Filter,
+    pattern: &Pattern,
+    alts: &[Pattern],
+    body: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    let names = bind_name_list(pattern, alts);
+    feed_each(expr, input, env, &mut |value| {
+        bind_value(pattern, alts, &names, value, body, input, env, sink)
+    })
+}
+
+/// Hand each value to `on_value` as it is produced. `on_value` returns
+/// `Ok(true)` to stop, or `Err` to stop and keep that failure. A failure's
+/// pending values are handed over before the failure itself.
+fn feed_each(
+    filter: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    on_value: &mut dyn FnMut(&Value) -> Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    let mut early: Option<Failure> = None;
+    let result = super::stream::feed(filter, input, env, &mut |value| match on_value(value) {
+        Ok(stop) => stop,
+        Err(failure) => {
+            early = Some(failure);
+            true
+        }
+    });
+    if let Some(failure) = early {
+        return Err(failure);
+    }
+    match result {
+        Ok(stop) => Ok(stop),
+        Err(mut failure) => {
+            let pending = std::mem::take(&mut failure.partial);
+            for value in pending {
+                if on_value(&value)? {
+                    return Ok(true);
+                }
+            }
+            Err(failure)
         }
     }
-    finish(out, err)
 }
 
 /// One value against each `?//` pattern. A pattern with no match is success
 /// and does not try the next pattern. A failure tries the next one. `halt`
-/// does not. Outputs from a failed attempt stay.
+/// does not. Outputs from a failed attempt stay. `Ok(true)` means stop.
 fn bind_value(
     pattern: &Pattern,
     alts: &[Pattern],
@@ -728,20 +778,20 @@ fn bind_value(
     body: &Filter,
     input: &Value,
     env: &[(String, Value)],
-    out: &mut Vec<Value>,
-) -> Result<(), Failure> {
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
     let mut pats = Vec::with_capacity(1 + alts.len());
     pats.push(pattern);
     pats.extend(alts);
     for (index, pat) in pats.iter().enumerate() {
         let last = index + 1 == pats.len();
-        match bind_pattern(pat, names, value, body, input, env, out) {
-            Ok(()) => return Ok(()),
+        match bind_pattern(pat, names, value, body, input, env, sink) {
+            Ok(stop) => return Ok(stop),
             Err(failure) if failure.stop.is_some() || last => return Err(failure),
-            Err(failure) => out.extend(failure.partial),
+            Err(_) => {}
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn bind_pattern(
@@ -751,25 +801,28 @@ fn bind_pattern(
     body: &Filter,
     input: &Value,
     env: &[(String, Value)],
-    out: &mut Vec<Value>,
-) -> Result<(), Failure> {
+    sink: &mut dyn FnMut(&Value) -> bool,
+) -> Result<bool, Failure> {
+    let mut stop = false;
     match_pat(pattern, value, env, &[], &mut |frame| {
+        if stop {
+            return Ok(());
+        }
         let frame = with_nulls(frame, names);
         let child = child_scope(&frame, env);
-        match eval_in(body, input, &child) {
-            Ok(more) => {
-                out.extend(more);
+        match feed_each(body, input, &child, &mut |one| Ok(sink(one))) {
+            Ok(true) => {
+                stop = true;
                 Ok(())
             }
-            Err(mut failure) => {
-                out.extend(std::mem::take(&mut failure.partial));
-                Err(failure)
-            }
+            Ok(false) => Ok(()),
+            Err(failure) => Err(failure),
         }
-    })
+    })?;
+    Ok(stop)
 }
 
-fn bind_name_list(pattern: &Pattern, alts: &[Pattern]) -> Vec<String> {
+pub(super) fn bind_name_list(pattern: &Pattern, alts: &[Pattern]) -> Vec<String> {
     let mut names = Vec::new();
     super::parse::bind_names(pattern, alts, &mut names);
     names
@@ -777,7 +830,7 @@ fn bind_name_list(pattern: &Pattern, alts: &[Pattern]) -> Vec<String> {
 
 /// Names the successful pattern did not bind are null, and they hide an outer
 /// binding of the same name.
-fn with_nulls(frame: &[(String, Value)], names: &[String]) -> Vec<(String, Value)> {
+pub(super) fn with_nulls(frame: &[(String, Value)], names: &[String]) -> Vec<(String, Value)> {
     let mut out = frame.to_vec();
     for name in names {
         if !out.iter().any(|(bound, _)| bound == name) {
@@ -908,7 +961,8 @@ fn eval_label(
 }
 
 /// `reduce` keeps only a finished accumulator. `foreach` emits each step.
-/// The stream of every init after the first is run on null.
+/// One initial value runs the source before the next. The source of every
+/// initial value after the first is run on null.
 pub(super) fn eval_fold(
     stream: &Filter,
     pattern: &Pattern,
@@ -1004,40 +1058,35 @@ fn fold_pattern(
             }
             return Ok(());
         }
-        let (updates, update_err) = parts(eval_in(update, acc, &child));
+        // `foreach` runs the extract for one update value before the next
+        // update value. `reduce` keeps the last update value and does not emit.
         if emit {
-            if let Some(extract) = extract {
-                for value in &updates {
-                    match eval_in(extract, value, &child) {
-                        Ok(more) => {
-                            for one in &more {
-                                if sink(one) {
-                                    stop = true;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Err(mut failure) => {
-                            for one in &failure.partial {
-                                if sink(one) {
-                                    stop = true;
-                                    return Ok(());
-                                }
-                            }
-                            failure.partial.clear();
-                            return Err(failure);
-                        }
-                    }
+            let mut saw = false;
+            let mut last = Value::Null;
+            let finished = feed_each(update, acc, &child, &mut |value| {
+                if stop {
+                    return Ok(true);
                 }
-            } else {
-                for value in &updates {
-                    if sink(value) {
-                        stop = true;
-                        return Ok(());
-                    }
+                saw = true;
+                last = value.clone();
+                let halt = match extract {
+                    Some(extract) => feed_each(extract, value, &child, &mut |one| Ok(sink(one)))?,
+                    None => sink(value),
+                };
+                if halt {
+                    stop = true;
                 }
+                Ok(halt)
+            })?;
+            if finished || stop {
+                stop = true;
+                return Ok(());
             }
+            *acc = if saw { last } else { Value::Null };
+            *lookup = None;
+            return Ok(());
         }
+        let (updates, update_err) = parts(eval_in(update, acc, &child));
         if let Some(failure) = update_err {
             return Err(failure);
         }
@@ -1054,6 +1103,11 @@ fn fold_pattern(
 
 /// `true` means a consumer asked to stop. Values already handed to `sink`
 /// are not repeated in an error. `sink` returns `true` to stop.
+///
+/// One initial value runs the source to the end before the next initial
+/// value is read. One source value runs the update before the next source
+/// value. The source of every initial value after the first runs on null.
+/// `inputs` is read one value at a time, so the update sees that value's line.
 pub(super) fn fold_into(
     stream: &Filter,
     pattern: &Pattern,
@@ -1066,84 +1120,75 @@ pub(super) fn fold_into(
     env: &[(String, Value)],
     sink: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<bool, Failure> {
-    let (inits, init_err) = parts(eval_in(init, input, env));
-    if inits.is_empty() {
-        return match init_err {
-            Some(failure) => Err(failure),
-            None => Ok(false),
-        };
-    }
-    for (index, init_value) in inits.iter().enumerate() {
+    let mut step = FoldStep {
+        stream,
+        pattern,
+        alts,
+        update,
+        extract,
+        emit,
+        input,
+        env,
+        sink,
+    };
+    let mut first = true;
+    feed_each(init, input, env, &mut |init_value| {
+        let is_first = first;
+        first = false;
+        step.one(init_value, is_first)
+    })
+}
+
+struct FoldStep<'a> {
+    stream: &'a Filter,
+    pattern: &'a Pattern,
+    alts: &'a [Pattern],
+    update: &'a Filter,
+    extract: Option<&'a Filter>,
+    emit: bool,
+    input: &'a Value,
+    env: &'a [(String, Value)],
+    sink: &'a mut dyn FnMut(&Value) -> bool,
+}
+
+impl FoldStep<'_> {
+    fn one(&mut self, init_value: &Value, first: bool) -> Result<bool, Failure> {
+        let stream = self.stream;
+        let pattern = self.pattern;
+        let alts = self.alts;
+        let update = self.update;
+        let extract = self.extract;
+        let emit = self.emit;
+        let input = self.input;
+        let env = self.env;
+        let sink = &mut *self.sink;
         let null_input = Value::Null;
-        let stream_input = if index == 0 { input } else { &null_input };
+        let stream_input = if first { input } else { &null_input };
         let mut acc = init_value.clone();
         // Reused while the accumulator stays one object. A slow step replaces
         // the value, and the next fast step builds the index again.
         let mut lookup = None;
-        let mut stream_err = None;
-        let mut stop = false;
-        // `inputs` is read one value at a time. The update sees that value's
-        // line, and the read past the end runs only after the update.
-        if matches!(stream, Filter::Inputs) {
-            while !stop {
-                match crate::feed::read_one() {
-                    crate::feed::Read::Value(item) => {
-                        if fold_one(
-                            &item,
-                            pattern,
-                            alts,
-                            update,
-                            extract,
-                            emit,
-                            env,
-                            &mut acc,
-                            &mut lookup,
-                            sink,
-                        )? {
-                            stop = true;
-                        }
-                    }
-                    crate::feed::Read::Break => break,
-                    crate::feed::Read::Parse(message) | crate::feed::Read::Fatal(message) => {
-                        stream_err = Some(fail(message));
-                        break;
-                    }
-                }
-            }
-        } else {
-            let (items, err) = parts(eval_in(stream, stream_input, env));
-            stream_err = err;
-            for item in &items {
-                if fold_one(
-                    item,
-                    pattern,
-                    alts,
-                    update,
-                    extract,
-                    emit,
-                    env,
-                    &mut acc,
-                    &mut lookup,
-                    sink,
-                )? {
-                    stop = true;
-                    break;
-                }
-            }
-        }
-        if stop {
+        let streamed = feed_each(stream, stream_input, env, &mut |item| {
+            fold_one(
+                item,
+                pattern,
+                alts,
+                update,
+                extract,
+                emit,
+                env,
+                &mut acc,
+                &mut lookup,
+                sink,
+            )
+        })?;
+        if streamed {
             return Ok(true);
-        }
-        if let Some(failure) = stream_err {
-            return Err(failure);
         }
         if !emit && sink(&acc) {
             return Ok(true);
         }
-    }
-    match init_err {
-        Some(failure) => Err(failure),
-        None => Ok(false),
+        Ok(false)
     }
 }
 
