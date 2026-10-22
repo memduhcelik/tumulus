@@ -668,15 +668,41 @@ pub(super) fn eval_join(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let (seps, err) = parts(eval_in(arg, input, env));
+    // One separator is joined before the next is read. The first failure
+    // does not pull another separator.
     let mut out = Vec::new();
-    for sep in seps {
-        match join_with(input, &sep) {
-            Ok(value) => out.push(value),
-            Err(message) => return Err(fresh(out, message)),
+    let join_err: RefCell<Option<String>> = RefCell::new(None);
+    let result = {
+        let mut on_sep = |sep: &Value| {
+            match join_with(input, sep) {
+                Ok(value) => {
+                    out.push(value);
+                    false
+                }
+                Err(message) => {
+                    *join_err.borrow_mut() = Some(message);
+                    true
+                }
+            }
+        };
+        super::stream::feed(arg, input, env, &mut on_sep)
+    };
+    if let Some(message) = join_err.into_inner() {
+        return Err(fresh(out, message));
+    }
+    match result {
+        Ok(_) => Ok(out),
+        Err(mut failure) => {
+            let pending = std::mem::take(&mut failure.partial);
+            for sep in pending {
+                match join_with(input, &sep) {
+                    Ok(value) => out.push(value),
+                    Err(message) => return Err(fresh(out, message)),
+                }
+            }
+            Err(extend_err(out, failure))
         }
     }
-    finish(out, err)
 }
 
 pub(super) fn join_with(input: &Value, sep: &Value) -> Result<Value, String> {

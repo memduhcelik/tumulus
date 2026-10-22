@@ -1380,16 +1380,42 @@ pub(super) fn eval_if(
     input: &Value,
     env: &[(String, Value)],
 ) -> Result<Vec<Value>, Failure> {
-    let (conds, err) = parts(eval_in(cond, input, env));
+    // The branch for one condition value runs before the next condition value.
     let mut out = Vec::new();
-    for cond_value in conds {
-        let branch = if truthy(&cond_value) { yes } else { no };
-        match eval_in(branch, input, env) {
-            Ok(values) => out.extend(values),
-            Err(failure) => return Err(extend_err(out, failure)),
+    let branch_err: RefCell<Option<Failure>> = RefCell::new(None);
+    let cond_result = {
+        let mut on_cond = |cond_value: &Value| {
+            let branch = if truthy(cond_value) { yes } else { no };
+            match eval_in(branch, input, env) {
+                Ok(values) => {
+                    out.extend(values);
+                    false
+                }
+                Err(failure) => {
+                    *branch_err.borrow_mut() = Some(failure);
+                    true
+                }
+            }
+        };
+        super::stream::feed(cond, input, env, &mut on_cond)
+    };
+    if let Some(failure) = branch_err.into_inner() {
+        return Err(extend_err(out, failure));
+    }
+    match cond_result {
+        Ok(_) => Ok(out),
+        Err(mut failure) => {
+            let pending = std::mem::take(&mut failure.partial);
+            for cond_value in pending {
+                let branch = if truthy(&cond_value) { yes } else { no };
+                match eval_in(branch, input, env) {
+                    Ok(values) => out.extend(values),
+                    Err(err) => return Err(extend_err(out, err)),
+                }
+            }
+            Err(extend_err(out, failure))
         }
     }
-    finish(out, err)
 }
 
 pub(super) fn eval_interpolate(

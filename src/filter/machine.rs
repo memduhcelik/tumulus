@@ -117,10 +117,7 @@ struct Ifs {
     input: Value,
     env: Rc<func::EnvLink>,
     scope: Rc<ScopeNode>,
-    conds: Vec<Value>,
-    cond_at: usize,
-    cond_err: Option<Failure>,
-    /// 0 condition, 1 branch.
+    /// 0 while the condition runs, 1 while its branch runs.
     phase: u8,
     started: bool,
 }
@@ -596,9 +593,6 @@ fn step_run(machine: &mut Machine, index: usize) -> Result<Act, Failure> {
                 input,
                 env,
                 scope,
-                conds: Vec::new(),
-                cond_at: 0,
-                cond_err: None,
                 phase: 0,
                 started: false,
             });
@@ -1328,8 +1322,17 @@ fn accept(machine: &mut Machine, index: usize, value: Value) -> Result<Taken, Fa
         },
         Body::If(ifs) => {
             if ifs.phase == 0 {
-                ifs.conds.push(value);
-                Ok(Taken::Keep)
+                ifs.phase = 1;
+                let filter = if truthy(&value) {
+                    Rc::clone(&ifs.yes)
+                } else {
+                    Rc::clone(&ifs.no)
+                };
+                let input = ifs.input.clone();
+                let env = Rc::clone(&ifs.env);
+                let scope = Rc::clone(&ifs.scope);
+                push_run(machine, index, filter, input, env, scope);
+                Ok(Taken::Spawn)
             } else {
                 Ok(Taken::Send(value))
             }
@@ -1455,68 +1458,14 @@ fn finish_if(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
         Body::If(ifs) => ifs.phase,
         _ => return Ok(DoneAct::Finish),
     };
-    if phase == 0 {
-        let empty = match &*machine.stack[index].body {
-            Body::If(ifs) => ifs.conds.is_empty(),
-            _ => true,
-        };
-        if empty {
-            let err = match &mut *machine.stack[index].body {
-                Body::If(ifs) => ifs.cond_err.take(),
-                _ => None,
-            };
-            return Ok(match err {
-                Some(failure) => DoneAct::Fail(failure),
-                None => DoneAct::Finish,
-            });
-        }
+    if phase == 1 {
+        // The branch for this condition value is done. The condition continues.
         if let Body::If(ifs) = &mut *machine.stack[index].body {
-            ifs.phase = 1;
-            ifs.cond_at = 0;
+            ifs.phase = 0;
         }
-        push_branch(machine, index);
         return Ok(DoneAct::Stay);
     }
-    let more = match &mut *machine.stack[index].body {
-        Body::If(ifs) => {
-            ifs.cond_at += 1;
-            ifs.cond_at < ifs.conds.len()
-        }
-        _ => false,
-    };
-    if more {
-        push_branch(machine, index);
-        return Ok(DoneAct::Stay);
-    }
-    let err = match &mut *machine.stack[index].body {
-        Body::If(ifs) => ifs.cond_err.take(),
-        _ => None,
-    };
-    Ok(match err {
-        Some(failure) => DoneAct::Fail(failure),
-        None => DoneAct::Finish,
-    })
-}
-
-fn push_branch(machine: &mut Machine, index: usize) {
-    let (filter, input, env, scope) = match &*machine.stack[index].body {
-        Body::If(ifs) => {
-            let cond = &ifs.conds[ifs.cond_at];
-            let filter = if truthy(cond) {
-                Rc::clone(&ifs.yes)
-            } else {
-                Rc::clone(&ifs.no)
-            };
-            (
-                filter,
-                ifs.input.clone(),
-                Rc::clone(&ifs.env),
-                Rc::clone(&ifs.scope),
-            )
-        }
-        _ => unreachable!("if"),
-    };
-    push_run(machine, index, filter, input, env, scope);
+    Ok(DoneAct::Finish)
 }
 
 fn finish_call(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
@@ -1622,8 +1571,6 @@ fn step_levels(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> 
 enum Halt {
     /// `+` and the other operators are still reading the right-hand side.
     BinRight,
-    /// `if` is still reading the condition.
-    IfCond,
     /// A call is still reading a `$` argument.
     CallPull,
     /// `[]`, `try`, `//`, and the other forms that own their child.
@@ -1634,7 +1581,6 @@ enum Halt {
 fn halt_kind(machine: &Machine, index: usize) -> Halt {
     match &*machine.stack[index].body {
         Body::Bin(bin) if !bin.on_left => Halt::BinRight,
-        Body::If(ifs) if ifs.phase == 0 => Halt::IfCond,
         Body::Call(call) if call.pulling => Halt::CallPull,
         Body::Nest(_) => Halt::Nest,
         Body::MatchRun(_) | Body::StreamRun(_) => Halt::Drop,
@@ -1697,32 +1643,6 @@ fn failed(
                     _ => unreachable!("bin"),
                 };
                 push_run(machine, index, left, input, env, scope);
-                return Ok(None);
-            }
-            Halt::IfCond => {
-                if let Body::If(ifs) = &mut *machine.stack[index].body {
-                    ifs.cond_err = Some(note(&mut failure));
-                }
-                let empty = match &*machine.stack[index].body {
-                    Body::If(ifs) => ifs.conds.is_empty(),
-                    _ => true,
-                };
-                if empty {
-                    let err = match &mut *machine.stack[index].body {
-                        Body::If(ifs) => ifs.cond_err.take(),
-                        _ => None,
-                    };
-                    let next = machine.stack[index].parent;
-                    machine.stack.truncate(index);
-                    failure = err.unwrap_or(failure);
-                    parent = next;
-                    continue;
-                }
-                if let Body::If(ifs) = &mut *machine.stack[index].body {
-                    ifs.phase = 1;
-                    ifs.cond_at = 0;
-                }
-                push_branch(machine, index);
                 return Ok(None);
             }
             Halt::CallPull => {

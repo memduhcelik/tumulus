@@ -258,6 +258,7 @@ fn drive(
         ),
         Filter::Label { slot, body } => drive_label(*slot, body, input, env, emit),
         Filter::Break { slot, .. } => Err(eval::break_failure(*slot)),
+        Filter::If { cond, yes, no } => drive_if(cond, yes, no, input, env, emit),
         Filter::MatchImpl {
             regex,
             flags,
@@ -629,6 +630,47 @@ fn relay(result: Result<Vec<Value>, Failure>, emit: &Emit) -> Result<bool, Failu
         Some(failure) => Err(failure),
         None => Ok(false),
     }
+}
+
+/// One condition value, then its branch, then the next condition value.
+/// A branch error stops the condition before another value is read.
+fn drive_if(
+    cond: &Filter,
+    yes: &Filter,
+    no: &Filter,
+    input: &Value,
+    env: &[(String, Value)],
+    emit: &Emit,
+) -> Result<bool, Failure> {
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let stopped = Cell::new(false);
+    let mut on_cond = |cond_value: &Value| {
+        if stopped.get() {
+            return true;
+        }
+        let branch = if eval::truthy(cond_value) { yes } else { no };
+        match drive(branch, input, env, emit) {
+            Ok(stop) => {
+                if stop {
+                    stopped.set(true);
+                }
+                stop
+            }
+            Err(err) => {
+                *failure.borrow_mut() = Some(err);
+                true
+            }
+        }
+    };
+    let on_cond = Emit {
+        f: RefCell::new(&mut on_cond),
+    };
+    let cond_result = drive(cond, input, env, &on_cond);
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    let cond_stopped = cond_result?;
+    Ok(stopped.get() || cond_stopped)
 }
 
 /// A right-hand error stops the left. Values already produced are kept.
