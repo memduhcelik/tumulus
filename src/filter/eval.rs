@@ -284,8 +284,16 @@ pub(super) fn produce(
         Filter::GsubLit {
             pattern,
             replacement,
+            global,
             ..
-        } => super::re::gsub_literal(input, pattern, replacement),
+        } => {
+            if *global {
+                super::re::gsub_literal(input, pattern, replacement)
+            } else {
+                super::re::sub_literal(input, pattern, replacement)
+            }
+        }
+        Filter::SplitsLit { pattern, .. } => super::re::splits_literal(input, pattern),
     }
 }
 

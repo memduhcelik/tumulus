@@ -386,13 +386,22 @@ pub enum Filter {
         flags: Box<Filter>,
         testing: bool,
     },
-    /// `gsub` of two strings, with `g` and no other flag, when the pattern
-    /// has no regular-expression syntax. Values are replaced in one pass.
+    /// A literal pattern replaced in one pass. `global` replaces every
+    /// match. Otherwise only the first match is replaced. `reject_call` makes
+    /// a following `(` a syntax error. Two-argument `gsub` leaves that false.
     /// `slow` is the match program `path` walks, so that error still names
     /// the match array.
     GsubLit {
         pattern: crate::value::Text,
         replacement: crate::value::Text,
+        global: bool,
+        reject_call: bool,
+        slow: Box<Filter>,
+    },
+    /// `splits` of a literal pattern. Pieces are the text between matches.
+    /// `slow` is the match program `path` walks.
+    SplitsLit {
+        pattern: crate::value::Text,
         slow: Box<Filter>,
     },
     /// Bind each value of `expr` and run `body`, and do not read the next

@@ -289,6 +289,30 @@ The same five commands were timed on that file. Stdout and stderr matched. `--st
 | 2 | 4.22 | 0.63 |
 | 3 | 4.21 | 0.61 |
 
+`.path | sub("/"; "_")` writes those same 4251398 bytes. Stdout matched and stderr was empty.
+
+| run | `jq -c` | `tumulus -c` |
+| --- | ---: | ---: |
+| 1 | 2.57 | 0.62 |
+| 2 | 2.59 | 0.62 |
+| 3 | 2.60 | 0.62 |
+
+`[.path | splits("/")]` writes 6105326 bytes. Stdout matched and stderr was empty.
+
+| run | `jq -c` | `tumulus -c` |
+| --- | ---: | ---: |
+| 1 | 2.67 | 0.66 |
+| 2 | 2.67 | 0.66 |
+| 3 | 2.67 | 0.66 |
+
+`.path | gsub("/"; "_"; "g")` writes those same 4251398 bytes. Stdout matched and stderr was empty.
+
+| run | `jq -c` | `tumulus -c` |
+| --- | ---: | ---: |
+| 1 | 4.21 | 0.64 |
+| 2 | 4.21 | 0.64 |
+| 3 | 4.26 | 0.65 |
+
 Times are seconds.
 
 ## License

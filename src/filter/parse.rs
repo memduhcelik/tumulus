@@ -204,7 +204,7 @@ pub fn reads_input(filter: &Filter) -> bool {
             Filter::Break { .. } => false,
             Filter::MatchImpl { regex, flags, .. } => walk(regex, seen) || walk(flags, seen),
             Filter::StreamBind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
-            Filter::GsubLit { slow, .. } => walk(slow, seen),
+            Filter::GsubLit { slow, .. } | Filter::SplitsLit { slow, .. } => walk(slow, seen),
             Filter::Bind { expr, body, .. } => walk(expr, seen) || walk(body, seen),
             Filter::Reduce {
                 stream,
@@ -655,7 +655,7 @@ pub(super) fn check_vars(filter: &Filter, scope: &[String]) -> Result<(), Progra
             inner.push(name.clone());
             check_vars(body, &inner)
         }
-        Filter::GsubLit { slow, .. } => check_vars(slow, scope),
+        Filter::GsubLit { slow, .. } | Filter::SplitsLit { slow, .. } => check_vars(slow, scope),
     }
 }
 
@@ -975,7 +975,9 @@ fn walk_defs(filter: &Filter, seen: &mut HashSet<usize>, errors: &mut Vec<(usize
             walk_defs(expr, seen, errors);
             walk_defs(body, seen, errors);
         }
-        Filter::GsubLit { slow, .. } => walk_defs(slow, seen, errors),
+        Filter::GsubLit { slow, .. } | Filter::SplitsLit { slow, .. } => {
+            walk_defs(slow, seen, errors)
+        }
         Filter::Break {
             slot: None,
             at,
@@ -1335,10 +1337,27 @@ fn splits_call(re: Filter, flags: Option<Box<Filter>>) -> Filter {
         Some(flags) => *flags,
         None => Filter::Literal(Value::Null),
     };
-    bind_lazy(
+    // `g` is added in front of the flags. Null adds nothing, so one argument
+    // searches the same way as `"g"`. A literal pattern can be cut in one pass.
+    let fast = match &re {
+        Filter::Literal(Value::String(pattern))
+            if literal_pattern(pattern.as_str()) && splits_modifier(&flags) =>
+        {
+            Some(pattern.clone())
+        }
+        _ => None,
+    };
+    let slow = bind_lazy(
         vec![("re", re)],
         call_with(compile_scoped(SPLITS, &["re"]), vec![flags]),
-    )
+    );
+    match fast {
+        Some(pattern) => Filter::SplitsLit {
+            pattern,
+            slow: Box::new(slow),
+        },
+        None => slow,
+    }
 }
 
 fn split_regex(re: Filter, flags: Filter) -> Filter {
@@ -1354,26 +1373,54 @@ fn sub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Filt
         Some(flags) => *flags,
         None => Filter::Literal(Value::String(crate::value::Text::from(String::new()))),
     };
-    bind_lazy(
+    let fast = literal_replace(&re, &replacement, &flags);
+    let slow = bind_lazy(
         vec![("re", re), ("flags", flags)],
         call_with(compile_scoped(SUB, &["re", "flags"]), vec![replacement]),
-    )
+    );
+    match fast {
+        Some((pattern, replacement, global)) => Filter::GsubLit {
+            pattern,
+            replacement,
+            global,
+            reject_call: true,
+            slow: Box::new(slow),
+        },
+        None => slow,
+    }
 }
 
 fn gsub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Filter {
     match flags {
-        Some(flags) => bind_lazy(
-            vec![("re", re)],
-            call_with(compile_scoped(GSUB, &["re"]), vec![replacement, *flags]),
-        ),
+        Some(flags) => {
+            // `gsub` appends `g`. A literal pattern with no other modifier
+            // is the same one-pass replacement as two-argument `gsub`.
+            let fast = literal_replace(&re, &replacement, &flags)
+                .map(|(pattern, replacement, _)| (pattern, replacement));
+            let slow = bind_lazy(
+                vec![("re", re)],
+                call_with(compile_scoped(GSUB, &["re"]), vec![replacement, *flags]),
+            );
+            match fast {
+                Some((pattern, replacement)) => Filter::GsubLit {
+                    pattern,
+                    replacement,
+                    global: true,
+                    reject_call: true,
+                    slow: Box::new(slow),
+                },
+                None => slow,
+            }
+        }
         None => {
             // A plain string is the same match `g` would find, without
             // building a match object for every hit.
             let fast = match (&re, &replacement) {
-                (
-                    Filter::Literal(Value::String(pattern)),
-                    Filter::Literal(Value::String(repl)),
-                ) if literal_pattern(pattern.as_str()) => Some((pattern.clone(), repl.clone())),
+                (Filter::Literal(Value::String(pattern)), Filter::Literal(Value::String(repl)))
+                    if literal_pattern(pattern.as_str()) =>
+                {
+                    Some((pattern.clone(), repl.clone()))
+                }
                 _ => None,
             };
             let slow = sub_call(
@@ -1387,11 +1434,56 @@ fn gsub_call(re: Filter, replacement: Filter, flags: Option<Box<Filter>>) -> Fil
                 Some((pattern, replacement)) => Filter::GsubLit {
                     pattern,
                     replacement,
+                    global: true,
+                    reject_call: false,
                     slow: Box::new(slow),
                 },
                 None => slow,
             }
         }
+    }
+}
+
+/// Both sides are strings, and the flags are only `g` and `n`. The bool is
+/// true when `g` is present, so every match is replaced.
+fn literal_replace(
+    re: &Filter,
+    replacement: &Filter,
+    flags: &Filter,
+) -> Option<(crate::value::Text, crate::value::Text, bool)> {
+    let (pattern, repl) = match (re, replacement) {
+        (Filter::Literal(Value::String(pattern)), Filter::Literal(Value::String(repl)))
+            if literal_pattern(pattern.as_str()) =>
+        {
+            (pattern.clone(), repl.clone())
+        }
+        _ => return None,
+    };
+    plain_modifier(flags).map(|global| (pattern, repl, global))
+}
+
+/// `None` when a flag would change a literal search. `Some(true)` asks for
+/// every match.
+fn plain_modifier(flags: &Filter) -> Option<bool> {
+    let Filter::Literal(Value::String(text)) = flags else {
+        return None;
+    };
+    let mut global = false;
+    for ch in text.as_str().chars() {
+        match ch {
+            'g' => global = true,
+            'n' => {}
+            _ => return None,
+        }
+    }
+    Some(global)
+}
+
+/// One-argument `splits` passes null. `"g" + null` is `"g"`.
+fn splits_modifier(flags: &Filter) -> bool {
+    match flags {
+        Filter::Literal(Value::Null) => true,
+        other => plain_modifier(other).is_some(),
     }
 }
 
@@ -2800,7 +2892,9 @@ impl<'a> Parser<'a> {
         }
         let update = self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?;
         let extract = if foreach && self.eat(';') {
-            Some(Box::new(self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?))
+            Some(Box::new(
+                self.in_qalt(QALT_PLAIN, |parser| parser.parse_pipe())?,
+            ))
         } else if !foreach && self.sees(';') {
             return Err(ProgramError::Syntax);
         } else {
@@ -4486,7 +4580,9 @@ pub(super) fn forbids_call(filter: &Filter) -> bool {
         | Filter::Param(_)
         | Filter::Unresolved { .. }
         | Filter::MatchImpl { .. }
-        | Filter::StreamBind { .. } => true,
+        | Filter::StreamBind { .. }
+        | Filter::SplitsLit { .. } => true,
+        Filter::GsubLit { reject_call, .. } => *reject_call,
         Filter::Optional(inner) => forbids_call(inner),
         Filter::Pipe(left, right) => regex_shape(left) || call_blocked(right),
         _ => false,

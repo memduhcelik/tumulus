@@ -21,28 +21,78 @@ pub(super) fn gsub_literal(
     pattern: &str,
     replacement: &str,
 ) -> Result<Vec<Value>, Failure> {
-    let Value::String(text) = input else {
-        return Err(fail(format!(
-            "{} ({}) cannot be matched, as it is not a string",
-            input.type_name(),
-            eval::shown(input)
-        )));
+    replace_literal(input, pattern, replacement, true)
+}
+
+/// The first copy of `pattern`, replaced by `replacement`. The same strings
+/// `gsub_literal` accepts. A miss returns the input unchanged.
+pub(super) fn sub_literal(
+    input: &Value,
+    pattern: &str,
+    replacement: &str,
+) -> Result<Vec<Value>, Failure> {
+    replace_literal(input, pattern, replacement, false)
+}
+
+/// Pieces of a string between non-overlapping copies of `pattern`. No match
+/// yields the input as the only piece. A value that is not a string fails
+/// the way `match` fails.
+pub(super) fn splits_literal(input: &Value, pattern: &str) -> Result<Vec<Value>, Failure> {
+    let text = matched_text(input)?;
+    let Some(first) = text.find(pattern) else {
+        return Ok(vec![input.clone()]);
     };
-    let text = text.as_str();
+    let mut out = Vec::new();
+    out.push(piece(&text[..first]));
+    let mut rest = &text[first + pattern.len()..];
+    while let Some(at) = rest.find(pattern) {
+        out.push(piece(&rest[..at]));
+        rest = &rest[at + pattern.len()..];
+    }
+    out.push(piece(rest));
+    Ok(out)
+}
+
+fn replace_literal(
+    input: &Value,
+    pattern: &str,
+    replacement: &str,
+    global: bool,
+) -> Result<Vec<Value>, Failure> {
+    let text = matched_text(input)?;
     let Some(first) = text.find(pattern) else {
         return Ok(vec![input.clone()]);
     };
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..first]);
     out.push_str(replacement);
-    let mut rest = &text[first + pattern.len()..];
-    while let Some(at) = rest.find(pattern) {
-        out.push_str(&rest[..at]);
-        out.push_str(replacement);
-        rest = &rest[at + pattern.len()..];
+    if global {
+        let mut rest = &text[first + pattern.len()..];
+        while let Some(at) = rest.find(pattern) {
+            out.push_str(&rest[..at]);
+            out.push_str(replacement);
+            rest = &rest[at + pattern.len()..];
+        }
+        out.push_str(rest);
+    } else {
+        out.push_str(&text[first + pattern.len()..]);
     }
-    out.push_str(rest);
     Ok(vec![Value::String(crate::value::Text::from(out))])
+}
+
+fn matched_text(input: &Value) -> Result<&str, Failure> {
+    match input {
+        Value::String(text) => Ok(text.as_str()),
+        other => Err(fail(format!(
+            "{} ({}) cannot be matched, as it is not a string",
+            other.type_name(),
+            eval::shown(other)
+        ))),
+    }
+}
+
+fn piece(text: &str) -> Value {
+    Value::String(crate::value::Text::from(text))
 }
 
 pub(super) fn apply_pair(
