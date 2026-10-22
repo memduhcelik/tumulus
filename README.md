@@ -93,7 +93,7 @@ Printing:
 - The first of `-h`, `--help`, `-V`, `--version`, and `--build-configuration` wins. Later arguments are not read. After `--`, none of them is an option.
 - An unknown option exits 2. The message is `jq: Unknown option ...`, then jq's usage text. A short cluster names the whole argument, as in `-Z` and `-eQ`.
 
-Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.
+Numbers are rewritten on the way out, including spellings such as `01`, `.1`, `+1`, and `1.`. A number produced by arithmetic is printed from its value. When that value is exactly halfway between two shortest decimals, the one with an even last digit is used, so `1e15+0.3` prints `1000000000000000.2`. `NaN` and `Infinity` are accepted. A leading UTF-8 BOM is ignored. Nesting deeper than 256 is rejected on input. A value built deeper than that still compares with `==`. `tojson`, `tostring`, and printing write `<skipped: too deep>` in place of anything past that depth.
 
 Filters that work are field access (`.a`, `.a.b`, `.["a"]`, `."a b"`), array indexes (`.[0]` and negative indexes), slices (`.[2:5]`, `.[:-1]`, `.[$i:]`, `.[:length-1]`, `.[index("b"):]`), several keys or indexes in one bracket (`.["a","b"]`), iteration (`.[]`), recurse (`..`), pipe (`|`), comma (`,`), two filters written next to each other, parentheses, and the `?` suffix.
 

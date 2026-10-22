@@ -440,6 +440,7 @@ fn cmp_mag(left: &str, left_scale: i64, right: &str, right_scale: i64) -> i8 {
 
 /// Print a computed number the way jq prints an arithmetic result.
 /// Literals keep `normalize`; this is only for results of operators.
+/// Two shortest decimals that are equally close keep the even last digit.
 pub fn format_jq_f64(n: f64) -> String {
     if n.is_nan() {
         return if n.is_sign_negative() {
@@ -473,8 +474,19 @@ pub fn format_jq_f64(n: f64) -> String {
 }
 
 /// `digits` is the shortest coefficient and `decpt` places the point so the
-/// value is `0.digits * 10^decpt`.
+/// value is `0.digits * 10^decpt`. An exact tie keeps the even last digit.
 fn decompose(abs: f64) -> (String, i32) {
+    let (digits, decpt) = rust_decimal(abs);
+    if let Some((next, next_pt)) = even_halfway(&digits, decpt, abs) {
+        (next, next_pt)
+    } else {
+        (digits, decpt)
+    }
+}
+
+/// Rust's shortest decimal. On an exact tie it keeps the candidate farther
+/// from zero, so the last digit can be the odd one.
+fn rust_decimal(abs: f64) -> (String, i32) {
     let text = format!("{abs}");
     let exp_at = text.find(['e', 'E']);
     let (mant, exp) = match exp_at {
@@ -508,6 +520,112 @@ fn decompose(abs: f64) -> (String, i32) {
         return ("0".to_string(), 0);
     }
     (digits, point + exp)
+}
+
+/// The other shortest decimal, when `abs` is exactly halfway and Rust kept
+/// the odd last digit. Nothing is changed when that other decimal does not
+/// parse back to `abs`.
+fn even_halfway(digits: &str, decpt: i32, abs: f64) -> Option<(String, i32)> {
+    let dir = tie_dir(abs, digits, decpt)?;
+    let m: u128 = digits.parse().ok()?;
+    if m.is_multiple_of(2) {
+        return None;
+    }
+    let other = if dir > 0 {
+        m.checked_add(1)?
+    } else {
+        m.checked_sub(1)?
+    };
+    let (next, next_pt) = rescale(other, decpt, digits.len())?;
+    let rendered = format_digits(&next, next_pt);
+    if rendered.parse::<f64>() == Ok(abs) {
+        Some((next, next_pt))
+    } else {
+        None
+    }
+}
+
+/// `Some(1)` when `abs` is halfway between this decimal and the next one up.
+/// `Some(-1)` when it is halfway between this decimal and the next one down.
+///
+/// `abs` is an odd integer times a power of two. That power matches the last
+/// digit's place on a decimal midpoint, and the odd integer is `2 * digits ± 1`
+/// times the fives in the matching power of ten.
+fn tie_dir(abs: f64, digits: &str, decpt: i32) -> Option<i32> {
+    let m: u128 = digits.parse().ok()?;
+    if m == 0 {
+        return None;
+    }
+    let e = decpt - digits.len() as i32;
+    let (sig, exp) = odd_parts(abs);
+    if exp + 1 != e || sig == 0 {
+        return None;
+    }
+    let q = if e >= 0 {
+        let p5 = pow5(u32::try_from(e).ok()?)?;
+        let sig = u128::from(sig);
+        if sig % p5 != 0 {
+            return None;
+        }
+        sig / p5
+    } else {
+        let f = u32::try_from(e.checked_neg()?).ok()?;
+        let p5 = pow5(f)?;
+        u128::from(sig).checked_mul(p5)?
+    };
+    let twice = m.checked_mul(2)?;
+    if q == twice.checked_add(1)? {
+        Some(1)
+    } else if q.checked_add(1)? == twice {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+/// `abs` as `significand * 2^exp` with `significand` odd.
+fn odd_parts(n: f64) -> (u64, i32) {
+    let bits = n.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mut sig, mut exp) = if raw_exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1023 - 52)
+    };
+    if sig == 0 {
+        return (0, 0);
+    }
+    while sig.is_multiple_of(2) {
+        sig /= 2;
+        exp += 1;
+    }
+    (sig, exp)
+}
+
+fn pow5(exp: u32) -> Option<u128> {
+    let mut acc = 1u128;
+    for _ in 0..exp {
+        acc = acc.checked_mul(5)?;
+    }
+    Some(acc)
+}
+
+/// `other` is the significand at the same scale as a coefficient of `old_len`
+/// digits. Trailing zeros drop out, and a carry into a new digit moves the point.
+fn rescale(other: u128, decpt: i32, old_len: usize) -> Option<(String, i32)> {
+    if other == 0 {
+        return None;
+    }
+    let mut sig = other;
+    let mut zeros = 0i32;
+    while sig.is_multiple_of(10) {
+        sig /= 10;
+        zeros += 1;
+    }
+    let digits = sig.to_string();
+    let new_decpt = decpt - old_len as i32 + zeros + digits.len() as i32;
+    Some((digits, new_decpt))
 }
 
 fn format_digits(digits: &str, decpt: i32) -> String {

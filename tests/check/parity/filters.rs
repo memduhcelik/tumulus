@@ -955,6 +955,31 @@ fn operators_match_jq() {
 }
 
 #[test]
+fn halfway_decimal_matches_jq() {
+    require_jq();
+    let programs = [
+        "1e15+0.3",
+        "-(1e15+0.3)",
+        "1e15+0.2",
+        "1e15+0.25",
+        "1e15+0.3 | tostring",
+        "1e15+0.3 | tojson",
+        "-(1e15+0.3) | tostring",
+        "-(1e15+0.3) | tojson",
+        "1e15+0.3 | length",
+        r#""\(1e15+0.3)""#,
+        "[1e15+0.3, -(1e15+0.3)]",
+        "29802.322387695313+0",
+        "-(29802.322387695313)+0",
+        "0.000000029802322387695313+0",
+        "-(0.000000029802322387695313)+0",
+    ];
+    for program in programs {
+        compare_exact(program, &["-n", "-c", "--", program], b"");
+    }
+}
+
+#[test]
 fn early_syntax_matches_jq() {
     require_jq();
     for program in [

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A computed number that is exactly halfway between two shortest decimals prints the one with an even last digit. `1e15+0.3` prints `1000000000000000.2`. So does its negative, and so do `tostring` and `tojson`.
+
 `if` runs the branch for one condition value before it reads the next. `printf '1\n2\n3\n4\n5\n' | tumulus -n -c 'if (input,input) then (input) else (input) end'` prints `2` and `4`. `join` joins one separator before it reads the next. `[1,2] | join(input,input)` on `1` then `2` fails at `<stdin>:1` and does not read `2`.
 
 ## 0.13.0
