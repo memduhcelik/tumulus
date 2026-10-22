@@ -988,7 +988,7 @@ pub(super) fn eval_fold(
 }
 
 /// One `reduce` or `foreach` step. `true` means the caller asked to stop.
-fn fold_one(
+pub(super) fn fold_one(
     item: &Value,
     pattern: &Pattern,
     alts: &[Pattern],

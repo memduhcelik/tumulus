@@ -2065,7 +2065,8 @@ fn nest_child_done(machine: &mut Machine, index: usize) -> Result<DoneAct, Failu
         (6, 0) => finish_fold_init(machine, index),
         (6, 1) => finish_fold_stream(machine, index),
         (6, 2) => finish_fold_update(machine, index),
-        (6, _) => finish_fold_extract(machine, index),
+        (6, 3) => finish_fold_extract(machine, index),
+        (6, _) => finish_fold_emit(machine, index),
         (7, _) => finish_map_item(machine, index),
         (8, _) => finish_first(machine, index),
         (9, 0) => finish_limit_count(machine, index),
@@ -2566,6 +2567,12 @@ fn accept_fold_item(machine: &mut Machine, index: usize, item: Value) -> Result<
 
 /// Pick a `?//` pattern for the source value in `items` and run its update.
 fn begin_fold_alt(machine: &mut Machine, index: usize) -> Result<FoldCont, Failure> {
+    // An object pattern indexes one key, runs the update, then indexes the
+    // next key. Collecting every key first reports the later index error
+    // before that update.
+    if foreach_object_item(machine, index) {
+        return fold_foreach_object_item(machine, index);
+    }
     loop {
         let (pattern, last, names, item, flat) = match &*machine.stack[index].body {
             Body::Nest(nest) => {
@@ -2621,6 +2628,135 @@ fn begin_fold_alt(machine: &mut Machine, index: usize) -> Result<FoldCont, Failu
                 }
             }
         }
+    }
+}
+
+fn pattern_has_object(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Var(_) => false,
+        Pattern::Array(pats) => pats.iter().any(pattern_has_object),
+        Pattern::Object(_) => true,
+    }
+}
+
+/// `foreach` whose pattern indexes object keys. The update for one key runs
+/// before the next key is indexed.
+fn foreach_object_item(machine: &Machine, index: usize) -> bool {
+    match &*machine.stack[index].body {
+        Body::Nest(nest) => match &nest.kind {
+            Kind::Reduce {
+                each: true,
+                pattern,
+                alts,
+                ..
+            } if nest.alt_at == 0 => {
+                pattern_has_object(pattern) || alts.iter().any(pattern_has_object)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn fold_foreach_object_item(machine: &mut Machine, index: usize) -> Result<FoldCont, Failure> {
+    let mut lookup = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.lookup.take(),
+        _ => None,
+    };
+    let (pattern, alts, update, extract, item, env, mut acc) = match &*machine.stack[index].body {
+        Body::Nest(nest) => match &nest.kind {
+            Kind::Reduce {
+                pattern,
+                alts,
+                update,
+                extract,
+                ..
+            } => (
+                pattern.clone(),
+                alts.clone(),
+                Rc::clone(update),
+                extract.clone(),
+                nest.items.first().cloned().unwrap_or(Value::Null),
+                nest.env.flatten(),
+                nest.acc.clone(),
+            ),
+            _ => unreachable!("foreach"),
+        },
+        _ => unreachable!("foreach"),
+    };
+    let mut outputs = Vec::new();
+    let ran = eval::fold_one(
+        &item,
+        &pattern,
+        &alts,
+        &update,
+        extract.as_deref(),
+        true,
+        &env,
+        &mut acc,
+        &mut lookup,
+        &mut |value| {
+            outputs.push(value.clone());
+            false
+        },
+    );
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.acc = acc;
+        nest.lookup = lookup;
+        nest.phase = 1;
+    }
+    emit_foreach_outputs(machine, index, outputs, ran.err())
+}
+
+fn emit_foreach_outputs(
+    machine: &mut Machine,
+    index: usize,
+    outputs: Vec<Value>,
+    failure: Option<Failure>,
+) -> Result<FoldCont, Failure> {
+    if outputs.is_empty() {
+        return match failure {
+            Some(failure) => Err(failure),
+            None => Ok(FoldCont::ItemDone),
+        };
+    }
+    let filter = literal_stream(outputs);
+    let (env, input) = match &*machine.stack[index].body {
+        Body::Nest(nest) => (Rc::clone(&nest.env), nest.input.clone()),
+        _ => unreachable!("foreach"),
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.fail_last = failure.map(|mut failure| {
+            failure.partial.clear();
+            failure
+        });
+        nest.phase = 4;
+        nest.update_open = false;
+    }
+    nest_arm_in(machine, index, filter, input, env);
+    Ok(FoldCont::Spawned)
+}
+
+fn literal_stream(mut outputs: Vec<Value>) -> Rc<Filter> {
+    let first = outputs.remove(0);
+    let mut filter = Filter::Literal(first);
+    for value in outputs {
+        filter = Filter::Comma(Box::new(filter), Box::new(Filter::Literal(value)));
+    }
+    Rc::new(filter)
+}
+
+fn finish_fold_emit(machine: &mut Machine, index: usize) -> Result<DoneAct, Failure> {
+    let failure = match &mut *machine.stack[index].body {
+        Body::Nest(nest) => nest.fail_last.take(),
+        _ => None,
+    };
+    if let Body::Nest(nest) = &mut *machine.stack[index].body {
+        nest.phase = 1;
+    }
+    match failure {
+        Some(failure) => Ok(DoneAct::Fail(failure)),
+        None => Ok(DoneAct::Stay),
     }
 }
 

@@ -954,6 +954,16 @@ fn operators_match_jq() {
     }
 }
 
+/// Indexing the next object key before the update reports
+/// `Cannot index object with number`. jq runs the update first and reports
+/// `Cannot index number with string "a"`.
+#[test]
+fn foreach_object_pattern_in_a_function_matches_jq() {
+    require_jq();
+    let program = r#"def f: [foreach {"a":1} as {("a", 1): $x} (0; 1|.a)]; f"#;
+    compare_exact(program, &["-n", "-c", "--", program], b"");
+}
+
 /// Collecting `(input,input)` before `. + input` prints 7. jq prints 6.
 #[test]
 fn reduce_reads_one_source_value_before_the_body() {
