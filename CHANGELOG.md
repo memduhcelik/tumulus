@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+`%=` is its own token. `%=` expects the end of the file. `1 + %=`, `.a | %=`, and `1, %=` are `unexpected %=`. `1 %=` and `. %=` expect the end of the file.
+
 `sub`, `splits`, and `gsub` with an explicit `g` cut a literal pattern in one pass. `.path | sub("/"; "_")` on the requests file took 0.62, 0.62, and 0.62 seconds beside jq's 2.57, 2.59, and 2.60. `[.path | splits("/")]` took 0.66, 0.66, and 0.66 beside jq's 2.67, 2.67, and 2.67. `.path | gsub("/"; "_"; "g")` took 0.64, 0.64, and 0.65 beside jq's 4.21, 4.21, and 4.26. The text is unchanged.
 
 A `%` after an operator is `unexpected '%'`. `1 + %`, `.a | %`, and `1, %` are that message. A `%` that starts the program still expects the end of the file.

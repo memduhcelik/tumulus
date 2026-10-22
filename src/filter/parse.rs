@@ -2335,9 +2335,18 @@ impl<'a> Parser<'a> {
     /// `=` does not chain. `//=` is one operator, not `//` followed by `=`.
     fn parse_update(&mut self) -> Result<Filter, ProgramError> {
         let left = self.parse_or()?;
+        self.skip_ws();
+        let token_at = self.index;
         let Some(op) = self.take_update() else {
             return Ok(left);
         };
+        // `1 %=` has no right-hand side. jq names the end of the file there.
+        // The other update operators still use the generic syntax error.
+        if op == UpdateOp::Rem {
+            if let Some(err) = self.after_operator(token_at, self.index) {
+                return Err(err);
+            }
+        }
         let right = self.parse_or()?;
         if self.sees_update() {
             return Err(ProgramError::Syntax);
@@ -2565,9 +2574,16 @@ impl<'a> Parser<'a> {
             return Err(self.bad_question_alt(true));
         }
         if self.peek() == Some('%') {
-            // jq expects the end of the file only when `%` is the first token.
-            // After an operator, as in `1 + %`, the message is `unexpected '%'`.
-            let detail = if self.qalt == QALT_EOF && self.at_first_token() {
+            // `%=` is one token. `%` expects the end of the file only when it
+            // is the first token, as in `%` itself. `1 + %` is `unexpected '%'`.
+            let update = self.peek_at(1) == Some('=');
+            let detail = if update {
+                if self.qalt == QALT_EOF && self.at_first_token() {
+                    "unexpected %=, expecting end of file"
+                } else {
+                    "unexpected %="
+                }
+            } else if self.qalt == QALT_EOF && self.at_first_token() {
                 "unexpected '%', expecting end of file"
             } else {
                 "unexpected '%'"
